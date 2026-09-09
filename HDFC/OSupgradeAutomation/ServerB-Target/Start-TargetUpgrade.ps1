@@ -65,6 +65,17 @@
     switch to downgrade that to a warning-only (proceed anyway) - intended
     strictly for lab/non-production validation runs, never production.
 
+.PARAMETER SkipSystemStateBackup
+    Skip backup task 8 of 8 (the wbadmin system state backup). That task is
+    by far the slowest and largest part of the backup stage, so skipping it
+    is useful for repeat lab runs, or where an external/enterprise backup
+    product (or a VM snapshot) already provides an equivalent restore point.
+    Everything else in the backup stage still runs: registry hives, GPO,
+    secedit, gpresult, RDS CAL DB, and the pre-upgrade services snapshot.
+    Think carefully before using this in production - system state is the
+    artifact you would need for a bare-metal/AD-level restore if the upgrade
+    goes badly.
+
 .PARAMETER MinVMwareToolsVersion
     Minimum acceptable VMware Tools version when Server B is a VMware VM.
     Default: "12.0.0". Ignored entirely on Hyper-V/physical hardware.
@@ -83,6 +94,10 @@
 .EXAMPLE
     Lab run bypassing only the patch-currency hard stop:
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -SkipPatchCheckLab
+
+.EXAMPLE
+    Repeat lab run, skipping the slow system state backup:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -SkipPatchCheckLab -SkipSystemStateBackup
 #>
 
 [CmdletBinding()]
@@ -94,6 +109,7 @@ param(
     [int]   $RetentionDays      = 14,
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
+    [switch]$SkipSystemStateBackup,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
     [int]   $MaxPatchAgeDays    = 60
@@ -1180,11 +1196,104 @@ function Test-SafeProfileFolder {
     return $true
 }
 
+function Invoke-NativeQuiet {
+    <#
+    Runs a console tool, discarding its output and returning the exit code.
+    The $ErrorActionPreference dance is essential, not cosmetic: this script
+    runs with 'Stop', under which ANY native command writing to stderr raises
+    a terminating NativeCommandError. takeown/icacls routinely write to
+    stderr for individual files while still succeeding overall, so without
+    this the whole cleanup would abort partway through.
+    #>
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList 2>&1 | Out-Null
+        return $LASTEXITCODE
+    } catch {
+        return -1
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+function Remove-ProfileFolder {
+    <#
+    Deletes one orphaned profile folder in escalating stages, doing the least
+    invasive thing that works. Only ever called on a path that already passed
+    Test-SafeProfileFolder.
+
+    Stage 1 - Remove-Item. Fails on the legacy compatibility JUNCTIONS inside
+      AppData ('Application Data', 'Local Settings', ...) because it walks
+      INTO them and hits their by-design deny ACE:
+      "Access to the path ...\AppData\Local\Application Data is denied".
+    Stage 2 - cmd's 'rd /s /q', which deletes a reparse point as a LINK
+      instead of following it, and removes read-only files without asking.
+      This alone fixes the junction case - no permission changes needed.
+    Stage 3 - only if still present: take ownership and reset the ACLs, then
+      'rd' again. 'icacls /reset' matters here because a profile owned by a
+      deleted SID can carry explicit DENY entries, and /grant cannot override
+      a deny - it has to be cleared.
+
+    Escalation is deliberately LAST: 'takeown /R' and 'icacls /T' traverse
+    directory junctions, so on a profile containing a junction that points
+    outside itself they could rewrite ownership/permissions on unrelated
+    data. Stage 2 removes those junctions first, so by the time stage 3 runs
+    there is normally nothing left to traverse out of.
+    #>
+    param([string]$Path)
+
+    $firstError = $null
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    } catch {
+        $firstError = $_.Exception.Message
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Success = $true; Method = 'direct delete'; Error = $null }
+    }
+
+    Invoke-NativeQuiet -FilePath 'cmd.exe' -ArgumentList @('/c', 'rd', '/s', '/q', $Path) | Out-Null
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Success = $true; Method = 'rd /s /q (junction-safe)'; Error = $null }
+    }
+
+    Write-Host ("   Delete blocked ({0})" -f $firstError) -ForegroundColor DarkYellow
+    Write-Host ("   Taking ownership and resetting permissions on {0} ..." -f $Path) -ForegroundColor Yellow
+
+    # *S-1-5-32-544 is the built-in Administrators SID - used instead of the
+    # group NAME so this still works on non-English Windows.
+    Invoke-NativeQuiet -FilePath 'takeown.exe' -ArgumentList @('/F', $Path, '/R', '/A', '/D', 'Y')                           | Out-Null
+    Invoke-NativeQuiet -FilePath 'icacls.exe'  -ArgumentList @($Path, '/reset', '/T', '/C', '/Q')                            | Out-Null
+    Invoke-NativeQuiet -FilePath 'icacls.exe'  -ArgumentList @($Path, '/grant', '*S-1-5-32-544:(OI)(CI)F', '/T', '/C', '/Q') | Out-Null
+    Invoke-NativeQuiet -FilePath 'attrib.exe'  -ArgumentList @('-R', '-S', '-H', "$Path\*", '/S', '/D')                      | Out-Null
+
+    Invoke-NativeQuiet -FilePath 'cmd.exe' -ArgumentList @('/c', 'rd', '/s', '/q', $Path) | Out-Null
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Success = $true; Method = 'takeown + icacls reset + rd'; Error = $null }
+    }
+
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+    } catch {
+        $firstError = $_.Exception.Message
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Success = $true; Method = 'takeown + icacls reset + Remove-Item'; Error = $null }
+    }
+
+    return [pscustomobject]@{ Success = $false; Method = 'all methods failed'; Error = $firstError }
+}
+
 $profileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
 
 # Matches the detection logic in Start-TargetUpgrade.ps1 exactly: only real
 # user-account SIDs (S-1-5-21-*), so built-in/service SIDs are never touched.
-$orphans = Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue |
+# @(...) is required: with exactly ONE orphan the pipeline returns a bare
+# PSCustomObject whose .Count is $null, which blanked every "N of M" message
+# and made the final "$removed -eq $orphans.Count" success test fail.
+$orphans = @(Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue |
     Where-Object { $_.PSChildName -match '^S-1-5-21-' } |
     ForEach-Object {
         $sid = $_.PSChildName
@@ -1199,7 +1308,7 @@ $orphans = Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue |
                 ProfilePath = (Get-ItemProperty -Path $_.PSPath -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
             }
         }
-    }
+    })
 
 if (-not $orphans) {
     Write-Host "No orphaned profile SIDs found under ProfileList - nothing to do." -ForegroundColor Green
@@ -1263,12 +1372,13 @@ foreach ($o in $orphans) {
     # the upgrade is unblocked either way, and the leftover path is reported.
     if ($deleteFolders -and $o.ProfilePath) {
         if (Test-SafeProfileFolder -Path $o.ProfilePath) {
-            try {
-                Remove-Item -LiteralPath $o.ProfilePath -Recurse -Force
-                Write-Host ("Deleted profile folder: {0}" -f $o.ProfilePath) -ForegroundColor Green
+            $fr = Remove-ProfileFolder -Path $o.ProfilePath
+            if ($fr.Success) {
+                Write-Host ("Deleted profile folder: {0}  [{1}]" -f $o.ProfilePath, $fr.Method) -ForegroundColor Green
                 $foldersOk++
-            } catch {
-                Write-Host ("FAILED to delete profile folder {0}: {1}" -f $o.ProfilePath, $_) -ForegroundColor Red
+            } else {
+                Write-Host ("FAILED to delete profile folder {0} even after taking ownership: {1}" -f $o.ProfilePath, $fr.Error) -ForegroundColor Red
+                Write-Host "   A file there is most likely still open/locked by a running process." -ForegroundColor Red
                 $foldersFailed += $o.ProfilePath
             }
         } elseif (Test-Path -LiteralPath $o.ProfilePath) {
@@ -1672,34 +1782,46 @@ try {
     # there. A pointer file is left inside $backupFolder so anyone browsing
     # the per-run folder can still find where the real data landed.
     try {
-        $wsbFeature = Get-WindowsFeature -Name Windows-Server-Backup -ErrorAction SilentlyContinue
-        if (-not $wsbFeature) { throw "Could not query the Windows-Server-Backup feature state." }
-        if (-not $wsbFeature.Installed) {
-            Write-Log "Windows Server Backup feature not installed - installing it now for system state backup."
-            $installResult = Install-WindowsFeature -Name Windows-Server-Backup -ErrorAction Stop
-            if (-not $installResult.Success) { throw "Install-WindowsFeature reported Success=`$false for Windows-Server-Backup." }
-            if ($installResult.RestartNeeded -eq "Yes") {
-                Write-Log "Windows Server Backup feature installed but reports a pending restart - proceeding anyway (non-blocking)." "WARN"
-            } else {
-                Write-Log "Windows Server Backup feature installed successfully."
-            }
-        }
-
-        $wsbLog = Join-Path $backupFolder "SystemStateBackup_$($script:RunStamp).log"
-        & wbadmin.exe start systemstatebackup "-backupTarget:$driveRoot" -quiet *> $wsbLog
-        if ($LASTEXITCODE -eq 0) {
-            $wsbActualPath = Join-Path $driveRoot "WindowsImageBackup\$env:COMPUTERNAME"
-            Set-UpgradeRegistryValue -Name "SystemStateBackupPath" -Value $wsbActualPath
-            "System state backup completed: $wsbActualPath (full wbadmin output: $wsbLog)" |
+        if ($SkipSystemStateBackup) {
+            # Recorded in the registry/JSON so the change record shows this run
+            # deliberately has no system state backup, rather than implying one
+            # exists. Still counted as a completed backup step (same convention
+            # as the RDS CAL task when the role isn't installed) so the 8-task
+            # percentage still reaches 100%.
+            Set-UpgradeRegistryValue -Name "SystemStateBackupPath" -Value "SKIPPED (-SkipSystemStateBackup)"
+            "System state backup was SKIPPED for this run because -SkipSystemStateBackup was specified. No wbadmin system state backup exists for $($script:RunStamp)." |
                 Out-File -FilePath (Join-Path $backupFolder "SystemStateBackup_Location.txt") -Encoding UTF8 -Force
-            Write-Log "System state backup completed via wbadmin -> $wsbActualPath (log: $wsbLog)"
+            Write-Log "System state backup SKIPPED (-SkipSystemStateBackup specified). All other backup artifacts were still created under $backupFolder." "WARN"
         } else {
-            Write-Log "wbadmin start systemstatebackup returned exit code $LASTEXITCODE (non-blocking) - see $wsbLog." "WARN"
+            $wsbFeature = Get-WindowsFeature -Name Windows-Server-Backup -ErrorAction SilentlyContinue
+            if (-not $wsbFeature) { throw "Could not query the Windows-Server-Backup feature state." }
+            if (-not $wsbFeature.Installed) {
+                Write-Log "Windows Server Backup feature not installed - installing it now for system state backup."
+                $installResult = Install-WindowsFeature -Name Windows-Server-Backup -ErrorAction Stop
+                if (-not $installResult.Success) { throw "Install-WindowsFeature reported Success=`$false for Windows-Server-Backup." }
+                if ($installResult.RestartNeeded -eq "Yes") {
+                    Write-Log "Windows Server Backup feature installed but reports a pending restart - proceeding anyway (non-blocking)." "WARN"
+                } else {
+                    Write-Log "Windows Server Backup feature installed successfully."
+                }
+            }
+
+            $wsbLog = Join-Path $backupFolder "SystemStateBackup_$($script:RunStamp).log"
+            & wbadmin.exe start systemstatebackup "-backupTarget:$driveRoot" -quiet *> $wsbLog
+            if ($LASTEXITCODE -eq 0) {
+                $wsbActualPath = Join-Path $driveRoot "WindowsImageBackup\$env:COMPUTERNAME"
+                Set-UpgradeRegistryValue -Name "SystemStateBackupPath" -Value $wsbActualPath
+                "System state backup completed: $wsbActualPath (full wbadmin output: $wsbLog)" |
+                    Out-File -FilePath (Join-Path $backupFolder "SystemStateBackup_Location.txt") -Encoding UTF8 -Force
+                Write-Log "System state backup completed via wbadmin -> $wsbActualPath (log: $wsbLog)"
+            } else {
+                Write-Log "wbadmin start systemstatebackup returned exit code $LASTEXITCODE (non-blocking) - see $wsbLog." "WARN"
+            }
         }
     } catch {
         Write-Log "System state backup step failed (non-blocking): $_" "WARN"
     }
-    Update-BackupProgress -TaskName "System state backup (wbadmin)"
+    Update-BackupProgress -TaskName $(if ($SkipSystemStateBackup) { "System state backup (SKIPPED)" } else { "System state backup (wbadmin)" })
 
     Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -Notes "Backup completed at $backupFolder"
 } catch {

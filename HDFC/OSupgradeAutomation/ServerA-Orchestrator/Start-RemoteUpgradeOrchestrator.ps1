@@ -79,10 +79,12 @@
     C:\ProgramData\OSUpgradeAutomation location. Default: C:\Temp\OSUpgradeStaging
 
 .PARAMETER IsoFolder, MinFreeSpaceGB, BackupRoot, StatusJsonPath, RetentionDays,
-.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, MinVMwareToolsVersion,
-.PARAMETER UseControlledReboot, MaxPatchAgeDays
+.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipSystemStateBackup,
+.PARAMETER MinVMwareToolsVersion, UseControlledReboot, MaxPatchAgeDays
     Passed straight through to Start-TargetUpgrade.ps1 on Server B - see that
-    script's own help for details.
+    script's own help for details. -SkipSystemStateBackup omits backup task
+    8 of 8 (the slow wbadmin system state backup); every other backup
+    artifact is still produced.
 
 .PARAMETER PollIntervalSeconds
     Seconds between monitoring checks while WinRM/Active Polling is up.
@@ -142,6 +144,7 @@ param(
     [int]   $RetentionDays         = 14,
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
+    [switch]$SkipSystemStateBackup,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
     [int]   $MaxPatchAgeDays       = 60,
@@ -571,6 +574,7 @@ try {
         RetentionDays         = $RetentionDays
         DisableAutoCleanup    = [bool]$DisableAutoCleanup
         SkipPatchCheckLab     = [bool]$SkipPatchCheckLab
+        SkipSystemStateBackup = [bool]$SkipSystemStateBackup
         MinVMwareToolsVersion = $MinVMwareToolsVersion
         UseControlledReboot   = [bool]$UseControlledReboot
         MaxPatchAgeDays       = $MaxPatchAgeDays
