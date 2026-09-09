@@ -1,0 +1,68 @@
+The actual path is exactly:
+
+C:\$WINDOWS.~BT\Sources\Panther\setuperr.log
+
+
+A few things to know:
+
+Why you may not see it
+
+$WINDOWS.~BT is a hidden and protected system folder that Windows Setup creates during:
+
+Feature Updates
+In-place OS upgrades (2016 → 2019 → 2022 → 2025)
+Setup rollback operations
+
+To view it in Explorer:
+
+View → Hidden items
+Folder Options → View → uncheck Hide protected operating system files
+Quick verification
+dir "C:\$WINDOWS.~BT\Sources\Panther\setuperr.log"
+
+
+or
+
+Test-Path "C:\$WINDOWS.~BT\Sources\Panther\setuperr.log"
+
+Other important upgrade logs
+
+For in-place upgrade troubleshooting, I typically check:
+
+C:\$WINDOWS.~BT\Sources\Panther\setupact.log
+C:\$WINDOWS.~BT\Sources\Panther\setuperr.log
+
+C:\Windows\Panther\setupact.log
+C:\Windows\Panther\setuperr.log
+
+C:\Windows\Logs\MoSetup\
+
+Accessing the folder directly
+cd /d C:\$WINDOWS.~BT\Sources\Panther
+notepad setuperr.log
+
+
+or
+
+Get-Content "C:\$WINDOWS.~BT\Sources\Panther\setuperr.log" -Tail 100
+
+If the file doesn't exist
+
+That usually means one of the following:
+
+The upgrade has not started yet.
+Setup cleaned up the temporary files after completion.
+The machine has never performed a feature update/in-place upgrade.
+The relevant logs are under:
+C:\Windows\Panther\
+
+
+For Windows Server in-place upgrade troubleshooting, the logs I prioritize are:
+
+C:\$WINDOWS.~BT\Sources\Panther\setuperr.log
+C:\$WINDOWS.~BT\Sources\Panther\setupact.log
+C:\Windows\Panther\setupact.log
+C:\Windows\Panther\CompatData*.xml
+
+
+These usually reveal exactly why Setup flagged a hard block, pending reboot, driver issue, or application compatibility issue during pre-upgrade checks.

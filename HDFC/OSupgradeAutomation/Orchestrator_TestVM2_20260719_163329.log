@@ -1,0 +1,31 @@
+﻿[2026-07-19 16:33:29] [INFO] ====================================================================
+[2026-07-19 16:33:29] [INFO] Start-RemoteUpgradeOrchestrator.ps1 - target: TestVM2
+[2026-07-19 16:33:29] [INFO] ====================================================================
+[2026-07-19 16:33:29] [WARN] Sibling folder 'C:\ServerB-Target' not found - falling back to flat single-folder layout: using C:\OSUpgradeAutomation1 as -SourceFilesPath.
+[2026-07-19 16:33:29] [INFO] All 5 target-side files found in C:\OSUpgradeAutomation1.
+[2026-07-19 16:33:30] [INFO] TestVM2 is responding to ping.
+[2026-07-19 16:33:30] [INFO] WinRM reachable on TestVM2.
+[2026-07-19 16:38:02] [WARN] Could not pre-check existing upgrade state on TestVM2 (non-blocking, assuming none): [TestVM2] Connecting to remote server TestVM2 failed with the following error message : WinRM cannot complete the operation. Verify that the specified computer name is valid, that the computer is accessible over the network, and that a firewall exception for the WinRM service is enabled and allows access from this computer. By default, the WinRM firewall exception for public profiles limits access to remote computers within the same local subnet. For more information, see the about_Remote_Troubleshooting Help topic.
+[2026-07-19 16:38:02] [INFO] Opening PSSession to TestVM2...
+[2026-07-19 16:38:05] [INFO] Copying target-side files to TestVM2:C:\Temp\OSUpgradeStaging ...
+[2026-07-19 16:38:12] [INFO] Optional companion 'LGPO.exe' found and staged to TestVM2.
+[2026-07-19 16:38:12] [INFO] Launching Start-TargetUpgrade.ps1 on TestVM2 (pre-checks + backup + ISO mount + setup.exe kickoff)...
+[2026-07-19 16:44:53] [SUCCESS] setup.exe launched successfully on TestVM2. Server B will now reboot multiple times - closing this session (expected).
+[2026-07-19 16:44:53] [INFO] Entering monitoring loop (poll every 15 sec, timeout 180 min)...
+[2026-07-19 16:44:53] [INFO] Monitoring modes: ACTIVE (WinRM reachable - richest status) / HEARTBEAT (ping-only, WinRM down - expected during SafeOS/reboots) / OFFLINE (no ping response).
+[2026-07-19 16:44:56] [INFO] TestVM2 is reachable with WinRM active (Active Polling mode).
+[2026-07-19 16:44:56] [INFO] [Stage 3/3: Windows Setup Execution] Phase change detected: '' -> 'Downlevel Phase' (Status=InProgress)
+[2026-07-19 17:11:07] [WARN] TestVM2 is not responding on ANY channel (ping, WinRM, file-share, or DCOM) - treating as Offline/Rebooting. (If ICMP is blocked in this environment, ping alone would never have been a reliable signal here anyway - this is based on all four channels.)
+[2026-07-19 17:11:07] [INFO] Phase change detected: 'Downlevel Phase' -> 'Offline / Rebooting (no ping, WinRM, file-share, or DCOM response)' (Status=Offline)
+[2026-07-19 17:11:25] [SUCCESS] WinRM connectivity RESTORED on TestVM2 - resuming Active Polling (reading status via WinRM/CIM/file share).
+[2026-07-19 17:11:25] [INFO] [Stage 3/3: Windows Setup Execution] Phase change detected: 'Offline / Rebooting (no ping, WinRM, file-share, or DCOM response)' -> 'Downlevel Phase' (Status=InProgress)
+[2026-07-19 17:16:22] [INFO] [Stage 3/3: Windows Setup Execution] Phase change detected: 'Downlevel Phase' -> 'Completed' (Status=CompletedWithWarnings)
+[2026-07-19 17:16:22] [INFO] ====================================================================
+[2026-07-19 17:16:22] [INFO]  OS upgrade Status         : Success (with warnings - review notes below before closing the change)
+[2026-07-19 17:16:22] [INFO]  Server OS                 : Microsoft Windows Server 2022 Datacenter
+[2026-07-19 17:16:22] [INFO]  Build                     : 20348
+[2026-07-19 17:16:22] [INFO]  Post-upgrade services     : Consistent - no attention items; 43 routine upgrade-related change(s) recorded for reference (report: D:\UpgradeBackup\20260719_163812\Services_PostUpgrade_Comparison.txt)
+[2026-07-19 17:16:22] [INFO]  Licensing/Activation      : WAS Licensed before the upgrade but is NOT Licensed now - this MAY indicate the upgrade itself affected activation (e.g. hardware ID/license binding). RECOMMENDATION: investigate and re-activate Windows (KMS/MAK/slmgr) before closing this change.
+[2026-07-19 17:16:22] [INFO]  Monitoring duration       : 31.5 minute(s).
+[2026-07-19 17:16:22] [INFO] ====================================================================
+[2026-07-19 17:16:22] [WARN]  Notes: Validation warnings: OS activation: WAS Licensed before the upgrade but is NOT Licensed now - this MAY indicate the upgrade itself affected activation (e.g. hardware ID/license binding). RECOMMENDATION: investigate and re-activate Windows (KMS/MAK/slmgr) before closing this change.
