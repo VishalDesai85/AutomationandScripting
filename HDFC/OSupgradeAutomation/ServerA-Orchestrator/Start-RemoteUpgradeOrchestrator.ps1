@@ -10,7 +10,7 @@
     Step 1  - Validate local companion files exist and Server B is currently
               reachable (ping is best-effort only; WinRM is the real gate,
               probed over HTTP/5985 first then automatically over HTTPS/5986).
-    Step 2  - Open a PSSession to Server B, copy the 5 target-side files into a
+    Step 2  - Open a PSSession to Server B, copy the 6 target-side files into a
               staging folder, and invoke Start-TargetUpgrade.ps1 there. This
               call returns as soon as Server B's pre-checks/backup/mount are
               done and setup.exe has been launched - it does NOT block for the
@@ -70,7 +70,7 @@
     certificate whose CN/SAN matches the exact -TargetComputer value.
 
 .PARAMETER SourceFilesPath
-    Folder on Server A containing the 5 target-side files. Default: the
+    Folder on Server A containing the 6 target-side files. Default: the
     "..\ServerB-Target" folder next to this script.
 
 .PARAMETER RemoteStagingPath
@@ -101,6 +101,12 @@
 .PARAMETER TimeoutMinutes
     Overall monitoring timeout. Default: 180 (3 hours - in-place upgrades with
     multiple reboots commonly take 60-120 minutes; tune per environment).
+
+.PARAMETER LocalStatusMirrorPath
+    Optional path on Server A for an atomic mirror of Server B's latest real
+    status. During reboots/WinPE, producer fields are retained unchanged and
+    an Observer object reports connectivity and cache age. Default: beside the
+    orchestrator logs under ProgramData.
 
 .EXAMPLE
     .\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer "ServerB" -IsoFolder "D:\ISO"
@@ -161,7 +167,8 @@ param(
     # is confirmed up and richer data is flowing normally.
     [int]$FastPollIntervalSeconds = 5,
     [int]$TimeoutMinutes      = 180,
-    [int]$PhaseStallWarningMinutes = 45
+    [int]$PhaseStallWarningMinutes = 45,
+    [string]$LocalStatusMirrorPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -172,6 +179,11 @@ $ErrorActionPreference = "Stop"
 $script:LocalLogDir = Join-Path $env:ProgramData "OSUpgradeAutomation\OrchestratorLogs"
 if (-not (Test-Path $script:LocalLogDir)) { New-Item -ItemType Directory -Path $script:LocalLogDir -Force | Out-Null }
 $script:LocalLogFile = Join-Path $script:LocalLogDir "Orchestrator_$($TargetComputer)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$safeTargetName = $TargetComputer -replace '[<>:"/\\|?*]', '_'
+if (-not $LocalStatusMirrorPath) {
+    $LocalStatusMirrorPath = Join-Path $script:LocalLogDir "UpgradeStatus_$($safeTargetName)_Latest.json"
+}
+$script:LocalStatusMirrorPath = $LocalStatusMirrorPath
 
 function Write-Log {
     param([string]$Message, [ValidateSet("INFO","WARN","ERROR","SUCCESS")][string]$Level = "INFO")
@@ -185,9 +197,165 @@ function Write-Log {
     Add-Content -Path $script:LocalLogFile -Value $line -Encoding UTF8
 }
 
+$script:LastProducerStatus = $null
+$script:LastProducerReadAtUtc = $null
+$script:ProducerCacheRecovered = $false
+$script:MirrorWriteWarningLogged = $false
+
+function ConvertTo-ProducerStatusRecord {
+    param([object]$Status)
+
+    $record = [ordered]@{}
+    foreach ($property in $Status.PSObject.Properties) {
+        if ($property.Name -notin @("PingOk", "WinRmOk", "Mode", "Source", "Observer")) {
+            $record[$property.Name] = $property.Value
+        }
+    }
+    if (-not $record.Contains("IsTerminal")) {
+        $record["IsTerminal"] = ($record["Status"] -in @("Completed", "CompletedWithWarnings", "Failed"))
+    }
+    return $record
+}
+
+function Import-LocalStatusMirrorCache {
+    if (-not (Test-Path $script:LocalStatusMirrorPath)) { return }
+
+    try {
+        $existingMirror = Get-Content -Path $script:LocalStatusMirrorPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        $existingTarget = if ($existingMirror.Observer -and $existingMirror.Observer.TargetComputer) {
+            $existingMirror.Observer.TargetComputer
+        } else {
+            $existingMirror.ComputerName
+        }
+        if ($existingTarget -and $existingTarget -ne $TargetComputer) {
+            throw "Mirror belongs to '$existingTarget', not '$TargetComputer'."
+        }
+        if (-not $existingMirror.RunId -or $existingMirror.Status -eq "AwaitingProducerStatus") { return }
+
+        $script:LastProducerStatus = ConvertTo-ProducerStatusRecord -Status $existingMirror
+        if ($existingMirror.Observer -and $existingMirror.Observer.LastProducerReadAtUtc) {
+            $script:LastProducerReadAtUtc = [DateTimeOffset]::Parse($existingMirror.Observer.LastProducerReadAtUtc)
+        } elseif ($existingMirror.StatusUpdatedAtUtc) {
+            $script:LastProducerReadAtUtc = [DateTimeOffset]::Parse($existingMirror.StatusUpdatedAtUtc)
+        } else {
+            $script:LastProducerReadAtUtc = [DateTimeOffset](Get-Item $script:LocalStatusMirrorPath).LastWriteTimeUtc
+        }
+        $script:ProducerCacheRecovered = $true
+        Write-Log "Recovered cached producer status RunId=$($existingMirror.RunId), Sequence=$($existingMirror.Sequence) from the existing Server A mirror." "WARN"
+    } catch {
+        Write-Log "Ignoring unreadable or mismatched existing status mirror '$script:LocalStatusMirrorPath': $_" "WARN"
+        $script:LastProducerStatus = $null
+        $script:LastProducerReadAtUtc = $null
+        $script:ProducerCacheRecovered = $false
+    }
+}
+
+function Write-LocalStatusMirror {
+    param(
+        [object]$ProducerStatus,
+        [object]$ObservationStatus,
+        [string]$ObservationError = ""
+    )
+
+    $temporaryPath = $null
+    try {
+        $nowUtc = [DateTimeOffset]::UtcNow
+        if ($null -ne $ProducerStatus) {
+            $script:LastProducerStatus = ConvertTo-ProducerStatusRecord -Status $ProducerStatus
+            $script:LastProducerReadAtUtc = $nowUtc
+            $script:ProducerCacheRecovered = $false
+        }
+
+        if ($null -ne $script:LastProducerStatus) {
+            $mirror = [ordered]@{}
+            foreach ($name in $script:LastProducerStatus.Keys) {
+                $mirror[$name] = $script:LastProducerStatus[$name]
+            }
+            $cacheAgeSeconds = [int][math]::Max(0, [math]::Floor(($nowUtc - $script:LastProducerReadAtUtc).TotalSeconds))
+            $cacheState = if ($null -ne $ProducerStatus) {
+                "Fresh"
+            } elseif ($script:ProducerCacheRecovered) {
+                "RecoveredFromDisk"
+            } else {
+                "CarriedForward"
+            }
+        } else {
+            $mirror = [ordered]@{
+                SchemaVersion          = 2
+                RunId                  = $null
+                Sequence               = $null
+                ComputerName           = $TargetComputer
+                Status                 = "AwaitingProducerStatus"
+                IsTerminal             = $false
+                Phase                  = $null
+                PhaseName              = "Waiting for the first target-produced status snapshot"
+                StageNumber            = $null
+                Stage                  = $null
+                StagePercentComplete   = $null
+                OverallPercentComplete = $null
+                PercentComplete        = $null
+                PercentSource          = $null
+                ProgressSource         = $null
+                ProgressFreshness      = $null
+                ProgressUpdatedAtUtc   = $null
+                StatusUpdatedAtUtc     = $null
+                LastUpdated            = $null
+                Notes                  = "Server A has not received a target-produced status snapshot yet."
+            }
+            $cacheAgeSeconds = $null
+            $cacheState = "NoProducerSnapshot"
+        }
+
+        $mirror["Observer"] = [ordered]@{
+            ComputerName          = $env:COMPUTERNAME
+            TargetComputer        = $TargetComputer
+            ObservedAtUtc         = $nowUtc.ToString("o")
+            LastProducerReadAtUtc = $(if ($script:LastProducerReadAtUtc) { $script:LastProducerReadAtUtc.ToString("o") } else { $null })
+            ProducerReachable     = ($null -ne $ProducerStatus)
+            CacheState            = $cacheState
+            CacheAgeSeconds       = $cacheAgeSeconds
+            ConnectivityMode      = $(if ($ObservationStatus) { $ObservationStatus.Mode } else { "Initializing" })
+            ConnectivitySource    = $(if ($ObservationStatus) { $ObservationStatus.Source } else { "ServerA" })
+            PingOk                = $(if ($ObservationStatus) { $ObservationStatus.PingOk } else { $null })
+            WinRmOk               = $(if ($ObservationStatus) { $ObservationStatus.WinRmOk } else { $null })
+            ObservationError      = $(if ($ObservationError) { $ObservationError } else { $null })
+        }
+
+        $mirrorDirectory = Split-Path -Parent $script:LocalStatusMirrorPath
+        if ($mirrorDirectory -and -not (Test-Path $mirrorDirectory)) {
+            New-Item -ItemType Directory -Path $mirrorDirectory -Force | Out-Null
+        }
+        $temporaryPath = "{0}.{1}.{2}.tmp" -f $script:LocalStatusMirrorPath, $PID, ([guid]::NewGuid().ToString("N"))
+        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($temporaryPath, ($mirror | ConvertTo-Json -Depth 8), $utf8WithoutBom)
+        if ([System.IO.File]::Exists($script:LocalStatusMirrorPath)) {
+            try {
+                [System.IO.File]::Replace($temporaryPath, $script:LocalStatusMirrorPath, $null, $true)
+            } catch {
+                Move-Item -Path $temporaryPath -Destination $script:LocalStatusMirrorPath -Force
+            }
+        } else {
+            [System.IO.File]::Move($temporaryPath, $script:LocalStatusMirrorPath)
+        }
+        $script:MirrorWriteWarningLogged = $false
+    } catch {
+        if (-not $script:MirrorWriteWarningLogged) {
+            Write-Log "Non-blocking: could not update local status mirror '$script:LocalStatusMirrorPath': $_" "WARN"
+            $script:MirrorWriteWarningLogged = $true
+        }
+    } finally {
+        if ($temporaryPath -and (Test-Path $temporaryPath)) {
+            Remove-Item -Path $temporaryPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Write-Log "===================================================================="
 Write-Log "Start-RemoteUpgradeOrchestrator.ps1 - target: $TargetComputer"
 Write-Log "===================================================================="
+Import-LocalStatusMirrorCache
+Write-LocalStatusMirror
+Write-Log "Server A status mirror: $script:LocalStatusMirrorPath"
 
 # =============================================================================
 # SECTION 1b - WINRM TRANSPORT RESOLUTION (HTTP 5985 -> HTTPS 5986 FALLBACK)
@@ -328,7 +496,7 @@ function Get-WinRMSessionParams {
 # =============================================================================
 # SECTION 2 - PRE-FLIGHT: local files + connectivity to Server B
 # =============================================================================
-$requiredFiles = @("Start-TargetUpgrade.ps1","Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd")
+$requiredFiles = @("Start-TargetUpgrade.ps1","OSUpgradeStatus.ps1","Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd")
 
 # Optional companion tools: not required to start an upgrade, but staged to
 # Server B when present locally so the target-side script can use them.
@@ -345,7 +513,7 @@ $optionalFiles = @("LGPO.exe")
 # ServerB-Target\). If that sibling folder doesn't exist - e.g. all 6 files
 # were instead dropped flat into one single parent folder - fall back to
 # using this script's OWN folder ($PSScriptRoot) as the source, as long as it
-# actually contains the 5 required files. This makes both layouts work
+# actually contains the 6 required files. This makes both layouts work
 # without requiring -SourceFilesPath to be passed manually.
 if (-not (Test-Path $SourceFilesPath)) {
     $flatLayoutOk = $true
@@ -360,7 +528,7 @@ foreach ($f in $requiredFiles) {
     $p = Join-Path $SourceFilesPath $f
     if (-not (Test-Path $p)) { throw "Required target-side file '$f' not found in '$SourceFilesPath'. Verify -SourceFilesPath." }
 }
-Write-Log "All 5 target-side files found in $SourceFilesPath."
+Write-Log "All 6 target-side files found in $SourceFilesPath."
 
 # NOTE: this is deliberately NON-FATAL, unlike earlier versions of this
 # script. Some environments block ICMP entirely via firewall policy, in
@@ -546,7 +714,7 @@ try {
 
     Write-Log "Copying target-side files to $($TargetComputer):$RemoteStagingPath ..."
     # Copy ONLY the 5 named required files (not a wildcard "*") - this is what
-    # guarantees just the 5 target-side files are staged on Server B even when
+    # guarantees just the 6 target-side files are staged on Server B even when
     # -SourceFilesPath points at a flat folder that also contains this very
     # orchestrator script (or any other unrelated files) alongside them.
     foreach ($f in $requiredFiles) {
@@ -648,6 +816,10 @@ try {
                     $parsedStatus = $rawStatus | ConvertFrom-Json
                     if ($null -ne $parsedStatus.PercentComplete) { $stage12Pct = [int]$parsedStatus.PercentComplete }
                     if ($parsedStatus.PhaseName) { $stage12PhaseName = $parsedStatus.PhaseName }
+                    $stage12Observation = [pscustomobject]@{
+                        PingOk = $true; WinRmOk = $true; Mode = "ActivePolling"; Source = "File($stage12UncPath)"
+                    }
+                    Write-LocalStatusMirror -ProducerStatus $parsedStatus -ObservationStatus $stage12Observation
                 } catch {
                     # Transient partial-write race - keep showing the last
                     # good values, will pick up a clean read next iteration.
@@ -833,24 +1005,49 @@ function Get-RemoteStatusViaCimDcom {
             }
 
             $obj = [ordered]@{
-                ComputerName    = $ComputerName
-                Phase           = Get-RegDWord "Phase"
-                PhaseName       = Get-RegSZ "PhaseName"
-                Status          = Get-RegSZ "Status"
-                PercentComplete = Get-RegDWord "PercentComplete"
-                PercentSource   = Get-RegSZ "PercentSource"
-                SourceBuild     = Get-RegSZ "SourceBuild"
-                TargetBuild     = Get-RegSZ "TargetBuild"
-                LastUpdated     = Get-RegSZ "LastUpdated"
-                Notes           = Get-RegSZ "Notes"
+                SchemaVersion                = Get-RegDWord "SchemaVersion"
+                RunId                        = Get-RegSZ "RunId"
+                Sequence                     = Get-RegDWord "Sequence"
+                ComputerName                 = $ComputerName
+                Status                       = Get-RegSZ "Status"
+                Phase                        = Get-RegDWord "Phase"
+                PhaseName                    = Get-RegSZ "PhaseName"
+                StageNumber                  = Get-RegDWord "StageNumber"
+                Stage                        = Get-RegSZ "Stage"
+                StagePercentComplete         = Get-RegDWord "StagePercentComplete"
+                OverallPercentComplete       = Get-RegDWord "OverallPercentComplete"
+                PercentComplete              = Get-RegDWord "PercentComplete"
+                PercentSource                = Get-RegSZ "PercentSource"
+                ProgressSource               = Get-RegSZ "ProgressSource"
+                ProgressFreshness            = Get-RegSZ "ProgressFreshness"
+                ProgressUpdatedAtUtc         = Get-RegSZ "ProgressUpdatedAtUtc"
+                StatusUpdatedAtUtc           = Get-RegSZ "StatusUpdatedAtUtc"
+                LastUpdated                  = Get-RegSZ "LastUpdated"
+                StartTime                    = Get-RegSZ "StartTime"
+                StartTimeUtc                 = Get-RegSZ "StartTimeUtc"
+                SetupLaunchTimeUtc           = Get-RegSZ "SetupLaunchTimeUtc"
+                ExpectedDisconnect           = [bool](Get-RegDWord "ExpectedDisconnect")
+                RebootCount                  = Get-RegDWord "RebootCount"
+                LastObservedBootTimeUtc      = Get-RegSZ "LastObservedBootTimeUtc"
+                BootEvidence                 = Get-RegSZ "BootEvidence"
+                SourceBuild                  = Get-RegSZ "SourceBuild"
+                TargetBuild                  = Get-RegSZ "TargetBuild"
+                SourceOSCaption              = Get-RegSZ "SourceOSCaption"
+                TargetOSCaption              = Get-RegSZ "TargetOSCaption"
+                Notes                        = Get-RegSZ "Notes"
+                SetupLogTail                 = Get-RegSZ "SetupLogTail"
+                SetupTelemetryPercent        = Get-RegDWord "SetupTelemetryPercent"
+                SetupTelemetrySource         = Get-RegSZ "SetupTelemetrySource"
+                SetupProcessMissingSinceUtc  = Get-RegSZ "SetupProcessMissingSinceUtc"
+                SetupFailureDetectedAtUtc    = Get-RegSZ "SetupFailureDetectedAtUtc"
                 PostUpgradeOSCaption         = Get-RegSZ "PostUpgradeOSCaption"
                 ServicesComparisonResult     = Get-RegSZ "ServicesComparisonResult"
                 ServicesComparisonReportPath = Get-RegSZ "ServicesComparisonReportPath"
                 ServicesAttentionCount       = Get-RegDWord "ServicesAttentionCount"
                 ServicesInfoCount            = Get-RegDWord "ServicesInfoCount"
-                TargetOSCaption              = Get-RegSZ "TargetOSCaption"
                 LicenseRecommendation        = Get-RegSZ "LicenseRecommendation"
-                Stage                        = Get-RegSZ "Stage"
+                BackupFolder                 = Get-RegSZ "BackupFolder"
+                SystemStateBackupPath         = Get-RegSZ "SystemStateBackupPath"
             }
             return [pscustomobject]$obj
         } finally {
@@ -982,7 +1179,12 @@ function Show-ProgressBar {
     output (phase/mode transitions, banners) stays clean and uncluttered
     regardless of host/redirection quirks.
     #>
-    param([int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk, [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage)
+    param(
+        [int]$PercentComplete, [string]$PhaseName, [string]$Status,
+        [bool]$PingOk, [string]$Mode, [string]$Source,
+        [string]$PercentSource, [string]$ProgressSource,
+        [string]$ProgressFreshness, [string]$Stage
+    )
 
     $pct = [math]::Max(0, [math]::Min(100, $PercentComplete))
     # If ping fails but some other channel confirms the host IS actually
@@ -1000,17 +1202,20 @@ function Show-ProgressBar {
     # Write-Progress bar/percentage text gets clipped and can render as just
     # the fill glyphs ("[ooo") with no visible number, so the "NN%" here is
     # what actually guarantees the percentage stays readable regardless of
-    # terminal width. PercentSource (Measured/Estimated) is also spelled out
-    # so it's clear at a glance whether a number is live telemetry parsed
-    # from Windows Setup's own logs, or a best-effort milestone marker (e.g.
-    # Safe OS/WinPE, where no telemetry can exist at all).
+    # terminal width. PercentSource and ProgressFreshness are also spelled
+    # out so a live MoSetup sample, a deterministic milestone, and a carried
+    # value during SafeOS/WinPE cannot be confused.
     $srcText = if ($PercentSource) { $PercentSource } else { "n/a" }
     # Stage groups Phase 1 (Precheck) / Phase 2 (Backup) / Phase 3-7
     # (Windows Setup actually executing: Downlevel -> Safe OS -> First Boot
     # -> OOBE -> Completed) so it's immediately clear at a glance which of
     # the 3 broad stages is running, in addition to the granular PhaseName.
     $stageText = if ($Stage) { "$Stage - " } else { "" }
-    Write-Progress -Activity "Monitoring OS upgrade on $TargetComputer [$pingText / $modeText]" -Status "$stageText[$pct% - $srcText] $PhaseName (Status=$Status, src:$Source)" -PercentComplete $pct
+    $freshnessText = if ($ProgressFreshness) { $ProgressFreshness } else { "UnknownFreshness" }
+    $progressSourceText = if ($ProgressSource) { $ProgressSource } else { "UnknownSource" }
+    Write-Progress -Activity "Monitoring OS upgrade on $TargetComputer [$pingText / $modeText]" `
+        -Status "$stageText[$pct% - $srcText/$freshnessText via $progressSourceText] $PhaseName (Status=$Status, observer:$Source)" `
+        -PercentComplete $pct
 }
 
 # =============================================================================
@@ -1073,7 +1278,7 @@ $stallWarningCount = 0
 # (e.g. the "WinRMOnly" fallback) - see below for why this must never just
 # reset to a hard 0.
 $lastKnownPercent  = 0
-$lastKnownPercentSource = "Estimated"
+$lastKnownPercentSource = "Unknown"
 # Intelligent "why didn't I see phase X" self-explanation (2026-07-20):
 # tracks the last REAL numeric Phase actually read from a genuine status
 # source (File/CIM-DCOM - the synthetic WinRMOnly/Heartbeat/Offline
@@ -1096,6 +1301,10 @@ while ($true) {
     $elapsedMin = (New-TimeSpan -Start $startTime -End (Get-Date)).TotalMinutes
     if ($elapsedMin -gt $TimeoutMinutes) {
         Write-Log "Monitoring timeout ($TimeoutMinutes minutes) reached. The upgrade may still be legitimately in progress - re-run this script (it will simply resume monitoring) or check $TargetComputer manually." "WARN"
+        $timeoutObservation = [pscustomobject]@{
+            PingOk = $null; WinRmOk = $null; Mode = "MonitoringStopped"; Source = "ServerA.Timeout"
+        }
+        Write-LocalStatusMirror -ObservationStatus $timeoutObservation -ObservationError "Monitoring timeout after $TimeoutMinutes minutes."
         $finalOutcome = "Timeout"
         break
     }
@@ -1107,8 +1316,18 @@ while ($true) {
         # is treated the same way a WinRM drop is: log it, keep polling, never
         # abort the monitoring loop because of a single failed probe.
         Write-Log "Unexpected error while polling status (non-fatal, will retry): $_" "WARN"
+        $errorObservation = [pscustomobject]@{
+            PingOk = $null; WinRmOk = $null; Mode = "PollError"; Source = "ServerA.Exception"
+        }
+        Write-LocalStatusMirror -ObservationStatus $errorObservation -ObservationError $_.Exception.Message
         Start-Sleep -Seconds $PollIntervalSeconds
         continue
+    }
+
+    if ($null -ne $status.Phase) {
+        Write-LocalStatusMirror -ProducerStatus $status -ObservationStatus $status
+    } else {
+        Write-LocalStatusMirror -ObservationStatus $status
     }
 
     if ($status.TargetBuild) { $targetBuildKnown = $status.TargetBuild }
@@ -1145,7 +1364,7 @@ while ($true) {
             $freshPct = [math]::Max($freshPct, $lastKnownPercent)
         }
         $lastKnownPercent       = $freshPct
-        $lastKnownPercentSource = if ($status.PercentSource) { $status.PercentSource } else { "Estimated" }
+        $lastKnownPercentSource = if ($status.PercentSource) { $status.PercentSource } else { "Unknown" }
         $pctSourceForDisplay    = $lastKnownPercentSource
     } else {
         $pctSourceForDisplay = "$lastKnownPercentSource (cached)"
@@ -1158,7 +1377,11 @@ while ($true) {
     # for why that guess has been directly observed to be wrong.
     $lastConfirmedForDisplay = if ($null -ne $lastConfirmedPhaseName) { $lastConfirmedPhaseName } else { "no phase confirmed yet" }
     $displayPhaseName = if ($null -ne $status.Phase) { $status.PhaseName } else { "$lastConfirmedForDisplay (connectivity gap - phase UNCONFIRMED; could be a Safe OS/WinPE reboot in progress, or just a transient interruption while still in this same phase - next real reading will confirm)" }
-    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage
+    $progressFreshnessForDisplay = if ($null -ne $status.Phase -and $status.ProgressFreshness) { $status.ProgressFreshness } else { "CarriedForward" }
+    $progressSourceForDisplay = if ($null -ne $status.Phase -and $status.ProgressSource) { $status.ProgressSource } else { "ServerA.CachedProducerStatus" }
+    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status `
+        -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay `
+        -ProgressSource $progressSourceForDisplay -ProgressFreshness $progressFreshnessForDisplay -Stage $status.Stage
 
     # --- Explicit Active-Polling <-> Heartbeat transition logging ------------
     if ($status.Mode -ne $lastMode) {

@@ -21,53 +21,50 @@ Automates and remotely monitors an in-place Windows Server OS upgrade:
   `setup.exe` launch, then tracks its own phase/progress locally.
 
 ## Architecture / who does what (for ServiceNow or any other remote-trigger integration)
-Three scripts run ON Server B and own ALL phase/percent tracking - Server A
-never computes progress itself, it only ever READS what Server B already
-computed, via one of three independent channels (file share / registry-via-
-CIM-DCOM / nothing-during-the-genuine-WinPE-blind-window):
+Two executable PowerShell scripts on Server B publish status through one shared
+helper. Server A never computes a replacement percentage; it reads the target
+through JSON or registry-via-CIM/DCOM and caches the last producer snapshot
+during the genuine WinPE blind window:
+- **`OSUpgradeStatus.ps1`** (Server B) - the sole registry/JSON/progress
+  implementation dot-sourced by both target processes. It owns SchemaVersion
+  2, `RunId`, `Sequence`, weighted end-to-end progress, high-water behavior,
+  freshness timestamps, a named cross-process mutex, atomic JSON replacement,
+  and reboot evidence.
 - **`Start-TargetUpgrade.ps1`** (Server B) - runs prechecks + backup, then
   sets Phase 1 -> 2 -> 3 as it progresses through its own steps, before ever
   launching `setup.exe`. This is the ONLY phase/percent writer that runs
   synchronously as part of the kickoff call itself.
 - **`Update-UpgradeStatus.ps1`** (Server B) - the actual phase/percent
-  ENGINE for everything from Downlevel onward. Registered as a recurring
-  5-minute Scheduled Task (`OSUpgradePhaseMonitor`) by `Start-TargetUpgrade.ps1`,
-  PLUS invoked immediately (not waiting for the next 5-min tick) by three
-  event hooks: the Event-ID-1074 watcher task (`OSUpgradeRebootWatcher`,
-  fires the instant a restart is initiated), and Windows Setup's own
+  engine for everything from Downlevel onward. Registered every minute, at
+  startup, and for System Events 12/6005. It is also invoked by the Event-ID-
+  1074 watcher (`OSUpgradeRebootWatcher`, restart initiation) and Setup's
   `setupcomplete.cmd`/`setuprollback.cmd` (`/PostOOBE`/`/PostRollback`
-  hooks, mandatory-exact filenames per Microsoft). It writes every
-  phase/percent update to BOTH the registry AND the JSON file - this is the
-  single source of truth Server A always reads from. `PercentComplete` is
-  always paired with a `PercentSource` field, currently always
-  `"Measured"` in practice - either regex-parsed/registry-read from Windows
-  Setup's own live telemetry (Downlevel, First Boot; carried forward
-  unchanged during Safe OS/OOBE where no telemetry can exist) or, for Stage
-  1/2 (Pre-Upgrade Assessment/Backup, which have no telemetry source of
-  their own at all), a genuine task-count fraction ("N of M checks/tasks
-  done") - a real measurement either way, never a fabricated milestone
-  guess. A `PercentStage` field (internal bookkeeping, not exposed in the
-  JSON) tracks which Stage the current `PercentComplete` belongs to, so the
-  monotonic-never-decreases clamp only applies WITHIN a stage, never across
-  a stage boundary (each Stage has its own independent 0-100 scale).
+  hooks). Only Microsoft's `mosetup\Volatile\SetupProgress` can supply a live
+  Setup percentage. Events change phase/evidence, never invent percentages.
+- **Progress contract** - Stage 1 task count maps to overall 0-10, Stage 2
+  task count maps to 10-25, Windows Setup maps to 25-95, and validation maps
+  to 95-100. `PercentComplete` is the compatibility alias for
+  `OverallPercentComplete`; `StagePercentComplete` retains the local 0-100
+  value. Missing telemetry and terminal failures retain the high-water value.
 - **`Start-RemoteUpgradeOrchestrator.ps1`** (Server A) - a pure READER/
   monitor. Polls Server B every `-PollIntervalSeconds` (default 15s) via
   whichever channel answers (file share, then CIM/DCOM, then ping-only
   during the genuine WinPE blind window), renders `Write-Progress`, logs
   phase transitions, and prints a final summary banner (Status/Server OS/
   Build/services-comparison result) before exiting 0 (success) / 1 (failed)
-  / 2 (timeout). **If this process is killed/closed, the upgrade on Server B
-  is completely unaffected** - re-running it just resumes monitoring (with
-  a liveness check to avoid falsely resuming a stale/dead attempt - see bug
-  list below). This is the piece a ServiceNow-triggered remote call should
-  invoke; it needs nothing of its own to survive between polls.
+  / 2 (timeout). It atomically maintains a local JSON mirror whose top-level
+  fields remain the last real target snapshot and whose `Observer` object
+  describes current connectivity/cache age. **If this process is killed or
+  closed, the upgrade on Server B is unaffected**; a rerun restores that local
+  mirror before reconnecting. This is the process a remote initiator invokes.
 
 ## File layout
 ```
 OSUpgradeAutomation1/
 ├── ServerB-Target/                      (copied to & run ON Server B)
 │   ├── Start-TargetUpgrade.ps1          - prechecks, backup, ISO mount, setup.exe launch (via Scheduled Task)
-│   ├── Update-UpgradeStatus.ps1         - 5-min scheduled task: phase/percent tracker + post-upgrade validation
+│   ├── OSUpgradeStatus.ps1              - shared v2 status/progress/JSON/reboot contract
+│   ├── Update-UpgradeStatus.ps1         - 1-min + boot-event phase tracker and post-upgrade validation
 │   ├── Remove-UpgradeArtifacts.ps1      - retention-based cleanup (registry/JSON/scheduled tasks)
 │   ├── setupcomplete.cmd                - Windows Setup /PostOOBE hook (filename is mandatory-exact)
 │   ├── setuprollback.cmd                - Windows Setup /PostRollback hook (filename is mandatory-exact)
@@ -91,7 +88,7 @@ underlying tracking logic, which DOES fully exist and fire for every phase:
   on those intermediate values.
 - Phase 6 (OOBE) -> Phase 7 (Completed) is the most likely to be missed
   entirely: `setupcomplete.cmd` calls `Update-UpgradeStatus.ps1` directly
-  (not waiting for the 5-min schedule), which sets Phase 6, then
+  (not waiting for the one-minute schedule), which sets Phase 6, then
   IMMEDIATELY calls `Invoke-PostUpgradeValidation` in the same execution,
   which sets Phase 7 a few hundred milliseconds later - both writes happen
   faster than Server A's 15-second poll interval, so Server A's snapshot
@@ -104,11 +101,12 @@ underlying tracking logic, which DOES fully exist and fire for every phase:
   reconstructable after the fact even if the live console view skipped it.
 - **Overall percentage IS tracked spanning all phases** (not per-phase
   only): `PercentComplete` in the registry/JSON is a single 0-100 value
-  that advances monotonically across the whole run (20/25 Downlevel ->
-  40/55 Safe OS -> 60-70 First Boot -> 95 OOBE -> 100 Completed/0 on
-  Rollback), and on failure `Set-Phase -Phase 99 -PhaseName "Rolled Back"`
-  is written with `Notes` describing exactly why (SetupDiag results path
-  included) - so "failed at phase X" reporting already works today; the
+  that advances monotonically across the whole run: prechecks 0-10, backup
+  10-25, Setup 25-95, and validation 95-100. SafeOS or missing telemetry
+  carries the last verified value and timestamp. Rollback/failure also keeps
+  that high-water value rather than resetting to zero. `Set-Phase -Phase 99
+  -PhaseName "Rolled Back"` is written with `Notes` describing why (including
+  the SetupDiag path when present), so "failed at phase X" reporting works; the
   orchestrator's final banner (see below) now also explicitly prints "Failed
   at phase: ..." for this reason.
 
@@ -183,6 +181,12 @@ targetBuild` locally) rather than looping forever.
   (`D:\upgrade_status.json`), so Server A can read status via either the
   admin share (`\\ServerB\D$\upgrade_status.json`, no WinRM needed) or a
   DCOM-based CIM/WMI registry read (also WinRM-independent) as a fallback.
+- **Server A local status mirror**: the orchestrator atomically writes
+  `UpgradeStatus_<target>_Latest.json` beside its logs unless
+  `-LocalStatusMirrorPath` overrides it. Real File/DCOM reads replace the
+  producer snapshot. Offline/Heartbeat/poll-error updates change only the
+  `Observer` object, so the last target `RunId`, `Sequence`, phase, percentage,
+  and timestamps remain intact and explicitly cached through WinPE.
 - **Phase model** (kept consistent across all scripts) - see "Full phase list"
   below for descriptions of each: `1` Pre-Upgrade Assessment · `2` Backup ·
   `3` Downlevel · `4` Safe OS (WinPE, blind window) · `5` First Boot ·
@@ -213,9 +217,15 @@ targetBuild` locally) rather than looping forever.
   (`throw`). If not, it automatically unregisters the 4 scheduled tasks,
   clears the registry key, removes stale OOBE/rollback markers, and renames
   away any leftover `$WINDOWS.~BT` - then proceeds with a clean run.
-- **Progress % sources** (in priority order): `HKLM:\SYSTEM\Setup\Status\ChildCompletion\setup.exe`
-  → regex scan of `setupact.log` (Panther logs) → phase-based conservative
-  baseline (25/55/70/95/100) if neither real source is available.
+- **Progress source**: live Windows Setup progress comes only from Microsoft's
+  `HKLM:\SYSTEM\Setup\mosetup\Volatile\SetupProgress`. `ChildCompletion` and
+  arbitrary percentages in `setupact.log` are diagnostics only and never feed
+  the published number. If MoSetup is absent, the last verified value and its
+  `ProgressUpdatedAtUtc` are retained with `ProgressFreshness=CarriedForward`.
+- **Reboot evidence**: Event 1074 marks restart initiation. Startup and System
+  Events 12/6005 trigger immediate status refreshes, but `LastBootUpTime` is
+  the unique reboot identity used for `RebootCount`; Events 12 and 6005 are
+  stored as corroboration and cannot double-count a boot.
 - **WinRM disconnect handling on Server A**: explicit `Test-WSMan`-based
   `Mode` state machine (`ActivePolling` / `Heartbeat` / `Offline`) with clear
   transition logging ("WinRM connectivity LOST/RESTORED..."). Final success
@@ -289,6 +299,13 @@ targetBuild` locally) rather than looping forever.
   reboot (reboot + re-run exact command).
 
 ## Known bugs found & fixed during lab testing (TestVM1)
+
+> **Historical chronology:** Entries from this heading through the dated
+> feature notes record the implementation as it existed when each issue was
+> found. Cadences, file counts, progress formulas, and fallback sources in
+> those entries may have been superseded. The architecture, key design
+> decisions, and full phase list in this document describe the current system.
+
 1. **`Get-DiskImage` with no `-ImagePath`** used to check for an
    already-mounted ISO → `-ImagePath` is mandatory, so PowerShell prompted
    interactively and hung. **Fix**: always call with the specific candidate
@@ -1198,14 +1215,11 @@ needed for this.
   Unlike the previously-top-priority undocumented `ChildCompletion\setup.exe`
   DWORD, this key is officially documented AND spans all four Windows-Setup
   phases (Downlevel/Safe OS/First Boot/Second Boot-OOBE) as one continuous
-  0-100 arc, so it no longer needs the old per-phase clamps
-  (`[math]::Min(...,55)` / `[math]::Max(...,60)`) when it's the source -
-  those clamps are now only applied as a fallback for the less-authoritative
-  `ChildCompletion`/`setupact.log`-regex sources. New `Source` field on the
-  return object (`MoSetupRegistry`/`ChildCompletion`/`SetupActLog`) records
-  which one actually answered.
-- **Stage 1/2/3 grouping**: both `Set-Phase` functions (`Start-TargetUpgrade.ps1`
-  and `Update-UpgradeStatus.ps1`) now also compute and persist a `Stage`
+  0-100 arc. The later v2 redesign removed the old per-phase clamps and all
+  `ChildCompletion`/`setupact.log` percentage fallbacks entirely; absence now
+  carries the last verified MoSetup sample with freshness metadata.
+- **Stage 1/2/3 grouping**: the shared `OSUpgradeStatus.ps1` `Set-Phase`
+  function computes and persists a `Stage`
   registry/JSON value - "Stage 1/3: Pre-Upgrade Assessment" (Phase 1),
   "Stage 2/3: Backup" (Phase 2), "Stage 3/3: Windows Setup Execution"
   (Phases 3-7, i.e. Downlevel -> Safe OS -> First Boot -> OOBE -> Completed),
@@ -1264,14 +1278,14 @@ alongside this solution.
 ## Full phase list
 | # | Name | Meaning | Percent behavior |
 |---|------|---------|-----------|
-| 1 | Pre-Upgrade Assessment | DC/cluster/diskspace/reboot/DISM/edition/licensing/patch-level/VMware Tools/RDS CAL/orphaned-profiles checks on Server B | Task-count based: (checks completed / 12) x 100, climbs with every check regardless of PASS/WARN/FAIL |
-| 2 | State & Policy Backup | Registry hives, Local GPO (+ optional LGPO.exe) + secedit export, gpresult, RDS CAL DB (if applicable) saved to `D:\UpgradeBackup` | Task-count based: (tasks completed / 7) x 100 |
-| 3 | Downlevel Phase | Still on the source build; `setup.exe` actively running (launched via `OSUpgradeSetupLaunch` Scheduled Task) | Measured from the `mosetup\Volatile\SetupProgress` registry key (unclamped) when available, else `ChildCompletion`/log-regex (clamped to <=55) - falls back to the last real carried-forward value if no source answers yet |
-| 4 | Safe OS Phase | WinPE - the genuine blind window; no script/task can run here at all (Event 1074 marks the phase transition instantly, but writes no percent) | No telemetry possible - the last real Downlevel measurement (often already 80-90%+) persists unchanged through this phase |
-| 5 | First Boot Phase | New build has booted; `SystemSetupInProgress=1` while roles/settings migrate | Same MoSetup-registry-first Measured logic as Downlevel (clamped to >=60 for less-authoritative sources), else carries forward the last real value |
-| 6 | Second Boot (OOBE) Phase | `setupcomplete.cmd` fired `/PostOOBE`; finalizing configuration/cleanup | One-shot hook, no ongoing counter - carries forward the last real First Boot measurement unchanged |
-| 7 | Completed | Post-upgrade validation ran (build/edition/activation/critical-services checks); `Completed` or `CompletedWithWarnings` | 100 (Measured - a verified fact, build match already confirmed locally) |
-| 99 | Rolled Back / Failed | `setuprollback.cmd` fired `/PostRollback` - upgrade failed and Windows reverted to the source OS; SetupDiag results copied if present | 0 (genuine terminal value, monotonic clamp deliberately does not apply to Failed/RolledBack) |
+| 1 | Pre-Upgrade Assessment | Fourteen DC/cluster/disk/reboot/health/media/licensing/patch/platform/RDS/profile checks | Local task count maps into 0-10 overall |
+| 2 | State & Policy Backup | Eight backup units saved to `D:\UpgradeBackup` / `WindowsImageBackup` | Local task count maps into 10-25 overall |
+| 3 | Downlevel Phase | Source build; Setup launched through `OSUpgradeSetupLaunch` | MoSetup `SetupProgress` maps into 25-95 overall; otherwise carry the last sample |
+| 4 | Safe OS Phase | Event 1074 observed; WinPE is the genuine target-side blind window | No invented value; retain high-water and original progress timestamp, with `ExpectedDisconnect=true` |
+| 5 | First Boot Phase | Target build with `SystemSetupInProgress=1` | MoSetup remains the only live numeric source; otherwise carry forward |
+| 6 | Second Boot (OOBE) Phase | `/PostOOBE` hook fired | Deterministic Setup-complete milestone: 95 overall, then validation starts |
+| 7 | Post-Upgrade Validation / Completed | Build, edition, activation, and services validation | 95 while validating; 100 only for `Completed`/`CompletedWithWarnings` |
+| 99 | Rolled Back / Failed | `/PostRollback` fired; SetupDiag copied if present | Terminal status retains the highest verified overall percentage and sample timestamp |
 
 ## Open items / not yet done
 - No automated end-to-end test of a full upgrade run to completion yet

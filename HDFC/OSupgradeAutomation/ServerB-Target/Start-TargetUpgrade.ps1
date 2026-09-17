@@ -129,6 +129,7 @@ $script:LogDir      = Join-Path $script:BaseDir "Logs"
 $script:StatusJson  = $StatusJsonPath
 $script:MarkerOOBE  = Join-Path $script:BaseDir "postoobe.marker"
 $script:MarkerRB    = Join-Path $script:BaseDir "rollback.marker"
+$script:StatusHelper = Join-Path $PSScriptRoot "OSUpgradeStatus.ps1"
 
 $script:TaskMonitor   = "OSUpgradePhaseMonitor"
 $script:TaskReboot    = "OSUpgradeRebootWatcher"
@@ -164,162 +165,12 @@ function Write-Log {
     Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
 }
 
-function Set-UpgradeRegistryValue {
-    param([string]$Name, $Value, [string]$Type = "String")
-    if (-not (Test-Path $script:RegRoot)) { New-Item -Path $script:RegRoot -Force | Out-Null }
-    New-ItemProperty -Path $script:RegRoot -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+# Both target-side processes use one JSON schema and one monotonic end-to-end
+# percentage model from this shared helper.
+if (-not (Test-Path $script:StatusHelper)) {
+    throw "Required shared status helper not found: $script:StatusHelper"
 }
-
-function Get-UpgradeRegistryValue {
-    <#
-    Read-side counterpart to Set-UpgradeRegistryValue - added 2026-07-20
-    alongside Set-Phase's monotonic-percent clamp (parity with
-    Update-UpgradeStatus.ps1's own Set-Phase, which already had both this
-    helper and the clamp). This script never previously needed to READ its
-    own registry values back, only write them - the clamp/display-fallback
-    logic in Set-Phase below is what introduced that need.
-    #>
-    param([string]$Name, $Default = $null)
-    if (Test-Path $script:RegRoot) {
-        $v = (Get-ItemProperty -Path $script:RegRoot -Name $Name -ErrorAction SilentlyContinue).$Name
-        if ($null -ne $v) { return $v }
-    }
-    return $Default
-}
-
-function Write-StatusJson {
-    <#
-    Writes the full status object to $script:StatusJson (D:\upgrade_status.json
-    by default). This is the primary channel Server A reads directly (over the
-    admin share) when WinRM is unavailable during Downlevel/SafeOS transitions.
-    Wrapped defensively - a transient file lock must never abort the upgrade.
-    #>
-    param([hashtable]$Extra = @{})
-    try {
-        $obj = [ordered]@{
-            ComputerName    = $env:COMPUTERNAME
-            Phase           = (Get-ItemProperty $script:RegRoot -Name Phase -ErrorAction SilentlyContinue).Phase
-            PhaseName       = (Get-ItemProperty $script:RegRoot -Name PhaseName -ErrorAction SilentlyContinue).PhaseName
-            Status          = (Get-ItemProperty $script:RegRoot -Name Status -ErrorAction SilentlyContinue).Status
-            PercentComplete = (Get-ItemProperty $script:RegRoot -Name PercentComplete -ErrorAction SilentlyContinue).PercentComplete
-            PercentSource   = (Get-ItemProperty $script:RegRoot -Name PercentSource -ErrorAction SilentlyContinue).PercentSource
-            SourceBuild     = (Get-ItemProperty $script:RegRoot -Name SourceBuild -ErrorAction SilentlyContinue).SourceBuild
-            TargetBuild     = (Get-ItemProperty $script:RegRoot -Name TargetBuild -ErrorAction SilentlyContinue).TargetBuild
-            TargetOSCaption = (Get-ItemProperty $script:RegRoot -Name TargetOSCaption -ErrorAction SilentlyContinue).TargetOSCaption
-            Stage           = (Get-ItemProperty $script:RegRoot -Name Stage -ErrorAction SilentlyContinue).Stage
-            StartTime       = (Get-ItemProperty $script:RegRoot -Name StartTime -ErrorAction SilentlyContinue).StartTime
-            LastUpdated     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            Notes           = (Get-ItemProperty $script:RegRoot -Name Notes -ErrorAction SilentlyContinue).Notes
-        }
-        foreach ($k in $Extra.Keys) { $obj[$k] = $Extra[$k] }
-        $tmp = "$($script:StatusJson).tmp"
-        ($obj | ConvertTo-Json -Depth 4) | Out-File -FilePath $tmp -Encoding UTF8 -Force
-        Move-Item -Path $tmp -Destination $script:StatusJson -Force
-    } catch {
-        Write-Log "Non-blocking: failed to write status JSON to $script:StatusJson : $_" "WARN"
-    }
-}
-
-function Set-Phase {
-    <# Single source of truth for phase/status - updates registry AND JSON together. #>
-    param(
-        [int]$Phase, [string]$PhaseName,
-        [string]$Status = "InProgress",
-        [int]$PercentComplete = -1,
-        [string]$Notes = "",
-        # "Measured" = derived from a real, live data source (e.g. regex-parsed
-        # from setupact.log); "Estimated" (default) = a best-effort milestone
-        # marker where no live telemetry source exists (e.g. Safe OS/WinPE, or
-        # a one-shot hook like OOBE). Start-TargetUpgrade.ps1 never parses live
-        # setup logs itself, so every call here is legitimately "Estimated".
-        [ValidateSet("Measured","Estimated")][string]$PercentSource = "Estimated"
-    )
-    # Stage grouping for customer-facing display: Stage 1/2 are OUR OWN
-    # script's work (prechecks/backup); Stage 3 is Windows Setup's own
-    # engine actually running - kept identical to the same mapping in
-    # Update-UpgradeStatus.ps1 so the label never flips inconsistently
-    # between the two scripts writing to the same registry key.
-    $stageLabel = switch ($Phase) {
-        1       { "Stage 1/3: Pre-Upgrade Assessment" }
-        2       { "Stage 2/3: Backup" }
-        99      { "Stage 3/3: Windows Setup Execution (Rolled Back)" }
-        default { "Stage 3/3: Windows Setup Execution" }
-    }
-    Set-UpgradeRegistryValue -Name "Stage"        -Value $stageLabel
-    Set-UpgradeRegistryValue -Name "Phase"       -Value $Phase -Type DWord
-    Set-UpgradeRegistryValue -Name "PhaseName"   -Value $PhaseName
-    Set-UpgradeRegistryValue -Name "Status"      -Value $Status
-    Set-UpgradeRegistryValue -Name "LastUpdated" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-    if ($PercentComplete -ge 0) {
-        # Parity fix (2026-07-20): Update-UpgradeStatus.ps1's Set-Phase has
-        # always clamped percent to never visibly regress while InProgress;
-        # this sibling copy of the SAME function (duplicated because the two
-        # scripts run as separate processes) was missing that clamp - which
-        # is exactly why a real run showed "Percent=0" logged here moments
-        # after Phase 2's backup step had already reached 15%, looking like
-        # progress reset. Same clamp, same "not applied to terminal Failed
-        # states" exception, now applied here too.
-        # SCOPED TO STAGE, NOT GLOBAL (2026-07-24): each Stage now has its
-        # OWN independent 0-100 percentage (Stage 1/2 = task-count-based,
-        # Stage 3 = setup.exe telemetry) - clamping against whatever the
-        # PREVIOUS stage ended at would wrongly force a new stage's fresh,
-        # genuinely-lower starting percent (e.g. Stage 3 Downlevel's real
-        # first Measured reading of 15%) up to the prior stage's ending
-        # value (e.g. Stage 2 finishing at 100%). Only clamp when the
-        # stored percent came from THIS SAME stage - i.e. never carry a
-        # high-water mark across a stage boundary, only within one.
-        if ($Status -eq "InProgress" -and (Get-UpgradeRegistryValue -Name "PercentStage") -eq $stageLabel) {
-            $priorPercent = [int](Get-UpgradeRegistryValue -Name "PercentComplete" -Default 0)
-            $PercentComplete = [math]::Max($PercentComplete, $priorPercent)
-        }
-        Set-UpgradeRegistryValue -Name "PercentComplete" -Value $PercentComplete -Type DWord
-        Set-UpgradeRegistryValue -Name "PercentSource"   -Value $PercentSource
-        Set-UpgradeRegistryValue -Name "PercentStage"    -Value $stageLabel
-    } elseif ((Get-UpgradeRegistryValue -Name "PercentStage") -and (Get-UpgradeRegistryValue -Name "PercentStage") -ne $stageLabel) {
-        # BUG FIX (2026-08-26) - parity with Update-UpgradeStatus.ps1's
-        # Set-Phase: clear the previous stage's stale PercentComplete/
-        # PercentSource when entering a new stage with no fresh measurement
-        # yet, so Write-StatusJson (read by the orchestrator) never surfaces
-        # a prior stage's leftover percentage under the new stage's label.
-        Remove-ItemProperty -Path $script:RegRoot -Name "PercentComplete" -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $script:RegRoot -Name "PercentSource" -ErrorAction SilentlyContinue
-        Set-UpgradeRegistryValue -Name "PercentStage" -Value $stageLabel
-    }
-    if ($Notes) { Set-UpgradeRegistryValue -Name "Notes" -Value $Notes }
-    # BUG FIX (2026-07-20): this fallback used to default to a hardcoded
-    # 0/"Estimated" when nothing was stored yet - which, on Phase 1's very
-    # first call ever (fresh registry, nothing to carry forward),
-    # reconstructed the exact same "Percent=0 (Estimated)" text the whole
-    # point of omitting -PercentComplete was meant to eliminate. Now
-    # distinguishes "no real value EVER existed" ($null - show nothing)
-    # from "a real value exists to carry forward" (show it).
-    $storedPct    = Get-UpgradeRegistryValue -Name "PercentComplete"
-    $storedSource = Get-UpgradeRegistryValue -Name "PercentSource"
-    $storedStage  = Get-UpgradeRegistryValue -Name "PercentStage"
-    if ($PercentComplete -ge 0) {
-        $displayPct    = $PercentComplete
-        $displaySource = $PercentSource
-    } elseif ($null -ne $storedPct -and $storedStage -eq $stageLabel) {
-        # Only carry forward a stored value that belongs to THIS SAME stage
-        # (2026-07-24) - otherwise a fresh stage's very first no-percent
-        # call (e.g. Phase 2's kickoff) would momentarily flash the PRIOR
-        # stage's ending percent (e.g. Stage 1 finishing at 100%) before its
-        # own first real task-based percent overwrites it a moment later.
-        $displayPct    = $storedPct
-        $displaySource = if ($storedSource) { $storedSource } else { "Estimated" }
-    } else {
-        $displayPct = $null
-    }
-    $pctClause = if ($null -ne $displayPct) { " Percent=$displayPct ($displaySource)" } else { "" }
-    # Dropped the bare "Phase=$Phase" number from this text (2026-07-20,
-    # customer feedback: it visually looked redundant/confusable next to
-    # "Stage 3/3" - two different numbering schemes that don't actually
-    # correlate 1:1, since Phase 3-7 and 99 ALL map to the same Stage 3/3).
-    # The raw Phase number is still fully preserved in the registry/JSON for
-    # technical/ServiceNow use - just no longer restated in this text.
-    Write-Log "[$stageLabel] $PhaseName - Status=$Status$pctClause $Notes"
-    Write-StatusJson
-}
+. $script:StatusHelper
 
 function Enable-BackupPrivilege {
     <#
@@ -443,14 +294,15 @@ if ($priorStatus) {
     }
 }
 
-# No -PercentComplete here (2026-07-20, per feedback: an arbitrary "0%"/
-# "5%"/"15%" milestone for prechecks/backup doesn't represent anything
-# measurable the way Stage 3's real setup.exe telemetry does, and risks
-# looking like meaningful progress data when it's really just a guess).
-# Stage 1/2 now show Stage+Phase+Status with no percent number at all; a
-# fresh run's registry has no prior PercentComplete yet, so Set-Phase's own
-# display-fallback resolves this to a plain 0 anyway.
-Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress"
+$runStartedAt = Get-Date
+Set-UpgradeRegistryValue -Name "RunId" -Value ([guid]::NewGuid().ToString())
+Set-UpgradeRegistryValue -Name "StartTime" -Value ($runStartedAt.ToString("yyyy-MM-dd HH:mm:ss"))
+Set-UpgradeRegistryValue -Name "StartTimeUtc" -Value ([DateTimeOffset]$runStartedAt).ToUniversalTime().ToString("o")
+Set-UpgradeRegistryValue -Name "StatusJsonPath" -Value $script:StatusJson
+Set-UpgradeRegistryValue -Name "RebootCount" -Value 0 -Type DWord
+Update-UpgradeBootEvidence | Out-Null
+Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress" `
+    -PercentComplete 0 -PercentSource "Measured" -ProgressSource "StageBoundary" -ProgressFreshness "Milestone"
 
 # =============================================================================
 # SECTION 2 - HARD-FAIL PRE-CHECKS (spec Section 1)
@@ -1013,7 +865,8 @@ try {
                 -Detail "RD Session Host role is installed; configured CAL license server(s): $($licServers -join ', '). Requirement: each license server must run an OS version >= $targetDesc AND must already have CALs for $targetDesc installed/activated, or clients will be unable to obtain a valid RDS CAL once the post-upgrade licensing grace period ends. Findings: $($serverFindings -join ' | ') Reference: https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-client-access-license"
         }
     } else {
-        Write-Log "RDS Session Host role not installed - CAL license server check skipped." "INFO"
+        Add-PreCheckResult -Name "RDS Session Host CAL license server check" -Result "PASS" `
+            -Detail "RD Session Host role is not installed; the CAL license server check is not applicable."
     }
 } catch {
     Add-PreCheckResult -Name "RDS Session Host CAL license server check" -Result "WARN" -Detail "Could not evaluate RDS Session Host role: $_"
@@ -1545,7 +1398,8 @@ try {
 
 if ($hardFailures.Count -gt 0) {
     $msg = ($hardFailures -join " | ")
-    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "Failed" -PercentComplete 0 -Notes $msg
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "Failed" -PercentComplete 0 `
+        -ProgressSource "PrecheckGate" -ProgressFreshness "Terminal" -Notes $msg
     Write-Log "PRE-CHECK GATE FAILED - terminating immediately. Details: $msg" "ERROR"
     throw "Pre-upgrade assessment failed: $msg"
 }
@@ -1555,10 +1409,11 @@ foreach ($w in $warnings) { Write-Log "  - $w" "WARN" }
 # =============================================================================
 # SECTION 3 - STATE & POLICY BACKUP  (D:\UpgradeBackup by default)
 # =============================================================================
-# Same reasoning as Phase 1 above - no fabricated milestone percent at
-# kickoff (0/M tasks done yet - Update-BackupProgress below reports real
-# progress as each task actually finishes).
-Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress"
+# Backup starts at 0/8 local tasks, which maps to 10% overall. Each completed
+# task below advances the local task-count value until Stage 2 reaches the
+# 25% overall handoff boundary.
+Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" `
+    -PercentComplete 0 -PercentSource "Measured" -ProgressSource "StageBoundary" -ProgressFreshness "Milestone"
 
 # TASK-COUNT-BASED PERCENTAGE (2026-07-24, same reasoning as
 # $totalPrecheckSteps above) - IMPORTANT: keep $totalBackupSteps in sync
@@ -1828,7 +1683,8 @@ try {
     # Aligned to 0 (was an inconsistent leftover "5") - a failed backup
     # genuinely completed 0% of anything meaningful, matching Phase 1's own
     # Failed-path convention above.
-    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "Failed" -PercentComplete 0 -Notes "$_"
+    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "Failed" -PercentComplete 0 `
+        -ProgressSource "BackupFailure" -ProgressFreshness "Terminal" -Notes "$_"
     Write-Log "Backup phase failed critically - terminating: $_" "ERROR"
     throw
 }
@@ -1842,7 +1698,6 @@ $sourceEditionId = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\Curren
 Set-UpgradeRegistryValue -Name "SourceBuild"  -Value $sourceBuild
 Set-UpgradeRegistryValue -Name "SourceOSCaption" -Value $osInfo.Caption
 Set-UpgradeRegistryValue -Name "SourceEditionId" -Value $sourceEditionId
-Set-UpgradeRegistryValue -Name "StartTime"    -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 Set-UpgradeRegistryValue -Name "IsoPath"      -Value $isoInfo.IsoPath
 Set-UpgradeRegistryValue -Name "StatusJsonPath" -Value $script:StatusJson
 # Safety net: if the edition-match check above could not derive TargetBuild
@@ -1869,7 +1724,7 @@ Write-Log "Current OS: $($osInfo.Caption) build $sourceBuild. Upgrade media: $($
 # ProgramData location that survives the whole upgrade so scheduled tasks /
 # setup.exe hooks always reference a stable, persistent path.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-foreach ($f in @("Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd","LGPO.exe")) {
+foreach ($f in @("OSUpgradeStatus.ps1","Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd","LGPO.exe")) {
     $src = Join-Path $here $f
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination $script:ScriptsDir -Force
@@ -1880,23 +1735,24 @@ foreach ($f in @("Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setup
     }
 }
 
-# --- Register the 5-minute phase/progress monitor ----------------------------
+# --- Register recurring and boot-driven phase/progress monitoring ------------
 $monitorScript = Join-Path $script:ScriptsDir "Update-UpgradeStatus.ps1"
 $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`""
-# Interval shortened from 5 to 2 minutes (2026-07-20): on a fast upgrade, Safe
-# OS + First Boot + OOBE can complete in well under 5 minutes combined - a
-# 5-min cadence can miss First Boot's window entirely (no poll ever lands
-# while the machine is specifically in that phase before the OOBE hook fires
-# and jumps straight to Phase 6). 2 minutes meaningfully narrows that blind
-# spot without materially increasing overhead (still a lightweight registry/
-# log-tail read).
-$trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3)
+$periodicTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3)
+$startupTrigger  = New-ScheduledTaskTrigger -AtStartup
+$eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace "Root/Microsoft/Windows/TaskScheduler"
+$bootEventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
+$bootEventTrigger.Subscription = @'
+<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[(EventID=12 and Provider[@Name='Microsoft-Windows-Kernel-General']) or (EventID=6005 and Provider[@Name='EventLog'])]]</Select></Query></QueryList>
+'@
+$bootEventTrigger.Enabled = $true
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
 
 Unregister-ScheduledTask -TaskName $script:TaskMonitor -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $script:TaskMonitor -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-Write-Log "Registered scheduled task '$script:TaskMonitor' (every 2 min, persists across reboots)."
+Register-ScheduledTask -TaskName $script:TaskMonitor -Action $action `
+    -Trigger @($periodicTrigger, $startupTrigger, $bootEventTrigger) -Principal $principal -Settings $settings | Out-Null
+Write-Log "Registered scheduled task '$script:TaskMonitor' (every 1 min, at startup, and on System events 12/6005). LastBootUpTime is the unique reboot signal; events 12/6005 are corroboration."
 
 # --- Register the event-triggered Safe OS watcher (Event ID 1074) -----------
 try {
@@ -1906,42 +1762,23 @@ try {
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v PhaseName /t REG_SZ /d `"Safe OS Phase`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Status /t REG_SZ /d `"InProgress`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Notes /t REG_SZ /d `"Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot.`" /f"
+        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ExpectedDisconnect /t REG_DWORD /d 1 /f"
+        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ProgressFreshness /t REG_SZ /d `"CarriedForward`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v LastUpdated /t REG_SZ /d `"%date% %time%`" /f"
     )
-    # This task deliberately runs via cmd.exe/reg.exe (not PowerShell) so it
-    # fires instantly/reliably in the narrow pre-shutdown window right
-    # before the real reboot - which means it can never call the Set-Phase
-    # PowerShell function, and so never mirrors into OSUpgradeProgress.log
-    # the way every other phase transition does. That left Phase 4 (Safe OS)
-    # completely invisible in that durable log, even though the live
-    # registry WAS updated correctly. Fix (2026-07-20): append one more
-    # command to the SAME cmd.exe chain that echoes a matching line straight
-    # into OSUpgradeProgress.log - no PowerShell dependency added, just a
-    # plain redirected echo, using the already-known $backupFolder path
-    # baked in at task-REGISTRATION time (this task itself only ever runs
-    # once, later, when Event ID 1074 fires).
-    #
-    # Deliberately does NOT touch PercentComplete/PercentSource at all
-    # anymore (2026-07-20 follow-up): this reg.exe chain used to hardcode a
-    # fake "40% (Estimated)" Safe OS milestone, which could visibly LOWER
-    # the displayed percentage below whatever real Downlevel reading (via
-    # the MoSetup registry, sometimes already in the 90s%) had just been
-    # measured moments before reboot - looking like a regression for no
-    # reason. Simply not writing those two values here leaves the registry's
-    # last real Measured percent untouched/still showing through Safe OS.
-    if ($backupFolder -and (Test-Path $backupFolder)) {
-        $progressLogPath = Join-Path $backupFolder "OSUpgradeProgress.log"
-        $regCmds += "echo [%date% %time%] [Stage 3/3: Windows Setup Execution] Phase=4 (Safe OS Phase) Status=InProgress Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot. Percent unchanged from last real Downlevel reading (no telemetry possible in WinPE). >> `"$progressLogPath`""
-    }
+    # The first action is intentionally cmd/reg.exe for the narrow shutdown
+    # window. The second action publishes the same transition atomically to
+    # JSON and the durable history through the shared PowerShell contract.
     $rebootAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c " + ($regCmds -join " && "))
-    $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace "Root/Microsoft/Windows/TaskScheduler"
+    $rebootPublishAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootInitiated"
     $eventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
     $eventTrigger.Subscription = @'
 <QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name='User32'] and EventID=1074]]</Select></Query></QueryList>
 '@
     $eventTrigger.Enabled = $true
-    Register-ScheduledTask -TaskName $script:TaskReboot -Action $rebootAction -Trigger $eventTrigger -Principal $principal -Settings $settings | Out-Null
-    Write-Log "Registered event-triggered task '$script:TaskReboot' (fires on Event ID 1074) to mark Safe OS phase immediately."
+    Register-ScheduledTask -TaskName $script:TaskReboot -Action @($rebootAction, $rebootPublishAction) -Trigger $eventTrigger -Principal $principal -Settings $settings | Out-Null
+    Write-Log "Registered event-triggered task '$script:TaskReboot' (Event 1074) to mark Safe OS and publish JSON before shutdown."
 } catch {
     Write-Log "Could not register Safe OS event watcher (non-blocking, best-effort): $_" "WARN"
 }
@@ -1965,19 +1802,13 @@ if (-not $DisableAutoCleanup) {
 # =============================================================================
 # SECTION 5 - LAUNCH WINDOWS SETUP
 # =============================================================================
-# 0% (not an invented mid-range number) - this is the honest state the
-# instant the Scheduled Task is about to fire: nothing measurable has
-# happened yet. Update-UpgradeStatus.ps1 takes over within seconds and
-# starts reporting Setup's OWN live "Overall progress" counter parsed from
-# setupact.log, which is real, monitored data - showing an arbitrary
-# placeholder here only to have it get overwritten moments later by a
-# genuinely lower real number is the exact ambiguity this avoids at the
-# source (rather than only patching around it via Set-Phase's monotonic
-# clamp). Fix applied 2026-07-20: -PercentComplete is now genuinely omitted
-# here (previously the comment above described this intent but the code
-# still passed 0) - the registry simply keeps Phase 2's last real percent
-# until Update-UpgradeStatus.ps1's own poll finds a real Measured value.
-Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" -Notes "Launching setup.exe"
+# Setup starts at 0% on its local scale, which maps to the stable 25% overall
+# handoff boundary. The recurring monitor replaces that local value only with
+# Microsoft's MoSetup SetupProgress counter; if the counter is unavailable,
+# the last verified value is carried forward with explicit freshness metadata.
+Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" -PercentComplete 0 `
+    -PercentSource "Measured" -ProgressSource "StageBoundary.SetupLaunch" -ProgressFreshness "Milestone" `
+    -Notes "Launching setup.exe"
 
 $postOobeCmd     = Join-Path $script:ScriptsDir "setupcomplete.cmd"
 $postRollbackCmd = Join-Path $script:ScriptsDir "setuprollback.cmd"
@@ -1998,7 +1829,8 @@ $setupArgs = @(
     "/Telemetry", "Disable",
     "/Compat", "IgnoreWarning",
     "/PostOOBE", "`"$postOobeCmd`"",
-    "/PostRollback", "`"$postRollbackCmd`""
+    "/PostRollback", "`"$postRollbackCmd`"",
+    "/PostRollbackContext", "System"
 )
 if ($script:MatchedImageIndex) {
     # Required whenever install.wim has more than one applicable image -
@@ -2031,7 +1863,9 @@ try {
     $setupAction  = New-ScheduledTaskAction -Execute $isoInfo.SetupPath -Argument ($setupArgs -join ' ')
     $setupTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
     Register-ScheduledTask -TaskName $script:TaskSetupRun -Action $setupAction -Trigger $setupTrigger -Principal $principal -Settings $settings | Out-Null
+    Set-UpgradeRegistryValue -Name "SetupLaunchTimeUtc" -Value ([DateTimeOffset]::UtcNow.ToString("o"))
     Start-ScheduledTask -TaskName $script:TaskSetupRun
+    Start-ScheduledTask -TaskName $script:TaskMonitor -ErrorAction SilentlyContinue
     Write-Log "setup.exe launch handed off to Scheduled Task '$script:TaskSetupRun' (decoupled from this WinRM session)."
 
     # Confirm the engine actually started (poll up to ~60s) before moving on.
@@ -2059,7 +1893,8 @@ try {
         Restart-Computer -Force
     }
 } catch {
-    Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "Failed" -PercentComplete 0 -Notes "Failed to launch setup.exe via Scheduled Task: $_"
+    Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "Failed" -PercentComplete 0 `
+        -ProgressSource "SetupLaunch" -ProgressFreshness "Terminal" -Notes "Failed to launch setup.exe via Scheduled Task: $_"
     Write-Log "Failed to launch setup.exe via Scheduled Task: $_" "ERROR"
     throw
 }
