@@ -1059,6 +1059,63 @@ function Get-RemoteStatusViaCimDcom {
     }
 }
 
+function Read-RemoteStatusJsonViaWinRM {
+    <#
+    Reads Server B's local atomic JSON through PowerShell Remoting. This is the
+    status fallback for environments where WinRM is allowed but SMB/admin
+    shares and DCOM/RPC are blocked. The outer job enforces a short timeout so
+    a successful liveness probe followed by a stalled remote command cannot
+    block the monitoring loop.
+    #>
+    param(
+        [string]$ComputerName,
+        [System.Management.Automation.PSCredential]$Cred,
+        [string]$JsonPath,
+        [ValidateSet("Http","Https","HttpsSkipCert")][string]$Transport,
+        [int]$TimeoutSec = 8,
+        [ref]$ErrorDetail
+    )
+
+    $job = Start-Job -ScriptBlock {
+        param($cn, $credential, $path, $transport)
+        $invokeParams = @{ ComputerName = $cn; ErrorAction = "Stop" }
+        if ($credential) { $invokeParams["Credential"] = $credential }
+        switch ($transport) {
+            "Https" {
+                $invokeParams["UseSSL"] = $true
+                $invokeParams["Port"] = 5986
+            }
+            "HttpsSkipCert" {
+                $invokeParams["UseSSL"] = $true
+                $invokeParams["Port"] = 5986
+                $invokeParams["SessionOption"] = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+            }
+        }
+        Invoke-Command @invokeParams -ScriptBlock {
+            param($statusPath)
+            if (-not (Test-Path $statusPath)) {
+                throw "Target status JSON does not exist: $statusPath"
+            }
+            Get-Content -Path $statusPath -Raw -ErrorAction Stop
+        } -ArgumentList $path
+    } -ArgumentList $ComputerName, $Cred, $JsonPath, $Transport
+
+    try {
+        if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+            $jobError = $null
+            $raw = Receive-Job -Job $job -ErrorVariable jobError -ErrorAction SilentlyContinue
+            if ($jobError -and $ErrorDetail) { $ErrorDetail.Value = $jobError[0].ToString() }
+            if ($raw) { return ($raw -join [Environment]::NewLine) }
+            return $null
+        }
+        if ($ErrorDetail) { $ErrorDetail.Value = "Timed out after ${TimeoutSec}s reading '$JsonPath' through WinRM." }
+        return $null
+    } finally {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-UpgradeStatus {
     <#
     Combines ping + explicit WinRM probe + file-read + DCOM/CIM fallback into
@@ -1121,11 +1178,30 @@ function Get-UpgradeStatus {
         return $cimStatus
     }
 
-    # Neither file nor DCOM yielded data. If WinRM itself is up, the machine
-    # is definitely alive even without a status payload yet (e.g. a brief
-    # race right after First Boot before SMB/DCOM services come up) - report
-    # that honestly rather than falling through to a ping-only guess.
+    # Channel C - read the same atomic target JSON through WinRM. This keeps
+    # detailed status available in hardened networks where 5985/5986 is open
+    # but SMB administrative shares and DCOM/RPC are intentionally blocked.
     if ($winRmOk) {
+        $winRmStatusErr = $null
+        $winRmRaw = Read-RemoteStatusJsonViaWinRM -ComputerName $ComputerName -Cred $Cred `
+            -JsonPath $JsonPath -Transport $script:WinRMTransport -ErrorDetail ([ref]$winRmStatusErr)
+        if ($winRmRaw) {
+            try {
+                $parsed = $winRmRaw | ConvertFrom-Json
+                $parsed | Add-Member -NotePropertyName PingOk  -NotePropertyValue $pingOk  -Force
+                $parsed | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $true    -Force
+                $parsed | Add-Member -NotePropertyName Mode    -NotePropertyValue $mode    -Force
+                $parsed | Add-Member -NotePropertyName Source  -NotePropertyValue "WinRM($JsonPath)" -Force
+                $script:fileDcomDiagLogged = $false
+                return $parsed
+            } catch {
+                $winRmStatusErr = "Target JSON was read through WinRM but could not be parsed: $($_.Exception.Message)"
+            }
+        }
+
+        # No payload channel yielded data. The machine is definitely alive,
+        # so retain the cached producer snapshot and report the three channel
+        # failures once instead of manufacturing phase or percentage data.
         # This specific combination (WinRM confirmed up, but BOTH the SMB
         # file-share AND CIM/DCOM channels came back empty) used to be
         # completely silent about WHY - it would just show "0%, no status
@@ -1134,10 +1210,10 @@ function Get-UpgradeStatus {
         # both channels once per occurrence (not every 15s poll) so this is
         # actually debuggable instead of a black box.
         if (-not $script:fileDcomDiagLogged) {
-            Write-Log "WinRM is up on $ComputerName but neither the file-share ($uncPath) nor CIM/DCOM channel returned data. File-share reason: $(if ($fileErr) { $fileErr } else { 'no data/empty response' }) | DCOM reason: $(if ($cimErr) { $cimErr } else { 'no data/empty response' }). This can happen if SMB (445) or DCOM/RPC (135+dynamic) are firewalled even though WinRM ($(Get-WinRMTransportLabel $script:WinRMTransport)) is open - see PROJECT-NOTES.md port guidance. Will keep retrying; this message won't repeat every poll." "WARN"
+            Write-Log "WinRM is up on $ComputerName but no status payload channel returned data. File-share reason: $(if ($fileErr) { $fileErr } else { 'no data/empty response' }) | DCOM reason: $(if ($cimErr) { $cimErr } else { 'no data/empty response' }) | WinRM JSON reason: $(if ($winRmStatusErr) { $winRmStatusErr } else { 'no data/empty response' }). Will keep retrying; this message won't repeat every poll." "WARN"
             $script:fileDcomDiagLogged = $true
         }
-        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "InProgress"; PhaseName = "Reachable via WinRM (no file/DCOM status source yet)"; PercentComplete = $null; Notes = "WinRM confirmed up; no file-share or DCOM status source reachable yet - normal during a brief post-reboot service-startup race, or a sign SMB/DCOM are firewalled while WinRM is open."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "InProgress"; PhaseName = "Reachable via WinRM (no status payload yet)"; PercentComplete = $null; Notes = "WinRM confirmed up, but the target JSON could not be read through WinRM and no file-share or DCOM status source is reachable yet."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
     }
 
     # WinRM is down too, but ping succeeded - typical during the Safe OS

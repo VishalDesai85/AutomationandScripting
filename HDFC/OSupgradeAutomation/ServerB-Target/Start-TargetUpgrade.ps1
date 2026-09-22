@@ -172,6 +172,21 @@ if (-not (Test-Path $script:StatusHelper)) {
 }
 . $script:StatusHelper
 
+# Hold this named mutex for the lifetime of the kickoff PowerShell process.
+# A previous WinRM caller can disconnect while DISM/SFC is still running; a
+# second kickoff must not start another precheck sequence against the same
+# registry/status contract. Windows releases the mutex when this process exits.
+$script:KickoffMutex = New-Object System.Threading.Mutex($false, "Global\OSUpgradeAutomationKickoff")
+$kickoffLockTaken = $false
+try {
+    $kickoffLockTaken = $script:KickoffMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $kickoffLockTaken = $true
+}
+if (-not $kickoffLockTaken) {
+    throw "Another Start-TargetUpgrade.ps1 process is still running on $env:COMPUTERNAME. Wait for that kickoff/precheck process to finish or investigate it before retrying."
+}
+
 function Enable-BackupPrivilege {
     <#
     Enables SeBackupPrivilege + SeRestorePrivilege on THIS process's token.
