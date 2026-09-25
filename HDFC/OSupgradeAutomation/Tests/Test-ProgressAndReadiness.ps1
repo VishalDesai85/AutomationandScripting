@@ -27,6 +27,36 @@ function Get-TestFunction {
 }
 
 & {
+    $tree = $syntaxTrees['Start-RemoteUpgradeOrchestrator.ps1']
+    $initialization = $tree.EndBlock.Statements | Where-Object {
+        $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+        $_.Extent.Text.StartsWith('if ([string]::IsNullOrWhiteSpace($SourceFilesPath))')
+    } | Select-Object -First 1
+    Assert-Condition ($null -ne $initialization) 'Source directory must be resolved after parameter binding'
+    $probeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('OSUpgradeStartup_' + [guid]::NewGuid().ToString('N'))
+    $probeDirectory = Join-Path $probeRoot 'ServerA-Orchestrator'
+    $probePath = Join-Path $probeDirectory 'StartupProbe.ps1'
+    try {
+        [System.IO.Directory]::CreateDirectory($probeDirectory) | Out-Null
+        $probe = $tree.ParamBlock.Extent.Text + [Environment]::NewLine +
+            '$ErrorActionPreference = "Stop"' + [Environment]::NewLine +
+            $initialization.Extent.Text + [Environment]::NewLine +
+            '$SourceFilesPath | ConvertTo-Json -Compress'
+        [System.IO.File]::WriteAllText($probePath, $probe)
+        $expected = Join-Path $probeRoot 'ServerB-Target'
+        $powershellPath = Join-Path $PSHOME 'powershell.exe'
+        $actual = & $powershellPath -NoProfile -ExecutionPolicy Bypass -File $probePath -TargetComputer 'offline-test'
+        Assert-Condition ($LASTEXITCODE -eq 0 -and ($actual | ConvertFrom-Json) -eq $expected) 'Default source directory failed under powershell.exe -File'
+        $explicit = Join-Path $probeRoot 'Custom Scripts'
+        $actual = & $powershellPath -NoProfile -ExecutionPolicy Bypass -File $probePath -TargetComputer 'offline-test' -SourceFilesPath $explicit
+        Assert-Condition ($LASTEXITCODE -eq 0 -and ($actual | ConvertFrom-Json) -eq $explicit) 'Explicit source directory was not preserved'
+        'PASS: powershell.exe -File startup default and explicit source paths (startup-only extracted code)'
+    } finally {
+        if ([System.IO.Directory]::Exists($probeRoot)) { [System.IO.Directory]::Delete($probeRoot, $true) }
+    }
+}
+
+& {
     . (Get-TestFunction $syntaxTrees['OSUpgradeStatus.ps1'] 'Get-UpgradePendingRebootState')
     $fixture = @{ Queue = $null; PendingKey = ''; RegistryFailure = $false }
     function Test-Path { param($Path, $ErrorAction) return ($Path -eq $fixture.PendingKey) }

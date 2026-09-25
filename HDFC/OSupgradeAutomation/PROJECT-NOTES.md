@@ -15,6 +15,13 @@ _Last updated: 2026-09-09 (orphaned-profile remediation expanded into three expl
 ## What this solution does
 ### Latest Fix: Precheck/Backup Display And Pending Reboot Diagnostics
 
+- Startup follow-up: `SourceFilesPath` is now resolved in the script body,
+  not in a parameter default that can see an empty `$PSScriptRoot` under
+  Windows PowerShell `-File`. Existing rc2 copies can supply an explicit
+  `-SourceFilesPath` pointing to their sibling `ServerB-Target` folder.
+  Regression tests launch extracted parameter/initialization code through
+  `powershell.exe -File`, verifying default and explicit paths without
+  including logging, network calls or upgrade actions.
 - The Stage 1/2 banner previously read only the SMB admin share, even when
   WinRM kickoff worked. It now falls back to a separate WinRM connection
   using the selected transport and credentials. The WinRM reader is defined

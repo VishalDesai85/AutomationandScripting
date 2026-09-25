@@ -139,7 +139,7 @@ param(
     [switch]$UseSSL,
     [switch]$SkipCertificateCheck,
 
-    [string]$SourceFilesPath   = (Join-Path (Split-Path -Parent $PSScriptRoot) "ServerB-Target"),
+    [string]$SourceFilesPath   = "",
     [string]$RemoteStagingPath = "C:\Temp\OSUpgradeStaging",
 
     # --- Pass-through parameters for Start-TargetUpgrade.ps1 -----------------
@@ -172,6 +172,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($SourceFilesPath)) {
+    $SourceFilesPath = Join-Path (Split-Path -Parent $PSScriptRoot) "ServerB-Target"
+}
 
 # =============================================================================
 # SECTION 1 - LOCAL LOGGING (on Server A)
