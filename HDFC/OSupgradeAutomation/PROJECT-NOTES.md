@@ -13,6 +13,59 @@ _Last updated: 2026-09-09 (orphaned-profile remediation expanded into three expl
 > ask me to refresh it.
 
 ## What this solution does
+### Latest Fix: Precheck/Backup Display And Pending Reboot Diagnostics
+
+- The Stage 1/2 banner previously read only the SMB admin share, even when
+  WinRM kickoff worked. It now falls back to a separate WinRM connection
+  using the selected transport and credentials. The WinRM reader is defined
+  before kickoff and reused by the later monitoring loop. Initial WinRM
+  transport probing is unchanged.
+- The banner shows overall and stage percentages, labels cached readings,
+  and logs unavailable status instead of silently showing a spinner. These
+  are completed-task counts, not estimates of DISM/SFC elapsed time. A long
+  check can legitimately leave the percentage unchanged until it finishes.
+- Pending reboot checks now report individual rename/delete source and
+  destination paths. All-empty values are ignored; real operations and
+  malformed nonempty entries still block. CBS/Windows Update gates remain.
+  Registry read failures are not treated as a pass. No queue is deleted and
+  no pending-reboot bypass is added.
+- `ServerA-Orchestrator/Test-UpgradeReadiness.ps1` is a read-only WinRM check
+  of those reboot flags, queued operations and last boot time. It does not
+  stage files, run DISM/SFC, take backups, start Setup, or reboot. It is not
+  a substitute for the full upgrade prechecks. Supports `-Credential`,
+  `-UseSSL`, and explicit `-SkipCertificateCheck`; HTTP is the default.
+
+From `ServerA-Orchestrator` in the new GitHub test copy on the actual
+orchestrator:
+
+```powershell
+.\Test-UpgradeReadiness.ps1 -TargetComputer testVM1
+```
+
+Let any active precheck run finish first. If blocked, complete the relevant
+servicing/installer work and an approved reboot, then repeat the read-only
+check before another full upgrade attempt. If entries return after reboot,
+use the displayed paths to investigate the owning installer/service and its
+logs; do not clear registry values to force a pass. `-SkipPatchCheckLab`
+does not bypass pending reboot checks. All full-run checks still execute
+before the aggregate failure gate; this change does not introduce fail-fast.
+
+Offline regression command from the project root:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Test-ProgressAndReadiness.ps1
+```
+
+Coverage: actual kickoff loop with blocked SMB, WinRM JSON, missing/invalid
+status, cached readings, stage labels, SMB success; WinRM transport,
+credentials, path and timeout cleanup; pending rename/delete/empty/malformed
+queues, CBS/Windows Update flags and unreadable registry; read-only readiness
+command. Tests use mocked I/O and parse every PowerShell script under Windows
+PowerShell 5.1. They do not certify live WinRM, Setup, reboots or customer
+readiness. The development workstation is not the user's test orchestrator;
+the user pushes local changes to GitHub and uses a fresh versioned test copy.
+
+### Overview
 Automates and remotely monitors an in-place Windows Server OS upgrade:
 - **Server A** (management machine) runs the orchestrator, which stages
   files onto Server B, kicks off the upgrade, and monitors progress through
@@ -23,7 +76,7 @@ Automates and remotely monitors an in-place Windows Server OS upgrade:
 ## Architecture / who does what (for ServiceNow or any other remote-trigger integration)
 Two executable PowerShell scripts on Server B publish status through one shared
 helper. Server A never computes a replacement percentage; it reads the target
-through JSON or registry-via-CIM/DCOM and caches the last producer snapshot
+through JSON (SMB or WinRM) or registry-via-CIM/DCOM and caches the last producer snapshot
 during the genuine WinPE blind window:
 - **`OSUpgradeStatus.ps1`** (Server B) - the sole registry/JSON/progress
   implementation dot-sourced by both target processes. It owns SchemaVersion
@@ -48,7 +101,8 @@ during the genuine WinPE blind window:
   value. Missing telemetry and terminal failures retain the high-water value.
 - **`Start-RemoteUpgradeOrchestrator.ps1`** (Server A) - a pure READER/
   monitor. Polls Server B every `-PollIntervalSeconds` (default 15s) via
-  whichever channel answers (file share, then CIM/DCOM, then ping-only
+  whichever channel answers (file share, then CIM/DCOM, then WinRM JSON;
+  connectivity-only observations when no status payload is readable
   during the genuine WinPE blind window), renders `Write-Progress`, logs
   phase transitions, and prints a final summary banner (Status/Server OS/
   Build/services-comparison result) before exiting 0 (success) / 1 (failed)

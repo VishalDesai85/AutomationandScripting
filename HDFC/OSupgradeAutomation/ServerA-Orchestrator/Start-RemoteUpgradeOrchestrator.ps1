@@ -698,6 +698,56 @@ function Read-RemoteFileWithTimeout {
     }
 }
 
+function Read-RemoteStatusJsonViaWinRM {
+    param(
+        [string]$ComputerName,
+        [System.Management.Automation.PSCredential]$Cred,
+        [string]$JsonPath,
+        [ValidateSet("Http","Https","HttpsSkipCert")][string]$Transport,
+        [int]$TimeoutSec = 8,
+        [ref]$ErrorDetail
+    )
+
+    $job = Start-Job -ScriptBlock {
+        param($cn, $credential, $path, $transport)
+        $invokeParams = @{ ComputerName = $cn; ErrorAction = "Stop" }
+        if ($credential) { $invokeParams["Credential"] = $credential }
+        switch ($transport) {
+            "Https" {
+                $invokeParams["UseSSL"] = $true
+                $invokeParams["Port"] = 5986
+            }
+            "HttpsSkipCert" {
+                $invokeParams["UseSSL"] = $true
+                $invokeParams["Port"] = 5986
+                $invokeParams["SessionOption"] = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+            }
+        }
+        Invoke-Command @invokeParams -ScriptBlock {
+            param($statusPath)
+            if (-not (Test-Path $statusPath)) {
+                throw "Target status JSON does not exist: $statusPath"
+            }
+            Get-Content -Path $statusPath -Raw -ErrorAction Stop
+        } -ArgumentList $path
+    } -ArgumentList $ComputerName, $Cred, $JsonPath, $Transport
+
+    try {
+        if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+            $jobError = $null
+            $raw = Receive-Job -Job $job -ErrorVariable jobError -ErrorAction SilentlyContinue
+            if ($jobError -and $ErrorDetail) { $ErrorDetail.Value = $jobError[0].ToString() }
+            if ($raw) { return ($raw -join [Environment]::NewLine) }
+            return $null
+        }
+        if ($ErrorDetail) { $ErrorDetail.Value = "Timed out after ${TimeoutSec}s reading '$JsonPath' through WinRM." }
+        return $null
+    } finally {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # =============================================================================
 # SECTION 3 - STAGE FILES + KICK OFF THE UPGRADE ON SERVER B
 # =============================================================================
@@ -787,47 +837,62 @@ try {
     $spinnerIdx   = 0
     $stage12Start = Get-Date
     $allReceived  = @()
-    # Real percentage during Stage 1/2 (2026-07-24): now that Add-PreCheckResult/
-    # Update-BackupProgress write genuine task-count-based percentages to
-    # Server B's own status file, poll it here too so the GUI bar shows a
-    # REAL, filling percentage instead of just a spinner. Uses a plain SMB
-    # file read (Read-RemoteFileWithTimeout, already defined above) rather
-    # than the heavier multi-channel Get-UpgradeStatus - $session is busy
-    # running $remoteJob for the whole duration of this loop, so it can't
-    # also service a concurrent Invoke-Command call, and spawning
-    # Get-UpgradeStatus's several background jobs every second would be
-    # unnecessarily heavy for what only needs one lightweight file read.
-    # Throttled to every 3rd iteration (~3 sec) - frequent enough to feel
-    # live, without hammering the admin share every single second. Sticky:
-    # keeps showing the last successfully-read value between polls/on a
-    # transient read failure, and omits the percentage entirely (bar stays
-    # indeterminate) until the very first successful read.
     $stage12Pct = $null
+    $stage12StagePct = $null
+    $stage12IsCached = $false
     $stage12PhaseName = $null
+    $stage12ReadWarningLogged = $false
     $driveLetter = ($StatusJsonPath -split ':')[0]
     $stage12UncPath = "\\$TargetComputer\$driveLetter`$\$(($StatusJsonPath -split ':', 2)[1].TrimStart('\'))"
     while ($remoteJob.State -eq 'Running') {
         $received = Receive-Job -Job $remoteJob -ErrorAction SilentlyContinue
         if ($received) { $allReceived += $received }
         if ($spinnerIdx % 3 -eq 0) {
-            $rawStatus = Read-RemoteFileWithTimeout -Path $stage12UncPath -TimeoutSec 2
+            $stage12ReadError = $null
+            $stage12Source = "File($stage12UncPath)"
+            $rawStatus = Read-RemoteFileWithTimeout -Path $stage12UncPath -TimeoutSec 2 -ErrorDetail ([ref]$stage12ReadError)
+            if (-not $rawStatus) {
+                $stage12Source = "WinRM($StatusJsonPath)"
+                $rawStatus = Read-RemoteStatusJsonViaWinRM -ComputerName $TargetComputer -Cred $Credential `
+                    -JsonPath $StatusJsonPath -Transport $script:WinRMTransport -ErrorDetail ([ref]$stage12ReadError)
+            }
             if ($rawStatus) {
                 try {
                     $parsedStatus = $rawStatus | ConvertFrom-Json
+                    if ($null -eq $parsedStatus.Phase -or $null -eq $parsedStatus.PercentComplete) {
+                        throw "Target JSON has no phase or percentage yet."
+                    }
                     if ($null -ne $parsedStatus.PercentComplete) { $stage12Pct = [int]$parsedStatus.PercentComplete }
+                    $stage12StagePct = $parsedStatus.StagePercentComplete
+                    $stage12IsCached = $false
                     if ($parsedStatus.PhaseName) { $stage12PhaseName = $parsedStatus.PhaseName }
                     $stage12Observation = [pscustomobject]@{
-                        PingOk = $true; WinRmOk = $true; Mode = "ActivePolling"; Source = "File($stage12UncPath)"
+                        PingOk = $null; WinRmOk = $true; Mode = "ActivePolling"; Source = $stage12Source
                     }
                     Write-LocalStatusMirror -ProducerStatus $parsedStatus -ObservationStatus $stage12Observation
+                    $stage12ReadWarningLogged = $false
                 } catch {
-                    # Transient partial-write race - keep showing the last
-                    # good values, will pick up a clean read next iteration.
+                    $stage12ReadError = $_.Exception.Message
+                    $rawStatus = $null
+                }
+            }
+            if (-not $rawStatus) {
+                $stage12IsCached = $true
+                $stage12Observation = [pscustomobject]@{
+                    PingOk = $null; WinRmOk = $null; Mode = "StatusUnavailable"; Source = $stage12Source
+                }
+                Write-LocalStatusMirror -ObservationStatus $stage12Observation -ObservationError $stage12ReadError
+                if (-not $stage12ReadWarningLogged) {
+                    Write-Log "Precheck/backup status unavailable through SMB and WinRM: $stage12ReadError. Retaining the last percentage and retrying." "WARN"
+                    $stage12ReadWarningLogged = $true
                 }
             }
         }
         $elapsed = (Get-Date) - $stage12Start
-        $pctPrefix = if ($null -ne $stage12Pct) { "[$stage12Pct%] " } else { "" }
+        $pctPrefix = if ($null -ne $stage12Pct) { "[Overall $stage12Pct%" } else { "[Awaiting target status" }
+        if ($null -ne $stage12StagePct) { $pctPrefix += "; stage $stage12StagePct%" }
+        if ($stage12IsCached -and $null -ne $stage12Pct) { $pctPrefix += "; cached" }
+        $pctPrefix += "] "
         $phaseSuffix = if ($stage12PhaseName) { " ($stage12PhaseName)" } else { "" }
         $progressParams = @{
             Activity = "Stage 1/3-2/3: Pre-Upgrade Assessment + Backup running on $TargetComputer"
@@ -1056,63 +1121,6 @@ function Get-RemoteStatusViaCimDcom {
     } catch {
         if ($ErrorDetail) { $ErrorDetail.Value = $_.Exception.Message }
         return $null
-    }
-}
-
-function Read-RemoteStatusJsonViaWinRM {
-    <#
-    Reads Server B's local atomic JSON through PowerShell Remoting. This is the
-    status fallback for environments where WinRM is allowed but SMB/admin
-    shares and DCOM/RPC are blocked. The outer job enforces a short timeout so
-    a successful liveness probe followed by a stalled remote command cannot
-    block the monitoring loop.
-    #>
-    param(
-        [string]$ComputerName,
-        [System.Management.Automation.PSCredential]$Cred,
-        [string]$JsonPath,
-        [ValidateSet("Http","Https","HttpsSkipCert")][string]$Transport,
-        [int]$TimeoutSec = 8,
-        [ref]$ErrorDetail
-    )
-
-    $job = Start-Job -ScriptBlock {
-        param($cn, $credential, $path, $transport)
-        $invokeParams = @{ ComputerName = $cn; ErrorAction = "Stop" }
-        if ($credential) { $invokeParams["Credential"] = $credential }
-        switch ($transport) {
-            "Https" {
-                $invokeParams["UseSSL"] = $true
-                $invokeParams["Port"] = 5986
-            }
-            "HttpsSkipCert" {
-                $invokeParams["UseSSL"] = $true
-                $invokeParams["Port"] = 5986
-                $invokeParams["SessionOption"] = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
-            }
-        }
-        Invoke-Command @invokeParams -ScriptBlock {
-            param($statusPath)
-            if (-not (Test-Path $statusPath)) {
-                throw "Target status JSON does not exist: $statusPath"
-            }
-            Get-Content -Path $statusPath -Raw -ErrorAction Stop
-        } -ArgumentList $path
-    } -ArgumentList $ComputerName, $Cred, $JsonPath, $Transport
-
-    try {
-        if (Wait-Job -Job $job -Timeout $TimeoutSec) {
-            $jobError = $null
-            $raw = Receive-Job -Job $job -ErrorVariable jobError -ErrorAction SilentlyContinue
-            if ($jobError -and $ErrorDetail) { $ErrorDetail.Value = $jobError[0].ToString() }
-            if ($raw) { return ($raw -join [Environment]::NewLine) }
-            return $null
-        }
-        if ($ErrorDetail) { $ErrorDetail.Value = "Timed out after ${TimeoutSec}s reading '$JsonPath' through WinRM." }
-        return $null
-    } finally {
-        Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
     }
 }
 

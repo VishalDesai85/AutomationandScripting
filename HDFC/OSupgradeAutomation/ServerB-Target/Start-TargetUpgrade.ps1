@@ -413,17 +413,8 @@ try {
 
 # --- 2.4 Pending reboot check -------------------------------------------------
 try {
-    $pendingReasons = @()
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
-        $pendingReasons += "CBS RebootPending key present"
-    }
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
-        $pendingReasons += "Windows Update RebootRequired key present"
-    }
-    $pfro = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name "PendingFileRenameOperations" -ErrorAction SilentlyContinue
-    if ($pfro -and $pfro.PendingFileRenameOperations) {
-        $pendingReasons += "PendingFileRenameOperations present (rename operation pending)"
-    }
+    $pendingReboot = Get-UpgradePendingRebootState
+    $pendingReasons = @($pendingReboot.Reasons)
     if ($pendingReasons.Count -gt 0) {
         Add-PreCheckResult -Name "No pending reboot" -Result "FAIL" -Detail ($pendingReasons -join "; ")
     } else {

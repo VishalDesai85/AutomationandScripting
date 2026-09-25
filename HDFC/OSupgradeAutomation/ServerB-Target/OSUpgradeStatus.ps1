@@ -32,6 +32,36 @@ function Get-UpgradeRegistryValue {
     return $Default
 }
 
+function Get-UpgradePendingRebootState {
+    $reasons = @()
+    $operations = @()
+    $cbsPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction Stop
+    $updatePending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' -ErrorAction Stop
+    if ($cbsPending) { $reasons += 'CBS RebootPending key present' }
+    if ($updatePending) { $reasons += 'Windows Update RebootRequired key present' }
+    $sessionManager = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop
+    $entries = @($sessionManager.PendingFileRenameOperations)
+    for ($entryIndex = 0; $entryIndex -lt $entries.Count; $entryIndex += 2) {
+        $source = [string]$entries[$entryIndex]
+        $destination = if ($entryIndex + 1 -lt $entries.Count) { [string]$entries[$entryIndex + 1] } else { '' }
+        if ([string]::IsNullOrWhiteSpace($source) -and [string]::IsNullOrWhiteSpace($destination)) { continue }
+        $operation = [pscustomobject]@{
+            Source = $source
+            Destination = $destination
+            Action = $(if (-not $source) { 'InvalidEntry' } elseif ($destination) { 'RenameOrReplace' } else { 'Delete' })
+        }
+        $operations += $operation
+        $reasons += "PendingFileRenameOperations: $($operation.Action) '$source' -> '$destination'"
+    }
+    [pscustomobject]@{
+        RebootPending = ($reasons.Count -gt 0)
+        CBSRebootPending = $cbsPending
+        WindowsUpdateRebootRequired = $updatePending
+        Operations = $operations
+        Reasons = $reasons
+    }
+}
+
 function Get-UpgradeStageMetadata {
     param([int]$Phase)
 
