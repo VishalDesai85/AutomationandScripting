@@ -32,6 +32,8 @@
                    (\\ServerB\D$\upgrade_status.json) and a CIM/WMI registry
                    read over DCOM/RPC - both are independent of WinRM, so the
                    progress bar can keep advancing even while WinRM is down.
+                   If those channels are unavailable but WinRM is up, reads
+                   status directly over the authenticated WinRM connection.
                 d. If NONE of ping/WinRM/file/DCOM succeed, reports a
                    transient "Safe OS / unreachable" state (the one genuine
                    blind window - WinPE has no running Windows services at
@@ -45,7 +47,8 @@
               -TimeoutMinutes elapses first.
 
 .PARAMETER TargetComputer
-    Hostname or IP of Server B.
+    Hostname or IPv4 address of Server B. IPv6 literal/admin-share mapping is
+    not supported by this script.
 
 .PARAMETER Credential
     Optional PSCredential for Server B (required for workgroup targets or
@@ -79,12 +82,24 @@
     C:\ProgramData\OSUpgradeAutomation location. Default: C:\Temp\OSUpgradeStaging
 
 .PARAMETER IsoFolder, MinFreeSpaceGB, BackupRoot, StatusJsonPath, RetentionDays,
-.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipSystemStateBackup,
+.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipDismScanHealthLab,
+.PARAMETER SkipSfcScanNowLab,
+.PARAMETER SkipSystemStateBackup,
 .PARAMETER MinVMwareToolsVersion, UseControlledReboot, MaxPatchAgeDays
     Passed straight through to Start-TargetUpgrade.ps1 on Server B - see that
     script's own help for details. -SkipSystemStateBackup omits backup task
     8 of 8 (the slow wbadmin system state backup); every other backup
     artifact is still produced.
+
+.PARAMETER SkipDismScanHealthLab
+    LAB/TEST-ONLY performance override passed to Server B. Skips
+    `Dism /Online /Cleanup-Image /ScanHealth`, records WARN and leaves
+    component-store health unverified.
+
+.PARAMETER SkipSfcScanNowLab
+    LAB/TEST-ONLY performance override passed to Server B. Skips
+    `sfc /scannow` and supplementary CBS.log analysis, records WARN and leaves
+    protected Windows system-file integrity unverified.
 
 .PARAMETER PollIntervalSeconds
     Seconds between monitoring checks while WinRM/Active Polling is up.
@@ -101,6 +116,16 @@
 .PARAMETER TimeoutMinutes
     Overall monitoring timeout. Default: 180 (3 hours - in-place upgrades with
     multiple reboots commonly take 60-120 minutes; tune per environment).
+    Applies after kickoff, not to assessment/backup. The budget is checked
+    between polling cycles, so an in-flight network call can extend it.
+
+.PARAMETER PrecheckOnly
+    Run target assessment only. Do not perform backups or launch Windows Setup.
+    Assessment still writes diagnostic reports and may temporarily mount media.
+
+.PARAMETER MonitorOnly
+    Read an existing attempt without staging files or starting an upgrade.
+    Useful for short monitoring checks with -TimeoutMinutes and shorter polling.
 
 .EXAMPLE
     .\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer "ServerB" -IsoFolder "D:\ISO"
@@ -124,6 +149,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
+    [ValidatePattern('^[a-zA-Z0-9][a-zA-Z0-9._-]*$')]
     [string]$TargetComputer,
 
     [System.Management.Automation.PSCredential]$Credential,
@@ -134,22 +160,32 @@ param(
     [switch]$SkipCertificateCheck,
 
     [string]$SourceFilesPath   = (Join-Path (Split-Path -Parent $PSScriptRoot) "ServerB-Target"),
+    [ValidatePattern('^[a-zA-Z]:\\.+')]
     [string]$RemoteStagingPath = "C:\Temp\OSUpgradeStaging",
 
     # --- Pass-through parameters for Start-TargetUpgrade.ps1 -----------------
     [string]$IsoFolder             = "D:\ISO",
+    [ValidateRange(1, 2147483647)]
     [int]   $MinFreeSpaceGB        = 32,
     [string]$BackupRoot            = "D:\UpgradeBackup",
+    [ValidatePattern('^[a-zA-Z]:\\.+\.json$')]
     [string]$StatusJsonPath        = "D:\upgrade_status.json",
+    [ValidateRange(1, 3650)]
     [int]   $RetentionDays         = 14,
+    [switch]$PrecheckOnly,
+    [switch]$MonitorOnly,
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
+    [switch]$SkipDismScanHealthLab,
+    [switch]$SkipSfcScanNowLab,
     [switch]$SkipSystemStateBackup,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
+    [ValidateRange(1, 3650)]
     [int]   $MaxPatchAgeDays       = 60,
 
     # --- Monitoring parameters -------------------------------------------------
+    [ValidateRange(1, 3600)]
     [int]$PollIntervalSeconds = 15,
     # Used ONLY while Mode is Heartbeat or Offline (WinRM down) - a shorter
     # interval here increases the odds of a poll actually landing during a
@@ -159,12 +195,18 @@ param(
     # seconds. Reverts to the normal $PollIntervalSeconds the instant Mode
     # is back to ActivePolling - no reason to poll aggressively once WinRM
     # is confirmed up and richer data is flowing normally.
+    [ValidateRange(1, 3600)]
     [int]$FastPollIntervalSeconds = 5,
+    [ValidateRange(1, 10080)]
     [int]$TimeoutMinutes      = 180,
+    [ValidateRange(1, 10080)]
     [int]$PhaseStallWarningMinutes = 45
 )
 
 $ErrorActionPreference = "Stop"
+if ($PrecheckOnly -and $MonitorOnly) {
+    throw "-PrecheckOnly and -MonitorOnly are mutually exclusive."
+}
 
 # =============================================================================
 # SECTION 1 - LOCAL LOGGING (on Server A)
@@ -172,6 +214,29 @@ $ErrorActionPreference = "Stop"
 $script:LocalLogDir = Join-Path $env:ProgramData "OSUpgradeAutomation\OrchestratorLogs"
 if (-not (Test-Path $script:LocalLogDir)) { New-Item -ItemType Directory -Path $script:LocalLogDir -Force | Out-Null }
 $script:LocalLogFile = Join-Path $script:LocalLogDir "Orchestrator_$($TargetComputer)_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$script:LogWriteFailureReported = $false
+
+function Add-LogFileLine {
+    <#
+    File-only append. Separated from Write-Log because two other producers -
+    the target's replayed output and the progress trail - must reach the log
+    file without being re-rendered as orchestrator lines.
+
+    Deliberately never throws: this script runs under
+    $ErrorActionPreference='Stop', so an unguarded append (an AV scanner
+    holding the file, a full disk) would abort monitoring of a live OS
+    upgrade. Losing a log line is never worth that.
+    #>
+    param([string]$Line)
+    try {
+        [System.IO.File]::AppendAllText($script:LocalLogFile, $Line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
+    } catch {
+        if (-not $script:LogWriteFailureReported) {
+            $script:LogWriteFailureReported = $true
+            Write-Host "[LOGGING] Could not append to $script:LocalLogFile (continuing; console output is unaffected): $($_.Exception.Message)" -ForegroundColor DarkYellow
+        }
+    }
+}
 
 function Write-Log {
     param([string]$Message, [ValidateSet("INFO","WARN","ERROR","SUCCESS")][string]$Level = "INFO")
@@ -182,7 +247,52 @@ function Write-Log {
         "SUCCESS" { Write-Host $line -ForegroundColor Green }
         default   { Write-Host $line }
     }
-    Add-Content -Path $script:LocalLogFile -Value $line -Encoding UTF8
+    Add-LogFileLine $line
+}
+
+$script:RemoteStreamCursor = @{}
+
+function Write-RemoteStreamsToLog {
+    <#
+    Persists the target's replayed Write-Host/Warning/Error records to the
+    orchestrator log FILE. Those records were previously visible on the console
+    but absent from the log entirely - the largest gap in the audit trail,
+    since all Stage 1/2 detail lives in them.
+
+    File-only by design. Verified empirically that Receive-Job renders these
+    streams to the host itself and that redirection (3>&1 / 6>&1 / *>&1) does
+    NOT suppress that: it only yields a duplicate copy of the Information
+    records and never captures Warning records. Re-printing here would
+    therefore double every line on screen.
+
+    Also verified: Receive-Job does NOT drain these collections, so they grow
+    for the lifetime of the job. A per-stream index cursor is what keeps each
+    record logged exactly once; without it every poll re-logged the whole
+    history.
+    #>
+    param($Job)
+    foreach ($child in @($Job.ChildJobs)) {
+        foreach ($streamName in 'Information', 'Warning', 'Error') {
+            $records = @($child.$streamName)
+            $key = "$($child.InstanceId)|$streamName"
+            $start = if ($script:RemoteStreamCursor.ContainsKey($key)) { $script:RemoteStreamCursor[$key] } else { 0 }
+            # Defensive: a truncated collection means something else drained it.
+            if ($start -gt $records.Count) { $start = 0 }
+            for ($i = $start; $i -lt $records.Count; $i++) {
+                $rec = $records[$i]
+                switch ($streamName) {
+                    'Information' {
+                        $data = $rec.MessageData
+                        $text = if ($data -is [System.Management.Automation.HostInformationMessage]) { $data.Message } else { [string]$data }
+                        if (-not [string]::IsNullOrWhiteSpace($text)) { Add-LogFileLine $text }
+                    }
+                    'Warning' { Add-LogFileLine "WARNING: $($rec.Message)" }
+                    'Error'   { Add-LogFileLine "ERROR: $rec" }
+                }
+            }
+            $script:RemoteStreamCursor[$key] = $records.Count
+        }
+    }
 }
 
 Write-Log "===================================================================="
@@ -304,10 +414,23 @@ function Resolve-WinRMTransport {
     return $null
 }
 
+$script:WinRMSessionOptionCache = $null
+
 function Get-WinRMSessionParams {
     <#
     Single source of truth for the splat used by New-PSSession/Invoke-Command,
     so the resolved transport is applied consistently everywhere.
+
+    A FRESH hashtable is returned on every call, deliberately. Only the
+    PSSessionOption object inside it is cached (2026-09-26), because that is
+    the only part with real construction cost and it is immutable settings
+    data that New-PSSession/Invoke-Command merely read - the documented
+    "build one, reuse it" pattern. Caching and handing back the whole
+    hashtable would save nothing measurable and would make every caller share
+    one mutable object: a single future `$p = Get-WinRMSessionParams;
+    $p["Port"] = 1234` would silently re-point every later remote call in the
+    run. The cache is also invalidated by transport changes for free, since
+    the switch below decides per call whether a SessionOption is used at all.
     #>
     $p = @{ ComputerName = $TargetComputer }
     if ($Credential) { $p["Credential"] = $Credential }
@@ -319,7 +442,10 @@ function Get-WinRMSessionParams {
         "HttpsSkipCert" {
             $p["UseSSL"]        = $true
             $p["Port"]          = 5986
-            $p["SessionOption"] = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+            if (-not $script:WinRMSessionOptionCache) {
+                $script:WinRMSessionOptionCache = New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+            }
+            $p["SessionOption"] = $script:WinRMSessionOptionCache
         }
     }
     return $p
@@ -328,7 +454,14 @@ function Get-WinRMSessionParams {
 # =============================================================================
 # SECTION 2 - PRE-FLIGHT: local files + connectivity to Server B
 # =============================================================================
-$requiredFiles = @("Start-TargetUpgrade.ps1","Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd")
+$requiredFiles = @("Start-TargetUpgrade.ps1","Update-UpgradeStatus.ps1","OSUpgradeShared.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd")
+
+# OSUpgradeShared.ps1 joined this list on 2026-09-26 and is genuinely
+# REQUIRED, not a nicety: it holds the Set-Phase / Write-StatusJson status
+# plumbing that BOTH Start-TargetUpgrade.ps1 and Update-UpgradeStatus.ps1
+# dot-source, and both of them hard-throw on startup if it is missing. Failing
+# here - before a WinRM session is even opened - is the whole point: the
+# alternative is discovering it after the target has already been modified.
 
 # Optional companion tools: not required to start an upgrade, but staged to
 # Server B when present locally so the target-side script can use them.
@@ -338,16 +471,26 @@ $requiredFiles = @("Start-TargetUpgrade.ps1","Update-UpgradeStatus.ps1","Remove-
 # C:\Windows\System32\GroupPolicy - drop LGPO.exe next to this script (or in
 # -SourceFilesPath) to enable it; if absent, GPO backup silently falls back
 # to the existing robocopy/secedit/gpresult-only approach.
-$optionalFiles = @("LGPO.exe")
+# Remove-OrphanedProfiles.ps1 is purely remedial - it is never EXECUTED by the
+# automation, only offered to the operator when the orphaned-profile pre-check
+# fails - so a missing copy degrades the guidance, not the upgrade.
+$optionalFiles = @("LGPO.exe","Remove-OrphanedProfiles.ps1")
+
+# What is actually lost when each optional companion is absent, so the
+# "not staged" warning says something actionable instead of a generic line.
+$optionalFileNotes = @{
+    "LGPO.exe"                    = "GPO backup falls back to the robocopy/secedit/gpresult export only - no portable, restorable LGPO-format backup"
+    "Remove-OrphanedProfiles.ps1" = "if the orphaned-profile pre-check fails, the operator still gets the manual remediation steps but no ready-to-run cleanup script"
+}
 
 # Layout auto-detection: the default -SourceFilesPath assumes the two-folder
 # layout this solution ships with (ServerA-Orchestrator\ + a sibling
-# ServerB-Target\). If that sibling folder doesn't exist - e.g. all 6 files
-# were instead dropped flat into one single parent folder - fall back to
-# using this script's OWN folder ($PSScriptRoot) as the source, as long as it
-# actually contains the 5 required files. This makes both layouts work
-# without requiring -SourceFilesPath to be passed manually.
-if (-not (Test-Path $SourceFilesPath)) {
+# ServerB-Target\). If that sibling folder doesn't exist - e.g. every file was
+# instead dropped flat into one single parent folder - fall back to using this
+# script's OWN folder ($PSScriptRoot) as the source, as long as it actually
+# contains all the required files. This makes both layouts work without
+# requiring -SourceFilesPath to be passed manually.
+if (-not $MonitorOnly -and -not $PSBoundParameters.ContainsKey('SourceFilesPath') -and -not (Test-Path $SourceFilesPath)) {
     $flatLayoutOk = $true
     foreach ($f in $requiredFiles) { if (-not (Test-Path (Join-Path $PSScriptRoot $f))) { $flatLayoutOk = $false } }
     if ($flatLayoutOk) {
@@ -356,11 +499,11 @@ if (-not (Test-Path $SourceFilesPath)) {
     }
 }
 
-foreach ($f in $requiredFiles) {
+foreach ($f in $(if ($MonitorOnly) { @() } else { $requiredFiles })) {
     $p = Join-Path $SourceFilesPath $f
     if (-not (Test-Path $p)) { throw "Required target-side file '$f' not found in '$SourceFilesPath'. Verify -SourceFilesPath." }
 }
-Write-Log "All 5 target-side files found in $SourceFilesPath."
+if (-not $MonitorOnly) { Write-Log "All $($requiredFiles.Count) target-side files found in $SourceFilesPath." }
 
 # NOTE: this is deliberately NON-FATAL, unlike earlier versions of this
 # script. Some environments block ICMP entirely via firewall policy, in
@@ -381,7 +524,10 @@ if (-not (Test-Connection -ComputerName $TargetComputer -Count 2 -Quiet -ErrorAc
 # have the HTTPS listener open and WinRM never retries across ports on its own.
 $script:WinRMTransport = Resolve-WinRMTransport -ComputerName $TargetComputer -Cred $Credential
 
-if (-not $script:WinRMTransport) {
+if (-not $script:WinRMTransport -and $MonitorOnly) {
+    $script:WinRMTransport = if ($UseSSL) { if ($SkipCertificateCheck) { "HttpsSkipCert" } else { "Https" } } else { "Http" }
+    Write-Log "Target is currently unreachable via WinRM. Monitor-only will continue using file/DCOM and $(Get-WinRMTransportLabel $script:WinRMTransport) probes; use -UseSSL for an HTTPS-only target." "WARN"
+} elseif (-not $script:WinRMTransport) {
     $hint = @()
     $hint += "Ensure PS Remoting is enabled on the target (Enable-PSRemoting) and that the relevant listener port is open through the firewall: 5985 for HTTP, 5986 for HTTPS (Get-ChildItem WSMan:\localhost\Listener on the target shows which listeners exist)."
     if (-not $UseSSL)               { $hint += "Both HTTP/5985 and HTTPS/5986 were tried automatically and neither answered." }
@@ -390,13 +536,31 @@ if (-not $script:WinRMTransport) {
     throw "WinRM is not reachable on $TargetComputer over any supported transport. $($hint -join ' ')"
 }
 
-Write-Log "WinRM reachable on $TargetComputer over $(Get-WinRMTransportLabel $script:WinRMTransport)." "SUCCESS"
+Write-Log "Selected WinRM transport for $TargetComputer : $(Get-WinRMTransportLabel $script:WinRMTransport)."
 if ($script:WinRMTransport -eq "HttpsSkipCert") {
     Write-Log "WinRM certificate validation is BYPASSED for this run (-SkipCertificateCheck). The channel is still encrypted, but the target's identity is NOT verified - install a trusted certificate matching '$TargetComputer' to remove this exposure." "WARN"
 }
 
 # Consumed by Invoke-Command/New-PSSession below - built from the resolved transport.
 $sessionParams = Get-WinRMSessionParams
+
+# Validate remote user has administrative privileges on Server B before attempting staging or kickoff
+if (-not $MonitorOnly) {
+    Write-Log "Verifying administrative privileges on $TargetComputer..."
+    try {
+        $adminCheck = Invoke-Command @sessionParams -ScriptBlock {
+            $user = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = [System.Security.Principal.WindowsPrincipal]$user
+            return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+        if (-not $adminCheck) {
+            throw "The user context initiating connection to $TargetComputer is NOT a member of the local Administrators group. Upgrade requires local administrative rights."
+        }
+        Write-Log "Administrative privileges confirmed on $TargetComputer." "SUCCESS"
+    } catch {
+        throw "Failed to verify administrative privileges on ${TargetComputer}: $($_.Exception.Message)"
+    }
+}
 
 # =============================================================================
 # SECTION 2b - DETECT AN ALREADY-IN-PROGRESS UPGRADE (RESUME SUPPORT)
@@ -414,11 +578,39 @@ $sessionParams = Get-WinRMSessionParams
 # setup.exe on top of one already mid-upgrade. So: check Server B's own
 # last-known Phase/Status first, and if an upgrade is already genuinely
 # under way, skip straight to monitoring instead of re-kicking anything off.
-$resumeExisting = $false
+$resumeExisting = [bool]$MonitorOnly
+if (-not $MonitorOnly) {
 try {
     $existing = Invoke-Command @sessionParams -ScriptBlock {
-        $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\OSUpgradeAutomation" -ErrorAction SilentlyContinue |
+        $starterActive = $false
+        $starterMutex = $null
+        try {
+            try {
+                $starterMutex = [System.Threading.Mutex]::OpenExisting('Global\OSUpgradeAutomation.StartTargetUpgrade')
+            } catch [System.Threading.WaitHandleCannotBeOpenedException] {
+                # No starter has created the mutex on this host.
+            }
+            if ($starterMutex) {
+                $acquired = $false
+                try {
+                    try { $acquired = $starterMutex.WaitOne(0) }
+                    catch [System.Threading.AbandonedMutexException] { $acquired = $true }
+                    $starterActive = -not $acquired
+                } finally {
+                    if ($acquired) { $starterMutex.ReleaseMutex() }
+                }
+            }
+        } finally {
+            if ($starterMutex) { $starterMutex.Dispose() }
+        }
+        $statePath = "HKLM:\SOFTWARE\OSUpgradeAutomation"
+        $reg = if (Test-Path -LiteralPath $statePath -ErrorAction Stop) {
+            Get-ItemProperty -LiteralPath $statePath -ErrorAction Stop |
             Select-Object Phase, PhaseName, Status, PostUpgradeOSCaption, TargetOSCaption, TargetBuild, LastUpdated
+        }
+        if ($starterActive -and (-not $reg -or $reg.Status -ne 'InProgress')) {
+            throw "Target starter is active but has not published a monitorable state. Retry with -MonitorOnly; do not overwrite its staged files."
+        }
         if ($reg) {
             # Status "InProgress" ALONE is not trustworthy - setup.exe can
             # self-cancel (e.g. a OneSettings network-timeout) and leave
@@ -436,7 +628,8 @@ try {
             $btPath = "$env:SystemDrive\`$WINDOWS.~BT"
             $pantherLog = Join-Path $btPath "Sources\Panther\setupact.log"
             $pantherFreshMin = if (Test-Path $pantherLog) { ((Get-Date) - (Get-Item $pantherLog).LastWriteTime).TotalMinutes } else { [double]::PositiveInfinity }
-            $reg | Add-Member -NotePropertyName LooksActive -NotePropertyValue ($setupIsRunning -or ($pantherFreshMin -lt 5)) -Force
+            $reg | Add-Member -NotePropertyName LooksActive -NotePropertyValue ($starterActive -or $setupIsRunning -or ($pantherFreshMin -lt 5)) -Force
+            $reg | Add-Member -NotePropertyName StarterActive -NotePropertyValue $starterActive -Force
             $reg | Add-Member -NotePropertyName SetupIsRunning -NotePropertyValue $setupIsRunning -Force
             $reg | Add-Member -NotePropertyName PantherAgeMin -NotePropertyValue $pantherFreshMin -Force
             # LIVE, independent OS caption/build check (2026-07-20) - not
@@ -460,9 +653,10 @@ try {
         $reg
     } -ErrorAction Stop
     if ($existing -and $existing.Status -eq "InProgress" -and [int]$existing.Phase -ge 1 -and $existing.LooksActive) {
+        if ($PrecheckOnly) { throw "An upgrade is active; assessment cannot run concurrently. Use -MonitorOnly." }
         $resumeExisting = $true
         Write-Log "Detected an upgrade already in progress on $TargetComputer (Phase=$($existing.Phase) '$($existing.PhaseName)', Status=InProgress, setup process running=$($existing.SetupIsRunning), setupact.log age=$([math]::Round($existing.PantherAgeMin,1)) min) - skipping re-stage/re-kickoff and resuming monitoring directly." "WARN"
-    } elseif ($existing -and $existing.Status -in @("Completed","CompletedWithWarnings")) {
+    } elseif (-not $PrecheckOnly -and $existing -and $existing.Status -in @("Completed","CompletedWithWarnings")) {
         # A prior run already finished successfully (e.g. the LAST
         # orchestrator process hit -TimeoutMinutes and exited while the
         # upgrade itself kept going and completed on Server B in the
@@ -482,7 +676,7 @@ try {
         # that live query itself failed.
         $liveOsText = if ($existing.LiveOSCaption) { "$($existing.LiveOSCaption) (build $($existing.LiveBuild))" } elseif ($existing.PostUpgradeOSCaption) { "$($existing.PostUpgradeOSCaption) (registry value, live re-check failed)" } else { "(could not be determined)" }
         Write-Log "====================================================================" "SUCCESS"
-        Write-Log " $TargetComputer IS ALREADY ON THE TARGET OS - NO UPGRADE ACTION TAKEN THIS RUN" "SUCCESS"
+        Write-Log " PRIOR COMPLETION RECORDED - LIVE BUILD WILL BE VERIFIED; NO UPGRADE ACTION TAKEN" "SUCCESS"
         Write-Log "====================================================================" "SUCCESS"
         Write-Log " Current OS (live check)   : $liveOsText" "SUCCESS"
         Write-Log " Prior run outcome         : Status=$($existing.Status) (Phase=$($existing.Phase) '$($existing.PhaseName)')" "SUCCESS"
@@ -493,7 +687,8 @@ try {
         Write-Log "$TargetComputer reports Status=InProgress (Phase=$($existing.Phase) '$($existing.PhaseName)') but shows NO real activity (no setup process, setupact.log age=$([math]::Round($existing.PantherAgeMin,1)) min) - treating as a STALE prior attempt, not a genuine resume. Proceeding with a normal stage+kickoff; Start-TargetUpgrade.ps1's own stale-attempt cleanup (Section 1b) will reset and restart fresh." "WARN"
     }
 } catch {
-    Write-Log "Could not pre-check existing upgrade state on $TargetComputer (non-blocking, assuming none): $_" "WARN"
+    throw "Cannot safely determine existing upgrade state on $TargetComputer. No kickoff will be attempted. $($_.Exception.Message)"
+}
 }
 
 # Moved here from its original "Section 4 - Monitoring Loop Functions" spot
@@ -508,18 +703,35 @@ function Read-RemoteFileWithTimeout {
     with a hard timeout via a background job, since a straight Test-Path/
     Get-Content against an unreachable or rebooting host can otherwise hang
     for the full SMB negotiation timeout.
+
+    Returns the file's contents, or $null on ANY failure. Because $null is
+    overloaded like that, callers that care about the difference must pass
+    -ErrorDetail: it is always populated when $null is returned, including
+    for the easy-to-miss case of a file that exists and is readable but is
+    zero bytes. That case is not hypothetical here - the target writes the
+    status JSON by building a .tmp and Move-Item'ing it into place, and a
+    reader that catches a torn or truncated write sees exactly that. Without
+    the explicit branch below it would report as "unreachable", sending an
+    operator to chase a network problem that does not exist.
     #>
     param([string]$Path, [int]$TimeoutSec = 5, [ref]$ErrorDetail)
     $job = Start-Job -ScriptBlock {
         param($p)
-        if (-not (Test-Path $p)) { throw "Path not found or not accessible: $p" }
-        Get-Content -Path $p -Raw -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $p)) { throw "Path not found or not accessible: $p" }
+        Get-Content -LiteralPath $p -Raw -ErrorAction Stop
     } -ArgumentList $Path
     try {
         if (Wait-Job -Job $job -Timeout $TimeoutSec) {
             $jobErr = $null
             $result = Receive-Job -Job $job -ErrorVariable jobErr -ErrorAction SilentlyContinue
             if ($jobErr -and $ErrorDetail) { $ErrorDetail.Value = $jobErr[0].ToString() }
+            if (-not $jobErr -and [string]::IsNullOrWhiteSpace($result)) {
+                # Reached the file fine; there was just nothing in it.
+                # Get-Content -Raw on a zero-byte file returns $null with no
+                # error, so this is the only place the distinction survives.
+                if ($ErrorDetail) { $ErrorDetail.Value = "Read '$Path' successfully but it is empty - the target is reachable and the file exists, so this is most likely a status write caught mid-flight (or one that failed partway). It normally resolves by the next poll." }
+                return $null
+            }
             return $result
         }
         if ($ErrorDetail) { $ErrorDetail.Value = "Timed out after ${TimeoutSec}s reading '$Path' (SMB/network may be slow, blocked, or the admin share isn't reachable)." }
@@ -545,8 +757,8 @@ try {
     } -ArgumentList $RemoteStagingPath | Out-Null
 
     Write-Log "Copying target-side files to $($TargetComputer):$RemoteStagingPath ..."
-    # Copy ONLY the 5 named required files (not a wildcard "*") - this is what
-    # guarantees just the 5 target-side files are staged on Server B even when
+    # Copy ONLY the named required files (not a wildcard "*") - this is what
+    # guarantees just the target-side files are staged on Server B even when
     # -SourceFilesPath points at a flat folder that also contains this very
     # orchestrator script (or any other unrelated files) alongside them.
     foreach ($f in $requiredFiles) {
@@ -561,11 +773,31 @@ try {
             Copy-Item -Path $optPath -Destination $RemoteStagingPath -ToSession $session -Force
             Write-Log "Optional companion '$f' found and staged to $TargetComputer."
         } else {
-            Write-Log "Optional companion '$f' not found in $SourceFilesPath - continuing without it (GPO backup will fall back to robocopy/secedit only)." "WARN"
+            Write-Log "Optional companion '$f' not found in $SourceFilesPath - continuing without it ($($optionalFileNotes[$f]))." "WARN"
         }
     }
 
     Write-Log "Launching Start-TargetUpgrade.ps1 on $TargetComputer (pre-checks + backup + ISO mount + setup.exe kickoff)..."
+    # SWITCH MARSHALLING - read this before changing either half. Every
+    # [switch] below is cast to [bool] here, and the remote scriptblock turns
+    # it back into a switch. The round-trip is deliberate:
+    #
+    #   * A [switch] cannot survive the hop as-is. It has to cross into a
+    #     remote runspace through -ArgumentList as plain serialised data, and
+    #     SwitchParameter does not round-trip usefully - hence [bool].
+    #   * Coming back, the receiving end must NOT do $splat[$k] = $false for a
+    #     false value. Splatting -SomeSwitch:$false onto a switch parameter is
+    #     legal PowerShell, but it is also the exact shape that trips people
+    #     up, and Start-TargetUpgrade.ps1's defaults already mean "off". So a
+    #     false bool is OMITTED from the splat entirely and only a true bool
+    #     is passed through as $true. Absent == off, present == on.
+    #
+    # The upshot: adding a new [switch] parameter means adding it here with a
+    # [bool] cast, and nothing else. Adding it WITHOUT the cast silently sends
+    # a SwitchParameter object that fails the -is [bool] test below, lands in
+    # the splat as an object rather than a switch, and the flag is quietly
+    # ignored on the target - no error, just an upgrade that ran with the
+    # wrong options.
     $remoteArgs = @{
         IsoFolder             = $IsoFolder
         MinFreeSpaceGB        = $MinFreeSpaceGB
@@ -574,7 +806,10 @@ try {
         RetentionDays         = $RetentionDays
         DisableAutoCleanup    = [bool]$DisableAutoCleanup
         SkipPatchCheckLab     = [bool]$SkipPatchCheckLab
+        SkipDismScanHealthLab = [bool]$SkipDismScanHealthLab
+        SkipSfcScanNowLab     = [bool]$SkipSfcScanNowLab
         SkipSystemStateBackup = [bool]$SkipSystemStateBackup
+        PrecheckOnly          = [bool]$PrecheckOnly
         MinVMwareToolsVersion = $MinVMwareToolsVersion
         UseControlledReboot   = [bool]$UseControlledReboot
         MaxPatchAgeDays       = $MaxPatchAgeDays
@@ -592,6 +827,9 @@ try {
         Set-Location $StagingPath
         $splat = @{}
         foreach ($k in $ArgMap.Keys) {
+            # See the "SWITCH MARSHALLING" note where $remoteArgs is built:
+            # a $false bool is intentionally dropped rather than splatted as
+            # -Switch:$false, so "absent" is what means "off".
             if ($ArgMap[$k] -is [bool]) { if ($ArgMap[$k]) { $splat[$k] = $true } } else { $splat[$k] = $ArgMap[$k] }
         }
         try {
@@ -619,6 +857,8 @@ try {
     $spinnerIdx   = 0
     $stage12Start = Get-Date
     $allReceived  = @()
+    $stage12ProgressId = 120
+    $stage12Activity = "Stage 1/3-2/3: Pre-Upgrade Assessment + Backup running on $TargetComputer"
     # Real percentage during Stage 1/2 (2026-07-24): now that Add-PreCheckResult/
     # Update-BackupProgress write genuine task-count-based percentages to
     # Server B's own status file, poll it here too so the GUI bar shows a
@@ -629,28 +869,40 @@ try {
     # also service a concurrent Invoke-Command call, and spawning
     # Get-UpgradeStatus's several background jobs every second would be
     # unnecessarily heavy for what only needs one lightweight file read.
-    # Throttled to every 3rd iteration (~3 sec) - frequent enough to feel
-    # live, without hammering the admin share every single second. Sticky:
-    # keeps showing the last successfully-read value between polls/on a
-    # transient read failure, and omits the percentage entirely (bar stays
-    # indeterminate) until the very first successful read.
+    # Polled on a real 3-second clock (see $stage12PollInterval) - frequent
+    # enough to feel live, without hammering the admin share every single
+    # second. Sticky: keeps showing the last successfully-read value between
+    # polls/on a transient read failure, and omits the percentage entirely
+    # (bar stays indeterminate) until the very first successful read.
     $stage12Pct = $null
     $stage12PhaseName = $null
+    # Wall-clock throttle rather than "every Nth iteration" (2026-09-26). The
+    # iteration count is NOT a clock: one pass is Start-Sleep 1s PLUS however
+    # long the read below takes, so on a slow or half-reachable share - where
+    # Read-RemoteFileWithTimeout can burn its full 2s timeout - a modulo-3
+    # throttle silently stretched the real poll interval to ~9s, backing off
+    # hardest in exactly the situation an operator is watching the bar most
+    # closely. MinValue seeds it so the first iteration polls immediately.
+    $stage12PollInterval = [TimeSpan]::FromSeconds(3)
+    $lastJsonPoll = [datetime]::MinValue
     $driveLetter = ($StatusJsonPath -split ':')[0]
     $stage12UncPath = "\\$TargetComputer\$driveLetter`$\$(($StatusJsonPath -split ':', 2)[1].TrimStart('\'))"
     while ($remoteJob.State -eq 'Running') {
+        Write-RemoteStreamsToLog -Job $remoteJob
         $received = Receive-Job -Job $remoteJob -ErrorAction SilentlyContinue
         if ($received) { $allReceived += $received }
-        if ($spinnerIdx % 3 -eq 0) {
+        if (((Get-Date) - $lastJsonPoll) -ge $stage12PollInterval) {
+            # Stamped BEFORE the read, so the interval measures poll-to-poll
+            # and a slow read doesn't add its own latency on top of the gap.
+            $lastJsonPoll = Get-Date
             $rawStatus = Read-RemoteFileWithTimeout -Path $stage12UncPath -TimeoutSec 2
             if ($rawStatus) {
                 try {
                     $parsedStatus = $rawStatus | ConvertFrom-Json
-                    if ($null -ne $parsedStatus.PercentComplete) { $stage12Pct = [int]$parsedStatus.PercentComplete }
+                    if ($null -ne $parsedStatus.PercentComplete) { $stage12Pct = [math]::Max(0, [math]::Min(100, [int]$parsedStatus.PercentComplete)) }
                     if ($parsedStatus.PhaseName) { $stage12PhaseName = $parsedStatus.PhaseName }
                 } catch {
-                    # Transient partial-write race - keep showing the last
-                    # good values, will pick up a clean read next iteration.
+                    Write-Log "Could not parse assessment/backup progress; retaining the last reading: $_" "WARN"
                 }
             }
         }
@@ -658,7 +910,8 @@ try {
         $pctPrefix = if ($null -ne $stage12Pct) { "[$stage12Pct%] " } else { "" }
         $phaseSuffix = if ($stage12PhaseName) { " ($stage12PhaseName)" } else { "" }
         $progressParams = @{
-            Activity = "Stage 1/3-2/3: Pre-Upgrade Assessment + Backup running on $TargetComputer"
+            Id       = $stage12ProgressId
+            Activity = $stage12Activity
             Status   = "$($spinnerChars[$spinnerIdx % 4]) ${pctPrefix}Elapsed: $($elapsed.ToString('mm\:ss'))$phaseSuffix - this can take several minutes (DISM scan, registry/GPO backup, etc.). See the scrolling [INFO]/[PASS]/[WARN] log lines printing below this bar for live step-by-step detail."
         }
         if ($null -ne $stage12Pct) { $progressParams["PercentComplete"] = $stage12Pct }
@@ -666,9 +919,17 @@ try {
         $spinnerIdx++
         Start-Sleep -Seconds 1
     }
-    Write-Progress -Activity "Stage 1/3-2/3: Pre-Upgrade Assessment + Backup running on $TargetComputer" -Completed
+    Write-Progress -Id $stage12ProgressId -Activity $stage12Activity -Completed
+    Write-RemoteStreamsToLog -Job $remoteJob
     $received = Receive-Job -Job $remoteJob -ErrorAction SilentlyContinue
     if ($received) { $allReceived += $received }
+    # Receive-Job replays the target's final Information/Write-Host records.
+    # ConsoleHost can redraw the most recent progress record after that replay,
+    # leaving stale fragments after the PowerShell prompt. Clear the same
+    # progress ID once more after the final stream drain, then move output to a
+    # clean line before printing the terminal result.
+    Write-Progress -Id $stage12ProgressId -Activity $stage12Activity -Completed
+    if ($Host.Name -eq "ConsoleHost") { Write-Host "" }
     Remove-Job -Job $remoteJob -Force -ErrorAction SilentlyContinue
     # Write-Host/Warning/Verbose lines don't produce pipeline objects, so the
     # genuine [pscustomobject]@{Success;Error} return value is the only
@@ -716,11 +977,15 @@ try {
         $reRunFlags = foreach ($k in $PSBoundParameters.Keys) {
             if ($k -eq 'TargetComputer') { continue }
             $v = $PSBoundParameters[$k]
-            if ($v -is [System.Management.Automation.SwitchParameter] -or $v -is [bool]) {
-                if ($v) { "-$k" }
-            } elseif ($v -is [System.Management.Automation.PSCredential]) {
+            # Use the parameter NAME rather than a runtime -is check. In some
+            # remoting/host combinations the credential object has a wrapped
+            # type, causing the old PSCredential type test to miss and render
+            # "-Credential " with an empty value in the retry command.
+            if ($k -eq 'Credential') {
                 $reRunNeedsCred = $true
-                "-$k `$cred"
+                "-Credential `$cred"
+            } elseif ($v -is [System.Management.Automation.SwitchParameter] -or $v -is [bool]) {
+                if ($v) { "-$k" }
             } elseif ($v -is [string]) {
                 "-$k `"$v`""
             } else {
@@ -759,30 +1024,36 @@ try {
             Write-Log "   3. Re-run the OS upgrade with this exact command once cleanup is done:" "WARN"
             if ($reRunCredHint) { Write-Log "        $reRunCredHint" "WARN" }
             Write-Log "        $reRunCommand" "WARN"
-            Write-Log "      Nothing was changed on $TargetComputer this run (no backup, no ISO" "WARN"
-            Write-Log "      mount, no setup.exe) - it is safe to simply retry." "WARN"
+            Write-Log "      No backup or setup.exe was started. Assessment artifacts and a" "WARN"
+            Write-Log "      mounted ISO may remain; they are safe to reuse on retry." "WARN"
         } else {
-            Write-Log "ACTION REQUIRED: Resolve the reason(s) listed above on $TargetComputer, then re-run this same command. Nothing was changed on $TargetComputer (no backup, no ISO mount, no setup.exe) - it is safe to simply retry once fixed." "WARN"
+            Write-Log "ACTION REQUIRED: Resolve the reason(s) listed above on $TargetComputer, then re-run this same command. No backup or setup.exe was started. Assessment may have staged files, written logs/status, and mounted or reused the ISO; those artifacts are safe to reuse on retry." "WARN"
             if ($reRunCredHint) { Write-Log "   $reRunCredHint" "WARN" }
             Write-Log "   Re-run command: $reRunCommand" "WARN"
         }
         Write-Log "====================================================================" "ERROR"
-        Write-Log "Full pre-check report: D:\UpgradeBackup\Logs\PreCheckReport_*.log (or C:\ProgramData\OSUpgradeAutomation\Logs if D: was unreachable) on $TargetComputer." "ERROR"
+        $preCheckReportHint = Join-Path $BackupRoot "PreCheckReport_*.log"
+        Write-Log "Full pre-check report: $preCheckReportHint (or C:\ProgramData\OSUpgradeAutomation\Logs if the backup drive was unavailable) on $TargetComputer." "ERROR"
 
         # Deliberately just falls through here (no throw/exit) - $upgradeKickoffOk
         # stays $false, the outer try's "finally" still cleans up the PSSession
-        # normally, and the "if (-not $upgradeKickoffOk) { return }" check right
+        # normally, and the "if (-not $upgradeKickoffOk) { exit 1 }" check right
         # after the try/finally block performs the actual graceful stop.
     } else {
         $upgradeKickoffOk = $true
-        Write-Log "setup.exe launched successfully on $TargetComputer. $TargetComputer will now reboot multiple times - closing this session (expected)." "SUCCESS"
+        if ($PrecheckOnly) {
+            Write-Log "Assessment passed on $TargetComputer. No backup or Windows Setup was started." "SUCCESS"
+        } else {
+            Write-Log "setup.exe launched successfully on $TargetComputer. $TargetComputer will now reboot multiple times - closing this session (expected)." "SUCCESS"
+        }
     }
 } finally {
     if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
 }
 }
 
-if (-not $upgradeKickoffOk) { return }
+if (-not $upgradeKickoffOk) { exit 1 }
+if ($PrecheckOnly) { exit 0 }
 
 # =============================================================================
 # SECTION 4 - MONITORING LOOP FUNCTIONS
@@ -800,6 +1071,31 @@ function Test-RemoteWinRM {
     param([string]$ComputerName, [System.Management.Automation.PSCredential]$Cred, [int]$TimeoutSec = 5)
     return Test-WinRMTransport -ComputerName $ComputerName -Cred $Cred `
                                -Transport $script:WinRMTransport -TimeoutSec $TimeoutSec
+}
+
+# StdRegProv read helpers for Get-RemoteStatusViaCimDcom below. Hoisted out
+# of that function's try block (2026-09-26): defining them in there worked,
+# but it re-created both on every status poll, and - because `function`
+# statements are NOT scoped to a try block - they escaped into script scope
+# anyway, just invisibly and only after the first CIM call had happened. Worse,
+# they closed over $cimSession/$hDefKey/$keyPath from the enclosing frame, so
+# once they were in script scope they were quietly callable from anywhere in
+# the file, where they would resolve $cimSession to whatever the caller
+# happened to have (or nothing) and fail obscurely. Taking the session as an
+# explicit parameter removes that trap entirely.
+$script:StdRegProvHklm    = [uint32]2147483650   # HKEY_LOCAL_MACHINE
+$script:StdRegProvKeyPath = "SOFTWARE\OSUpgradeAutomation"
+
+function Get-UpgradeRegSZ {
+    param($CimSession, [string]$Name)
+    $r = Invoke-CimMethod -CimSession $CimSession -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{ hDefKey = $script:StdRegProvHklm; sSubKeyName = $script:StdRegProvKeyPath; sValueName = $Name }
+    if ($r.ReturnValue -eq 0) { return $r.sValue } else { return $null }
+}
+
+function Get-UpgradeRegDWord {
+    param($CimSession, [string]$Name)
+    $r = Invoke-CimMethod -CimSession $CimSession -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{ hDefKey = $script:StdRegProvHklm; sSubKeyName = $script:StdRegProvKeyPath; sValueName = $Name }
+    if ($r.ReturnValue -eq 0) { return $r.uValue } else { return $null }
 }
 
 function Get-RemoteStatusViaCimDcom {
@@ -820,37 +1116,28 @@ function Get-RemoteStatusViaCimDcom {
         if ($Cred) { $cimParams["Credential"] = $Cred }
         $cimSession = New-CimSession @cimParams
         try {
-            $hDefKeyLocalMachine = [uint32]2147483650
-            $keyPath = "SOFTWARE\OSUpgradeAutomation"
-
-            function Get-RegSZ($name) {
-                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
-                if ($r.ReturnValue -eq 0) { return $r.sValue } else { return $null }
-            }
-            function Get-RegDWord($name) {
-                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
-                if ($r.ReturnValue -eq 0) { return $r.uValue } else { return $null }
-            }
-
             $obj = [ordered]@{
                 ComputerName    = $ComputerName
-                Phase           = Get-RegDWord "Phase"
-                PhaseName       = Get-RegSZ "PhaseName"
-                Status          = Get-RegSZ "Status"
-                PercentComplete = Get-RegDWord "PercentComplete"
-                PercentSource   = Get-RegSZ "PercentSource"
-                SourceBuild     = Get-RegSZ "SourceBuild"
-                TargetBuild     = Get-RegSZ "TargetBuild"
-                LastUpdated     = Get-RegSZ "LastUpdated"
-                Notes           = Get-RegSZ "Notes"
-                PostUpgradeOSCaption         = Get-RegSZ "PostUpgradeOSCaption"
-                ServicesComparisonResult     = Get-RegSZ "ServicesComparisonResult"
-                ServicesComparisonReportPath = Get-RegSZ "ServicesComparisonReportPath"
-                ServicesAttentionCount       = Get-RegDWord "ServicesAttentionCount"
-                ServicesInfoCount            = Get-RegDWord "ServicesInfoCount"
-                TargetOSCaption              = Get-RegSZ "TargetOSCaption"
-                LicenseRecommendation        = Get-RegSZ "LicenseRecommendation"
-                Stage                        = Get-RegSZ "Stage"
+                Phase           = Get-UpgradeRegDWord $cimSession "Phase"
+                PhaseName       = Get-UpgradeRegSZ    $cimSession "PhaseName"
+                Status          = Get-UpgradeRegSZ    $cimSession "Status"
+                PercentComplete = Get-UpgradeRegDWord $cimSession "PercentComplete"
+                PercentSource   = Get-UpgradeRegSZ    $cimSession "PercentSource"
+                SourceBuild     = Get-UpgradeRegSZ    $cimSession "SourceBuild"
+                TargetBuild     = Get-UpgradeRegSZ    $cimSession "TargetBuild"
+                LastUpdated     = Get-UpgradeRegSZ    $cimSession "LastUpdated"
+                Notes           = Get-UpgradeRegSZ    $cimSession "Notes"
+                PostUpgradeOSCaption         = Get-UpgradeRegSZ    $cimSession "PostUpgradeOSCaption"
+                ServicesComparisonResult     = Get-UpgradeRegSZ    $cimSession "ServicesComparisonResult"
+                ServicesComparisonReportPath = Get-UpgradeRegSZ    $cimSession "ServicesComparisonReportPath"
+                ServicesAttentionCount       = Get-UpgradeRegDWord $cimSession "ServicesAttentionCount"
+                ServicesInfoCount            = Get-UpgradeRegDWord $cimSession "ServicesInfoCount"
+                TargetOSCaption              = Get-UpgradeRegSZ    $cimSession "TargetOSCaption"
+                LicenseRecommendation        = Get-UpgradeRegSZ    $cimSession "LicenseRecommendation"
+                Stage                        = Get-UpgradeRegSZ    $cimSession "Stage"
+            }
+            if ($null -eq $obj.Phase -or [string]::IsNullOrWhiteSpace($obj.Status)) {
+                throw "Registry contains no complete upgrade status."
             }
             return [pscustomobject]$obj
         } finally {
@@ -859,6 +1146,66 @@ function Get-RemoteStatusViaCimDcom {
     } catch {
         if ($ErrorDetail) { $ErrorDetail.Value = $_.Exception.Message }
         return $null
+    }
+}
+
+function Get-RemoteStatusViaWinRM {
+    param([string]$JsonPath, [ref]$ErrorDetail)
+    $params = Get-WinRMSessionParams
+    $job = $null
+    try {
+        $job = Invoke-Command @params -AsJob -ScriptBlock {
+            param($Path)
+            $ErrorActionPreference = "Stop"
+            if (Test-Path -LiteralPath $Path) {
+                try {
+                    $state = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+                    if ($null -ne $state.Phase -and $state.Status) { return $state }
+                } catch {
+                    Write-Warning "Cannot read status JSON; attempting registry: $_"
+                }
+            }
+            Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation" |
+                Select-Object Phase, PhaseName, Status, PercentComplete, PercentSource,
+                    SourceBuild, TargetBuild, LastUpdated, Notes, PostUpgradeOSCaption,
+                    ServicesComparisonResult, ServicesComparisonReportPath,
+                    ServicesAttentionCount, ServicesInfoCount, TargetOSCaption,
+                    LicenseRecommendation, Stage
+        } -ArgumentList $JsonPath
+        if (-not (Wait-Job -Job $job -Timeout 10)) { throw "WinRM status read timed out after 10 seconds." }
+        $result = Receive-Job -Job $job -ErrorAction Stop
+        if ($null -eq $result.Phase -or -not $result.Status) { throw "WinRM returned no complete upgrade status." }
+        return $result
+    } catch {
+        if ($ErrorDetail) { $ErrorDetail.Value = $_.Exception.Message }
+        return $null
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-RemoteOperatingSystem {
+    $optionArgs = @{ Protocol = "Wsman" }
+    $params = @{ ComputerName = $TargetComputer; OperationTimeoutSec = 10; ErrorAction = "Stop" }
+    if ($Credential) { $params.Credential = $Credential }
+    if ($script:WinRMTransport -in @("Https", "HttpsSkipCert")) {
+        $optionArgs.UseSsl = $true
+        $params.Port = 5986
+        if ($script:WinRMTransport -eq "HttpsSkipCert") {
+            $optionArgs.SkipCACheck = $true
+            $optionArgs.SkipCNCheck = $true
+            $optionArgs.SkipRevocationCheck = $true
+        }
+    }
+    $params.SessionOption = New-CimSessionOption @optionArgs
+    $session = New-CimSession @params
+    try {
+        Get-CimInstance -CimSession $session -ClassName Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop
+    } finally {
+        Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
     }
 }
 
@@ -901,6 +1248,7 @@ function Get-UpgradeStatus {
     if ($raw) {
         try {
             $parsed = $raw | ConvertFrom-Json
+            if ($null -eq $parsed.Phase -or -not $parsed.Status) { throw "Incomplete status payload." }
             $parsed | Add-Member -NotePropertyName PingOk  -NotePropertyValue $pingOk  -Force
             $parsed | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $winRmOk -Force
             $parsed | Add-Member -NotePropertyName Mode    -NotePropertyValue $mode    -Force
@@ -924,11 +1272,18 @@ function Get-UpgradeStatus {
         return $cimStatus
     }
 
-    # Neither file nor DCOM yielded data. If WinRM itself is up, the machine
-    # is definitely alive even without a status payload yet (e.g. a brief
-    # race right after First Boot before SMB/DCOM services come up) - report
-    # that honestly rather than falling through to a ping-only guess.
+    # WinRM is also a data channel, not just a reachability probe.
     if ($winRmOk) {
+        $winRmErr = $null
+        $winRmStatus = Get-RemoteStatusViaWinRM -JsonPath $JsonPath -ErrorDetail ([ref]$winRmErr)
+        if ($winRmStatus) {
+            $winRmStatus | Add-Member -NotePropertyName PingOk -NotePropertyValue $pingOk -Force
+            $winRmStatus | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $true -Force
+            $winRmStatus | Add-Member -NotePropertyName Mode -NotePropertyValue $mode -Force
+            $winRmStatus | Add-Member -NotePropertyName Source -NotePropertyValue "WinRM" -Force
+            $script:fileDcomDiagLogged = $false
+            return $winRmStatus
+        }
         # This specific combination (WinRM confirmed up, but BOTH the SMB
         # file-share AND CIM/DCOM channels came back empty) used to be
         # completely silent about WHY - it would just show "0%, no status
@@ -937,10 +1292,11 @@ function Get-UpgradeStatus {
         # both channels once per occurrence (not every 15s poll) so this is
         # actually debuggable instead of a black box.
         if (-not $script:fileDcomDiagLogged) {
-            Write-Log "WinRM is up on $ComputerName but neither the file-share ($uncPath) nor CIM/DCOM channel returned data. File-share reason: $(if ($fileErr) { $fileErr } else { 'no data/empty response' }) | DCOM reason: $(if ($cimErr) { $cimErr } else { 'no data/empty response' }). This can happen if SMB (445) or DCOM/RPC (135+dynamic) are firewalled even though WinRM ($(Get-WinRMTransportLabel $script:WinRMTransport)) is open - see PROJECT-NOTES.md port guidance. Will keep retrying; this message won't repeat every poll." "WARN"
+            Write-Log "WinRM status fallback also failed: $winRmErr" "WARN"
+            Write-Log "No usable status payload from any channel on $ComputerName. File-share ($uncPath): $(if ($fileErr) { $fileErr } else { 'no data/empty response' }) | DCOM: $(if ($cimErr) { $cimErr } else { 'no data/empty response' }). WinRM status failure is logged above. Verify target logs/state and channel permissions; will retry." "WARN"
             $script:fileDcomDiagLogged = $true
         }
-        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "InProgress"; PhaseName = "Reachable via WinRM (no file/DCOM status source yet)"; PercentComplete = $null; Notes = "WinRM confirmed up; no file-share or DCOM status source reachable yet - normal during a brief post-reboot service-startup race, or a sign SMB/DCOM are firewalled while WinRM is open."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "Unknown"; PhaseName = "Reachable via WinRM (no valid status payload)"; PercentComplete = $null; Notes = "WinRM is reachable but all status reads failed. Upgrade state is unconfirmed."; TargetBuild = $null; Stage = $null }
     }
 
     # WinRM is down too, but ping succeeded - typical during the Safe OS
@@ -954,7 +1310,7 @@ function Get-UpgradeStatus {
         # sub-phase. Wording calls out Safe OS/WinPE by name so it's less
         # ambiguous to a customer watching the GUI bar than a bare
         # "heartbeat only" message.
-        return [pscustomobject]@{ PingOk = $true; WinRmOk = $false; Mode = "Heartbeat"; Source = "PingOnly"; Status = "InProgress"; PhaseName = "Safe OS/WinPE transition in progress (WinRM down - heartbeat via ping only)"; PercentComplete = $null; Notes = "Host responds to ping; WinRM is DOWN and no file/DCOM status source is reachable yet - normal during the Safe OS/WinPE reboot transition. No action needed."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+        return [pscustomobject]@{ PingOk = $true; WinRmOk = $false; Mode = "Heartbeat"; Source = "PingOnly"; Status = "Unknown"; PhaseName = "Ping reachable; upgrade phase unconfirmed"; PercentComplete = $null; Notes = "No status channel returned data. Ping alone does not establish upgrade progress."; TargetBuild = $null; Stage = $null }
     }
 
     # Nothing answered on ANY of the four channels. This is either a true
@@ -964,7 +1320,35 @@ function Get-UpgradeStatus {
     # assume ping is a reliable "is it down" signal on its own. Stage is set
     # for the same reason as the PingOnly branch above - this can only ever
     # fire after setup.exe has already launched.
-    return [pscustomobject]@{ PingOk = $false; WinRmOk = $false; Mode = "Offline"; Source = "None"; Status = "Offline"; PhaseName = "Safe OS/WinPE transition or reboot in progress (unreachable on ping, WinRM, file-share, and DCOM)"; PercentComplete = $null; Notes = ""; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+    return [pscustomobject]@{ PingOk = $false; WinRmOk = $false; Mode = "Offline"; Source = "None"; Status = "Unknown"; PhaseName = "Unreachable; upgrade phase unconfirmed"; PercentComplete = $null; Notes = "All probes failed. A reboot, network interruption or host failure cannot be distinguished remotely."; TargetBuild = $null; Stage = $null }
+}
+
+# Plain hashtable, not [ordered]: an OrderedDictionary indexed with an integer
+# resolves by POSITION, not by key, which would silently shift every label.
+$script:PhaseShortNames = @{
+    1 = "1 Assess"; 2 = "2 Backup"; 3 = "3 Downlevel"; 4 = "4 SafeOS"
+    5 = "5 FirstBoot"; 6 = "6 OOBE"; 7 = "7 Validate"
+}
+
+function Get-PhaseChecklist {
+    <#
+    Renders the upgrade lifecycle as a done/active/pending strip so the whole
+    phase sequence is visible at a glance rather than only the current phase.
+
+    Driven ONLY by a confirmed numeric phase. Callers pass $null during a
+    connectivity gap, which renders as "awaiting" - the checklist must never
+    advance on an inferred phase, for the same reason the phase-change log
+    only compares confirmed readings.
+    #>
+    param($Phase)
+    if ($null -eq $Phase) { return "Lifecycle: awaiting a confirmed phase reading from the target" }
+    $n = [int]$Phase
+    if ($n -eq 99) { return "Lifecycle: ROLLED BACK - Windows Setup reverted the server to its source OS" }
+    $marks = foreach ($p in 1..7) {
+        $label = $script:PhaseShortNames[$p]
+        if ($p -lt $n) { "[x] $label" } elseif ($p -eq $n) { ">> $label" } else { "[ ] $label" }
+    }
+    return "Lifecycle: " + ($marks -join "   ")
 }
 
 function Show-ProgressBar {
@@ -982,35 +1366,34 @@ function Show-ProgressBar {
     output (phase/mode transitions, banners) stays clean and uncluttered
     regardless of host/redirection quirks.
     #>
-    param([int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk, [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage)
+    param(
+        [int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk,
+        [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage,
+        $Phase, [int]$EvidenceAgeSec = -1
+    )
 
     $pct = [math]::Max(0, [math]::Min(100, $PercentComplete))
     # If ping fails but some other channel confirms the host IS actually
     # reachable (Mode isn't "Offline"), showing a flat "OFFLINE" here would
     # visibly contradict "Active Polling"/"Heartbeat" right next to it - this
     # is exactly what happens in an ICMP-blocked environment, where ping
-    # will NEVER succeed even though the server is fully up. Distinguish
-    # "confirmed reachable via ping" from "reachable via another channel,
-    # ping just didn't/couldn't answer" instead of conflating both as ONLINE
-    # or falsely calling it OFFLINE.
+    # will NEVER succeed even while the server is fully up.
     $pingText = if ($PingOk) { "ONLINE" } elseif ($Mode -ne "Offline") { "REACHABLE*" } else { "OFFLINE" }
     $modeText = switch ($Mode) { "ActivePolling" { "Active Polling" } "Heartbeat" { "Heartbeat" } default { "Offline" } }
-    # Percentage is spelled out explicitly in -Status (not left to the native
-    # graphical bar alone) - on narrow terminal widths, PowerShell's own
-    # Write-Progress bar/percentage text gets clipped and can render as just
-    # the fill glyphs ("[ooo") with no visible number, so the "NN%" here is
-    # what actually guarantees the percentage stays readable regardless of
-    # terminal width. PercentSource (Measured/Estimated) is also spelled out
-    # so it's clear at a glance whether a number is live telemetry parsed
-    # from Windows Setup's own logs, or a best-effort milestone marker (e.g.
-    # Safe OS/WinPE, where no telemetry can exist at all).
+    # Percentage and provenance are spelled out in the text, not left to the
+    # native bar: on a narrow console PowerShell clips its own percentage and
+    # renders only fill glyphs.
     $srcText = if ($PercentSource) { $PercentSource } else { "n/a" }
-    # Stage groups Phase 1 (Precheck) / Phase 2 (Backup) / Phase 3-7
-    # (Windows Setup actually executing: Downlevel -> Safe OS -> First Boot
-    # -> OOBE -> Completed) so it's immediately clear at a glance which of
-    # the 3 broad stages is running, in addition to the granular PhaseName.
-    $stageText = if ($Stage) { "$Stage - " } else { "" }
-    Write-Progress -Activity "Monitoring OS upgrade on $TargetComputer [$pingText / $modeText]" -Status "$stageText[$pct% - $srcText] $PhaseName (Status=$Status, src:$Source)" -PercentComplete $pct
+    $stageText = if ($Stage) { $Stage } else { "Stage -" }
+    # Staleness is the signal that distinguishes "working" from "frozen" - the
+    # defect that previously let a dead run look healthy for hours.
+    $ageText = if ($EvidenceAgeSec -ge 0) { "target status unchanged for ${EvidenceAgeSec}s" } else { "no target status yet" }
+
+    Write-Progress -Id 1 `
+        -Activity "OS upgrade on $TargetComputer   |   $stageText   |   $pingText / $modeText" `
+        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $ageText)" `
+        -CurrentOperation (Get-PhaseChecklist -Phase $Phase) `
+        -PercentComplete $pct
 }
 
 # =============================================================================
@@ -1073,6 +1456,7 @@ $stallWarningCount = 0
 # (e.g. the "WinRMOnly" fallback) - see below for why this must never just
 # reset to a hard 0.
 $lastKnownPercent  = 0
+$lastKnownStage = $null
 $lastKnownPercentSource = "Estimated"
 # Intelligent "why didn't I see phase X" self-explanation (2026-07-20):
 # tracks the last REAL numeric Phase actually read from a genuine status
@@ -1091,6 +1475,16 @@ $phaseFriendlyNames = @{ 1 = "Pre-Upgrade Assessment"; 2 = "Backup"; 3 = "Downle
 # skipped" (implies the whole reboot cycle completed faster than even one
 # 15-second poll could catch full unreachability).
 $outageObservedSinceLastPhase = $false
+# Evidence freshness is measured by watching when the target's LastUpdated
+# VALUE changes, timed on SERVER A's clock. Subtracting the target's timestamp
+# from Server A's wall clock would report ordinary clock skew between the two
+# machines as staleness, and the two are not even in the same basis (status
+# LastUpdated is target-local; validation timestamps are UTC).
+$lastStatusStamp      = $null
+$lastEvidenceChangeAt = Get-Date
+$lastTrailPct         = -1
+$lastTrailPhase       = $null
+$lastTrailAt          = [datetime]::MinValue
 
 while ($true) {
     $elapsedMin = (New-TimeSpan -Start $startTime -End (Get-Date)).TotalMinutes
@@ -1141,9 +1535,10 @@ while ($true) {
         # like Server B's, deliberately NOT applied to terminal states -
         # Failed/RolledBack correctly showing a real 0% must still get
         # through uncklamped).
-        if ($status.Status -eq "InProgress") {
+        if ($status.Status -eq "InProgress" -and $status.Stage -eq $lastKnownStage) {
             $freshPct = [math]::Max($freshPct, $lastKnownPercent)
         }
+        $lastKnownStage = $status.Stage
         $lastKnownPercent       = $freshPct
         $lastKnownPercentSource = if ($status.PercentSource) { $status.PercentSource } else { "Estimated" }
         $pctSourceForDisplay    = $lastKnownPercentSource
@@ -1158,7 +1553,30 @@ while ($true) {
     # for why that guess has been directly observed to be wrong.
     $lastConfirmedForDisplay = if ($null -ne $lastConfirmedPhaseName) { $lastConfirmedPhaseName } else { "no phase confirmed yet" }
     $displayPhaseName = if ($null -ne $status.Phase) { $status.PhaseName } else { "$lastConfirmedForDisplay (connectivity gap - phase UNCONFIRMED; could be a Safe OS/WinPE reboot in progress, or just a transient interruption while still in this same phase - next real reading will confirm)" }
-    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage
+
+    if ($status.LastUpdated -and $status.LastUpdated -ne $lastStatusStamp) {
+        $lastStatusStamp      = $status.LastUpdated
+        $lastEvidenceChangeAt = Get-Date
+    }
+    $evidenceAgeSec = [int]((Get-Date) - $lastEvidenceChangeAt).TotalSeconds
+
+    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage -Phase $status.Phase -EvidenceAgeSec $evidenceAgeSec
+
+    # The console bar is ephemeral and is never captured by redirection, so
+    # without this the log file ends up with phase transitions but no
+    # percentage/provenance timeline at all - exactly the evidence a change
+    # record needs afterwards. Written on change, and at least once a minute
+    # so a genuinely stalled run still leaves a heartbeat in the file.
+    $trailPhase = if ($null -ne $status.Phase) { "P$([int]$status.Phase) $($status.PhaseName)" } else { "UNCONFIRMED (connectivity gap)" }
+    if ($pct -ne $lastTrailPct -or $trailPhase -ne $lastTrailPhase -or ((Get-Date) - $lastTrailAt).TotalSeconds -ge 60) {
+        $lastTrailPct   = $pct
+        $lastTrailPhase = $trailPhase
+        $lastTrailAt    = Get-Date
+        Add-LogFileLine ("[{0}] [TRACK] {1} | {2} | {3}% ({4}) | Status={5} | Mode={6} | Src={7} | TargetStatusAge={8}s" -f `
+            (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `
+            $(if ($status.Stage) { $status.Stage } else { "Stage -" }), `
+            $trailPhase, $pct, $pctSourceForDisplay, $status.Status, $status.Mode, $status.Source, $evidenceAgeSec)
+    }
 
     # --- Explicit Active-Polling <-> Heartbeat transition logging ------------
     if ($status.Mode -ne $lastMode) {
@@ -1190,9 +1608,9 @@ while ($true) {
                         $downSecs = [math]::Round(((Get-Date) - $disconnectedSince).TotalSeconds)
                         $downForText = if ($downSecs -lt 60) { "$downSecs sec" } else { "$([math]::Round($downSecs/60,1)) min" }
                         $interpretation = if ($downSecs -lt 60) {
-                            " This was brief enough to most likely be a single transient network blip, NOT a genuine reboot (a real Safe OS/WinPE reboot typically renders every channel unreachable for several minutes, not seconds)."
+                            " A brief outage alone cannot distinguish a fast reboot from a network interruption."
                         } else {
-                            " This duration is consistent with a genuine Safe OS/WinPE reboot transition."
+                            " This could be a reboot or a network interruption; target telemetry is needed to confirm the phase."
                         }
                     }
                     Write-Log "WinRM connectivity RESTORED on $TargetComputer after being unreachable for $downForText - resuming Active Polling (reading status via WinRM/CIM/file share).$interpretation" "SUCCESS"
@@ -1226,9 +1644,9 @@ while ($true) {
             $outageClause = if ($outageObservedSinceLastPhase) {
                 "A connectivity outage WAS observed in between (see the Offline/Heartbeat log lines above), consistent with the reboot(s) these phase(s) require."
             } else {
-                "No connectivity outage was observed at all in between - this means the ENTIRE reboot cycle for these phase(s) completed faster than even a single $PollIntervalSeconds-second poll could catch full unreachability (possible on a fast VM/host), not that anything was missed due to an error."
+                "No connectivity outage was observed between polls. Polling snapshots alone cannot establish the timing or cause of the unobserved transitions."
             }
-            Write-Log "NOTE: $($skippedNames -join ' and ') did not get an individual reading on this monitor between the last confirmed status and this one. This is EXPECTED, not an error - Safe OS runs entirely inside WinPE with zero network connectivity (no WinRM/SMB/DCOM to poll), and First Boot can finish faster than this script's poll interval on a fast upgrade. $outageClause $TargetComputer's own OSUpgradeProgress.log on the target has the full, gap-free timeline if you need exact timing for either phase." "INFO"
+            Write-Log "NOTE: $($skippedNames -join ' and ') did not get an individual reading on this monitor between the last confirmed status and this one. Safe OS may provide no remote telemetry, and phases can finish between polls. $outageClause Review $TargetComputer's OSUpgradeProgress.log and Windows Setup logs for the available transition evidence." "INFO"
         }
         # Reset unconditionally on every real reading (not just when a skip
         # fires) - otherwise a stale "outage happened" flag from an earlier,
@@ -1267,7 +1685,7 @@ while ($true) {
             # of staying silent (silence here would look identical to
             # "nothing happened, still polling normally", when actually a
             # real gap+reconnect cycle just occurred and is worth surfacing).
-            Write-Log "$(if ($status.Stage) { "[$($status.Stage)] " })$TargetComputer reconnected and confirms it is STILL in '$($status.PhaseName)' - the connectivity gap did NOT correspond to a confirmed phase change (whatever caused it - a fast internal Setup network-stack operation, a transient VM/hypervisor blip, etc. - the machine never actually left this phase)." "INFO"
+            Write-Log "$(if ($status.Stage) { "[$($status.Stage)] " })$TargetComputer reconnected and reports '$($status.PhaseName)' again. No phase change was observed; this does not establish what occurred while telemetry was unavailable." "INFO"
         } elseif ($status.Status -eq "InProgress") {
             # Escalating, NON-FATAL stall notice - fires at 1x, 2x, 3x... the
             # threshold while still sitting in the SAME phase. Purely
@@ -1286,8 +1704,8 @@ while ($true) {
     }
 
     # --- Failure / rollback: stop monitoring immediately -----------------
-    if ($status.Status -eq "Failed") {
-        Write-Log "Upgrade reported Status=Failed. Notes: $($status.Notes)" "ERROR"
+    if ($status.Status -in @("Failed", "RolledBack")) {
+        Write-Log "Upgrade reported Status=$($status.Status). Notes: $($status.Notes)" "ERROR"
         $finalOutcome = "Failed"
         break
     }
@@ -1300,77 +1718,21 @@ while ($true) {
     # confirming completion - a Heartbeat-only ping is not sufficient proof
     # the server has finished booting into a fully usable state.
     if ($status.Status -in @("Completed","CompletedWithWarnings") -and $status.Mode -eq "ActivePolling") {
-        $buildConfirmed = $true
+        $buildConfirmed = $false
         if ($targetBuildKnown) {
             try {
-                # NOTE: Get-CimInstance throws "A parameter cannot be found
-                # that matches parameter name 'Credential'" if -Credential is
-                # passed but resolves to $null (i.e. whenever this script was
-                # run without -Credential, using the caller's own current
-                # session/integrated auth) - unlike most other -Credential
-                # parameters across PowerShell, CIM cmdlets do NOT silently
-                # accept a null credential. Every other CIM/WinRM call in
-                # this script already guards against this via conditional
-                # splatting - this one didn't, which is exactly why the
-                # build re-confirmation kept failing (and retrying, per the
-                # bounded-retry fix below) on every run made without
-                # -Credential. Fixed by splatting conditionally like the rest.
-                # This call uses the WSMan transport, so it must honour the
-                # same HTTP/HTTPS resolution as every other WinRM call -
-                # -ComputerName alone would always target 5985.
-                $cimCheckParams  = @{ ClassName = "Win32_OperatingSystem"; ErrorAction = "Stop" }
-                $cimCheckSession = $null
-                if ($script:WinRMTransport -in @("Https","HttpsSkipCert")) {
-                    $cimOptArgs = @{ UseSsl = $true }
-                    if ($script:WinRMTransport -eq "HttpsSkipCert") {
-                        $cimOptArgs["SkipCACheck"]         = $true
-                        $cimOptArgs["SkipCNCheck"]         = $true
-                        $cimOptArgs["SkipRevocationCheck"] = $true
-                    }
-                    $cimSessParams = @{
-                        ComputerName  = $TargetComputer
-                        Port          = 5986
-                        SessionOption = (New-CimSessionOption @cimOptArgs)
-                        ErrorAction   = "Stop"
-                    }
-                    if ($Credential) { $cimSessParams["Credential"] = $Credential }
-                    $cimCheckSession = New-CimSession @cimSessParams
-                    $cimCheckParams["CimSession"] = $cimCheckSession
-                } else {
-                    $cimCheckParams["ComputerName"] = $TargetComputer
-                    if ($Credential) { $cimCheckParams["Credential"] = $Credential }
-                }
-                try {
-                    $osCheck = Get-CimInstance @cimCheckParams
-                } finally {
-                    if ($cimCheckSession) { Remove-CimSession -CimSession $cimCheckSession -ErrorAction SilentlyContinue }
-                }
+                $osCheck = Get-RemoteOperatingSystem
                 $buildConfirmed = ($osCheck.BuildNumber -eq $targetBuildKnown)
                 if (-not $buildConfirmed) {
                     Write-Log "Status=$($status.Status) but live build ($($osCheck.BuildNumber)) does not yet match expected target build ($targetBuildKnown) - continuing to monitor." "WARN"
                 }
             } catch {
-                # WinRM/CIM not reachable yet even though Test-WSMan just
-                # succeeded (race during service startup) - treat as
-                # not-yet-confirmed and keep polling rather than failing.
-                # This used to fail SILENTLY (no log line), which made the
-                # console look permanently "stuck" at 100% with no visible
-                # explanation whenever CIM kept failing (e.g. a genuine
-                # DCOM/WMI firewall or double-hop issue distinct from plain
-                # WinRM). Now logged, and bounded: after a few minutes of
-                # failing this independent re-check, fall back to trusting
-                # Server B's own already-build-verified status (
-                # Update-UpgradeStatus.ps1 only ever reaches Phase 7 after
-                # confirming currentBuild -eq targetBuild locally) rather
-                # than looping forever.
                 $buildConfirmed = $false
                 $buildConfirmFailCount++
                 Write-Log "Could not independently re-confirm live build via CIM (attempt $buildConfirmFailCount, non-fatal, will retry): $_" "WARN"
-                if ($buildConfirmFailCount -ge 8) {
-                    Write-Log "CIM build re-confirmation failed $buildConfirmFailCount times ($([math]::Round($buildConfirmFailCount * $PollIntervalSeconds / 60,1)) min) - accepting $TargetComputer's own already-verified Status=$($status.Status) without further independent re-check." "WARN"
-                    $buildConfirmed = $true
-                }
             }
+        } else {
+            Write-Log "Completion reported without an expected target build. Cannot confirm success; continuing to monitor." "WARN"
         }
         if ($buildConfirmed) {
             $finalOutcome = $status.Status
@@ -1384,7 +1746,7 @@ while ($true) {
     $sleepSecs = if ($status.Mode -in @("Heartbeat","Offline")) { $FastPollIntervalSeconds } else { $PollIntervalSeconds }
     Start-Sleep -Seconds $sleepSecs
 }
-Write-Progress -Activity "Monitoring OS upgrade on $TargetComputer" -Completed
+Write-Progress -Id 1 -Activity "OS upgrade on $TargetComputer" -Completed
 $totalMinutes = [math]::Round((New-TimeSpan -Start $startTime -End (Get-Date)).TotalMinutes, 1)
 
 # Pull the extra summary fields off the LAST status snapshot read in the loop

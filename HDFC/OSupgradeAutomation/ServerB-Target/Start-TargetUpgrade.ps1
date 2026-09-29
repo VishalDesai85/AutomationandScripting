@@ -65,6 +65,18 @@
     switch to downgrade that to a warning-only (proceed anyway) - intended
     strictly for lab/non-production validation runs, never production.
 
+.PARAMETER SkipDismScanHealthLab
+    LAB/TEST-ONLY PERFORMANCE OVERRIDE. Skip the read-only
+    `Dism /Online /Cleanup-Image /ScanHealth` pre-check and record that check
+    as WARN. This leaves component-store health unverified and must never be
+    used for production acceptance or rollout.
+
+.PARAMETER SkipSfcScanNowLab
+    LAB/TEST-ONLY PERFORMANCE OVERRIDE. Skip `sfc /scannow` and its
+    supplementary CBS.log analysis, recording that check as WARN. This leaves
+    protected Windows system-file integrity unverified and must never be used
+    for production acceptance or rollout.
+
 .PARAMETER SkipSystemStateBackup
     Skip backup task 8 of 8 (the wbadmin system state backup). That task is
     by far the slowest and largest part of the backup stage, so skipping it
@@ -87,6 +99,10 @@
     immediately on its own schedule. Default: off (Setup manages its own
     reboots end-to-end, which is the simpler/most common pattern).
 
+.PARAMETER PrecheckOnly
+    Run pre-checks only. Do not perform state backup, register scheduled
+    tasks, or launch setup.exe. Useful for fast assessment verification.
+
 .EXAMPLE
     Local/manual test run on Server B:
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -IsoFolder "D:\ISO"
@@ -96,8 +112,8 @@
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -SkipPatchCheckLab
 
 .EXAMPLE
-    Repeat lab run, skipping the slow system state backup:
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -SkipPatchCheckLab -SkipSystemStateBackup
+    Faster disposable-lab run, skipping DISM, SFC, and system state backup:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Start-TargetUpgrade.ps1" -SkipDismScanHealthLab -SkipSfcScanNowLab -SkipSystemStateBackup
 #>
 
 [CmdletBinding()]
@@ -109,10 +125,13 @@ param(
     [int]   $RetentionDays      = 14,
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
+    [switch]$SkipDismScanHealthLab,
+    [switch]$SkipSfcScanNowLab,
     [switch]$SkipSystemStateBackup,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
-    [int]   $MaxPatchAgeDays    = 60
+    [int]   $MaxPatchAgeDays    = 60,
+    [switch]$PrecheckOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -161,165 +180,46 @@ function Write-Log {
         "PASS"  { Write-Host $line -ForegroundColor Green }
         default { Write-Host $line }
     }
-    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
-}
-
-function Set-UpgradeRegistryValue {
-    param([string]$Name, $Value, [string]$Type = "String")
-    if (-not (Test-Path $script:RegRoot)) { New-Item -Path $script:RegRoot -Force | Out-Null }
-    New-ItemProperty -Path $script:RegRoot -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
-}
-
-function Get-UpgradeRegistryValue {
-    <#
-    Read-side counterpart to Set-UpgradeRegistryValue - added 2026-07-20
-    alongside Set-Phase's monotonic-percent clamp (parity with
-    Update-UpgradeStatus.ps1's own Set-Phase, which already had both this
-    helper and the clamp). This script never previously needed to READ its
-    own registry values back, only write them - the clamp/display-fallback
-    logic in Set-Phase below is what introduced that need.
-    #>
-    param([string]$Name, $Default = $null)
-    if (Test-Path $script:RegRoot) {
-        $v = (Get-ItemProperty -Path $script:RegRoot -Name $Name -ErrorAction SilentlyContinue).$Name
-        if ($null -ne $v) { return $v }
-    }
-    return $Default
-}
-
-function Write-StatusJson {
-    <#
-    Writes the full status object to $script:StatusJson (D:\upgrade_status.json
-    by default). This is the primary channel Server A reads directly (over the
-    admin share) when WinRM is unavailable during Downlevel/SafeOS transitions.
-    Wrapped defensively - a transient file lock must never abort the upgrade.
-    #>
-    param([hashtable]$Extra = @{})
+    # PERF (2026-09-26): was Add-Content, which routes through PowerShell's
+    # whole provider stack (path resolution, encoding negotiation, open,
+    # write, close) on EVERY call - and this script calls Write-Log ~170
+    # times per run, several of them inside tight pre-check/backup loops.
+    # [System.IO.File]::AppendAllText does the same open-append-close in one
+    # native call, roughly an order of magnitude cheaper, with the SAME
+    # durability (flushed and closed before returning) and the SAME tiny lock
+    # window - deliberately NOT a long-lived StreamWriter, which would hold
+    # the log open for the entire run and block Remove-UpgradeArtifacts.ps1
+    # from deleting the Logs folder.
+    # Encoding::UTF8 matches Add-Content -Encoding UTF8 exactly: the BOM is
+    # emitted only when the file is created, not on every append.
+    # WRAPPED (2026-09-26): a transient log-write failure (AV scanner holding
+    # the file, disk momentarily full) used to be a TERMINATING error under
+    # $ErrorActionPreference='Stop' and could abort an in-flight OS upgrade.
+    # Losing a log line is never worth that; the console output above still
+    # reaches Server A's live stream either way.
     try {
-        $obj = [ordered]@{
-            ComputerName    = $env:COMPUTERNAME
-            Phase           = (Get-ItemProperty $script:RegRoot -Name Phase -ErrorAction SilentlyContinue).Phase
-            PhaseName       = (Get-ItemProperty $script:RegRoot -Name PhaseName -ErrorAction SilentlyContinue).PhaseName
-            Status          = (Get-ItemProperty $script:RegRoot -Name Status -ErrorAction SilentlyContinue).Status
-            PercentComplete = (Get-ItemProperty $script:RegRoot -Name PercentComplete -ErrorAction SilentlyContinue).PercentComplete
-            PercentSource   = (Get-ItemProperty $script:RegRoot -Name PercentSource -ErrorAction SilentlyContinue).PercentSource
-            SourceBuild     = (Get-ItemProperty $script:RegRoot -Name SourceBuild -ErrorAction SilentlyContinue).SourceBuild
-            TargetBuild     = (Get-ItemProperty $script:RegRoot -Name TargetBuild -ErrorAction SilentlyContinue).TargetBuild
-            TargetOSCaption = (Get-ItemProperty $script:RegRoot -Name TargetOSCaption -ErrorAction SilentlyContinue).TargetOSCaption
-            Stage           = (Get-ItemProperty $script:RegRoot -Name Stage -ErrorAction SilentlyContinue).Stage
-            StartTime       = (Get-ItemProperty $script:RegRoot -Name StartTime -ErrorAction SilentlyContinue).StartTime
-            LastUpdated     = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            Notes           = (Get-ItemProperty $script:RegRoot -Name Notes -ErrorAction SilentlyContinue).Notes
-        }
-        foreach ($k in $Extra.Keys) { $obj[$k] = $Extra[$k] }
-        $tmp = "$($script:StatusJson).tmp"
-        ($obj | ConvertTo-Json -Depth 4) | Out-File -FilePath $tmp -Encoding UTF8 -Force
-        Move-Item -Path $tmp -Destination $script:StatusJson -Force
+        [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, [System.Text.Encoding]::UTF8)
     } catch {
-        Write-Log "Non-blocking: failed to write status JSON to $script:StatusJson : $_" "WARN"
+        Write-Host "[LOGGING] Could not append to $script:LogFile (continuing): $($_.Exception.Message)" -ForegroundColor DarkYellow
     }
 }
 
-function Set-Phase {
-    <# Single source of truth for phase/status - updates registry AND JSON together. #>
-    param(
-        [int]$Phase, [string]$PhaseName,
-        [string]$Status = "InProgress",
-        [int]$PercentComplete = -1,
-        [string]$Notes = "",
-        # "Measured" = derived from a real, live data source (e.g. regex-parsed
-        # from setupact.log); "Estimated" (default) = a best-effort milestone
-        # marker where no live telemetry source exists (e.g. Safe OS/WinPE, or
-        # a one-shot hook like OOBE). Start-TargetUpgrade.ps1 never parses live
-        # setup logs itself, so every call here is legitimately "Estimated".
-        [ValidateSet("Measured","Estimated")][string]$PercentSource = "Estimated"
-    )
-    # Stage grouping for customer-facing display: Stage 1/2 are OUR OWN
-    # script's work (prechecks/backup); Stage 3 is Windows Setup's own
-    # engine actually running - kept identical to the same mapping in
-    # Update-UpgradeStatus.ps1 so the label never flips inconsistently
-    # between the two scripts writing to the same registry key.
-    $stageLabel = switch ($Phase) {
-        1       { "Stage 1/3: Pre-Upgrade Assessment" }
-        2       { "Stage 2/3: Backup" }
-        99      { "Stage 3/3: Windows Setup Execution (Rolled Back)" }
-        default { "Stage 3/3: Windows Setup Execution" }
-    }
-    Set-UpgradeRegistryValue -Name "Stage"        -Value $stageLabel
-    Set-UpgradeRegistryValue -Name "Phase"       -Value $Phase -Type DWord
-    Set-UpgradeRegistryValue -Name "PhaseName"   -Value $PhaseName
-    Set-UpgradeRegistryValue -Name "Status"      -Value $Status
-    Set-UpgradeRegistryValue -Name "LastUpdated" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-    if ($PercentComplete -ge 0) {
-        # Parity fix (2026-07-20): Update-UpgradeStatus.ps1's Set-Phase has
-        # always clamped percent to never visibly regress while InProgress;
-        # this sibling copy of the SAME function (duplicated because the two
-        # scripts run as separate processes) was missing that clamp - which
-        # is exactly why a real run showed "Percent=0" logged here moments
-        # after Phase 2's backup step had already reached 15%, looking like
-        # progress reset. Same clamp, same "not applied to terminal Failed
-        # states" exception, now applied here too.
-        # SCOPED TO STAGE, NOT GLOBAL (2026-07-24): each Stage now has its
-        # OWN independent 0-100 percentage (Stage 1/2 = task-count-based,
-        # Stage 3 = setup.exe telemetry) - clamping against whatever the
-        # PREVIOUS stage ended at would wrongly force a new stage's fresh,
-        # genuinely-lower starting percent (e.g. Stage 3 Downlevel's real
-        # first Measured reading of 15%) up to the prior stage's ending
-        # value (e.g. Stage 2 finishing at 100%). Only clamp when the
-        # stored percent came from THIS SAME stage - i.e. never carry a
-        # high-water mark across a stage boundary, only within one.
-        if ($Status -eq "InProgress" -and (Get-UpgradeRegistryValue -Name "PercentStage") -eq $stageLabel) {
-            $priorPercent = [int](Get-UpgradeRegistryValue -Name "PercentComplete" -Default 0)
-            $PercentComplete = [math]::Max($PercentComplete, $priorPercent)
-        }
-        Set-UpgradeRegistryValue -Name "PercentComplete" -Value $PercentComplete -Type DWord
-        Set-UpgradeRegistryValue -Name "PercentSource"   -Value $PercentSource
-        Set-UpgradeRegistryValue -Name "PercentStage"    -Value $stageLabel
-    } elseif ((Get-UpgradeRegistryValue -Name "PercentStage") -and (Get-UpgradeRegistryValue -Name "PercentStage") -ne $stageLabel) {
-        # BUG FIX (2026-08-26) - parity with Update-UpgradeStatus.ps1's
-        # Set-Phase: clear the previous stage's stale PercentComplete/
-        # PercentSource when entering a new stage with no fresh measurement
-        # yet, so Write-StatusJson (read by the orchestrator) never surfaces
-        # a prior stage's leftover percentage under the new stage's label.
-        Remove-ItemProperty -Path $script:RegRoot -Name "PercentComplete" -ErrorAction SilentlyContinue
-        Remove-ItemProperty -Path $script:RegRoot -Name "PercentSource" -ErrorAction SilentlyContinue
-        Set-UpgradeRegistryValue -Name "PercentStage" -Value $stageLabel
-    }
-    if ($Notes) { Set-UpgradeRegistryValue -Name "Notes" -Value $Notes }
-    # BUG FIX (2026-07-20): this fallback used to default to a hardcoded
-    # 0/"Estimated" when nothing was stored yet - which, on Phase 1's very
-    # first call ever (fresh registry, nothing to carry forward),
-    # reconstructed the exact same "Percent=0 (Estimated)" text the whole
-    # point of omitting -PercentComplete was meant to eliminate. Now
-    # distinguishes "no real value EVER existed" ($null - show nothing)
-    # from "a real value exists to carry forward" (show it).
-    $storedPct    = Get-UpgradeRegistryValue -Name "PercentComplete"
-    $storedSource = Get-UpgradeRegistryValue -Name "PercentSource"
-    $storedStage  = Get-UpgradeRegistryValue -Name "PercentStage"
-    if ($PercentComplete -ge 0) {
-        $displayPct    = $PercentComplete
-        $displaySource = $PercentSource
-    } elseif ($null -ne $storedPct -and $storedStage -eq $stageLabel) {
-        # Only carry forward a stored value that belongs to THIS SAME stage
-        # (2026-07-24) - otherwise a fresh stage's very first no-percent
-        # call (e.g. Phase 2's kickoff) would momentarily flash the PRIOR
-        # stage's ending percent (e.g. Stage 1 finishing at 100%) before its
-        # own first real task-based percent overwrites it a moment later.
-        $displayPct    = $storedPct
-        $displaySource = if ($storedSource) { $storedSource } else { "Estimated" }
-    } else {
-        $displayPct = $null
-    }
-    $pctClause = if ($null -ne $displayPct) { " Percent=$displayPct ($displaySource)" } else { "" }
-    # Dropped the bare "Phase=$Phase" number from this text (2026-07-20,
-    # customer feedback: it visually looked redundant/confusable next to
-    # "Stage 3/3" - two different numbering schemes that don't actually
-    # correlate 1:1, since Phase 3-7 and 99 ALL map to the same Stage 3/3).
-    # The raw Phase number is still fully preserved in the registry/JSON for
-    # technical/ServiceNow use - just no longer restated in this text.
-    Write-Log "[$stageLabel] $PhaseName - Status=$Status$pctClause $Notes"
-    Write-StatusJson
+# --- Shared status helpers ----------------------------------------------------
+# Set-UpgradeRegistryValue / Get-UpgradeRegistryValue / Write-StatusJson /
+# Set-Phase used to be copy-pasted into BOTH this script and
+# Update-UpgradeStatus.ps1, which had already caused two real divergence bugs
+# (the per-stage percent clamp landing in only one copy; the two Write-StatusJson
+# field lists drifting apart). They now live in ONE file that both dot-source.
+# MUST come after Write-Log above (Set-Phase calls it) and after the
+# $script:RegRoot / $script:StatusJson assignments in Section 0 (the shared
+# functions read both).
+# Fail-fast by design: if the companion is missing we stop HERE, before a
+# single change has been made to this server - never half-way through.
+$script:SharedHelpers = Join-Path $PSScriptRoot "OSUpgradeShared.ps1"
+if (-not (Test-Path $script:SharedHelpers)) {
+    throw "Required companion 'OSUpgradeShared.ps1' was not found next to this script ($PSScriptRoot). It carries the shared status/phase tracking functions - staging is incomplete. Re-run the orchestrator (it stages this file automatically), or copy it manually, then retry. Nothing has been changed on this server."
 }
+. $script:SharedHelpers
 
 function Enable-BackupPrivilege {
     <#
@@ -392,6 +292,24 @@ Write-Log "===================================================================="
 Write-Log "Start-TargetUpgrade.ps1 invoked on $env:COMPUTERNAME"
 Write-Log "===================================================================="
 
+# --- Mutex Protection ---------------------------------------------------------
+# Multiple concurrent invocations on Server B (e.g. rapid orchestrator triggers
+# or overlapping automated runs) must not stomp over staging, registry state,
+# or setup.exe execution.
+$script:StarterMutex = [System.Threading.Mutex]::new($false, "Global\OSUpgradeAutomation.StartTargetUpgrade")
+$script:OwnsStarterMutex = $false
+try {
+    try {
+        $script:OwnsStarterMutex = $script:StarterMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        $script:OwnsStarterMutex = $true
+    }
+    if (-not $script:OwnsStarterMutex) {
+        Write-Log "Another instance of Start-TargetUpgrade.ps1 is already running on $env:COMPUTERNAME. Terminating this execution." "ERROR"
+        throw "Another instance of Start-TargetUpgrade.ps1 is already active on this host."
+    }
+
+    try {
 # =============================================================================
 # SECTION 1b - DETECT & CLEAN UP A STALE PRIOR ATTEMPT
 # =============================================================================
@@ -479,6 +397,14 @@ $preCheckLog  = @()   # human-readable PASS/FAIL/WARN lines for the dedicated pr
 # check), so a simple running counter incremented on every
 # Add-PreCheckResult call accurately reflects "how many of the total checks
 # have completed".
+# check", "VMware Tools up-to-date (VMware VM detected)") and the ISO edition
+# check interpolates the detected edition into its name - so counting DISTINCT
+# NAME STRINGS gives 16 and is the wrong way to verify this number. What
+# matters is that each of the 14 checks reports exactly ONCE per run: every
+# check has mutually exclusive PASS/WARN/FAIL branches, each ending in a
+# single Add-PreCheckResult call, so a plain running counter is accurate.
+# Section 2c asserts the final count against this constant at runtime rather
+# than relying on this comment staying true.
 $totalPrecheckSteps = 14
 $script:precheckStepsDone = 0
 
@@ -572,7 +498,7 @@ try {
 # the brief 2026-07-26 WARN-only experiment: genuine component-store
 # corruption is a real, documented root cause of in-place-upgrade failures,
 # unlike e.g. orphaned profiles - so it stops the run just like that check
-# does). All 13 pre-checks still run to completion regardless (this check
+# does). Every pre-check still runs to completion regardless (this check
 # does NOT `throw` here - it only appends to $hardFailures, same as every
 # other check - see Section 2c's single aggregated throw at the very end),
 # so the admin sees every failing item in one shot and can resolve them all
@@ -580,19 +506,23 @@ try {
 # (DISM couldn't even run, or its output couldn't be parsed) stay WARN -
 # uncertainty about whether a problem exists is not the same as a confirmed
 # finding.
-try {
-    Write-Log "Running 'Dism /Online /Cleanup-Image /ScanHealth' (read-only scan, may take a few minutes)..."
-    $dismOutput = & Dism.exe /Online /Cleanup-Image /ScanHealth 2>&1 | Out-String
-    Add-Content -Path (Join-Path $script:LogDir "DismScanHealth_$($script:RunStamp).log") -Value $dismOutput -Encoding UTF8
-    if ($dismOutput -match "No component store corruption detected") {
-        Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "PASS"
-    } elseif ($dismOutput -match "component store (is repairable|corruption)") {
-        Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "FAIL" -Detail "Corruption detected - BLOCKING. Run 'Dism /Online /Cleanup-Image /RestoreHealth' then SFC /scannow to repair, confirm both come back clean, then re-initiate the upgrade - see DismScanHealth_$($script:RunStamp).log."
-    } else {
-        Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "WARN" -Detail "Could not conclusively parse DISM output - see DismScanHealth_$($script:RunStamp).log. Proceeding, but review manually."
+if ($SkipDismScanHealthLab) {
+    Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "WARN" -Detail "SKIPPED by explicit LAB/TEST override -SkipDismScanHealthLab. Component-store health was NOT validated. This override applies only to DISM; see the separate SFC check result. Do not use this result for production acceptance."
+} else {
+    try {
+        Write-Log "Running 'Dism /Online /Cleanup-Image /ScanHealth' (read-only scan, may take a few minutes)..."
+        $dismOutput = & Dism.exe /Online /Cleanup-Image /ScanHealth 2>&1 | Out-String
+        Add-Content -Path (Join-Path $script:LogDir "DismScanHealth_$($script:RunStamp).log") -Value $dismOutput -Encoding UTF8
+        if ($dismOutput -match "No component store corruption detected") {
+            Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "PASS"
+        } elseif ($dismOutput -match "component store (is repairable|corruption)") {
+            Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "FAIL" -Detail "Corruption detected - BLOCKING. Run 'Dism /Online /Cleanup-Image /RestoreHealth' then SFC /scannow to repair, confirm both come back clean, then re-initiate the upgrade - see DismScanHealth_$($script:RunStamp).log."
+        } else {
+            Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "WARN" -Detail "Could not conclusively parse DISM output - see DismScanHealth_$($script:RunStamp).log. Proceeding, but review manually."
+        }
+    } catch {
+        Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "WARN" -Detail "DISM scan failed to run (non-blocking): $_"
     }
-} catch {
-    Add-PreCheckResult -Name "Component store health (DISM ScanHealth)" -Result "WARN" -Detail "DISM scan failed to run (non-blocking): $_"
 }
 
 # --- 2.5b System file integrity (SFC /scannow) -------------------------------
@@ -612,46 +542,50 @@ try {
 # summary line. Only genuinely INCONCLUSIVE outcomes (SFC couldn't run at
 # all, e.g. another servicing operation in progress, or its output couldn't
 # be parsed) stay WARN.
-try {
-    $cbsLogPath   = Join-Path $env:WINDIR "Logs\CBS\CBS.log"
-    $sfcScanStart = Get-Date
-    Write-Log "Running 'sfc /scannow' (may take several minutes)..."
-    $sfcOutput = & sfc.exe /scannow 2>&1 | Out-String
-    $sfcLogPath = Join-Path $script:LogDir "SfcScanNow_$($script:RunStamp).log"
-    Add-Content -Path $sfcLogPath -Value $sfcOutput -Encoding UTF8
-
-    # Best-effort CBS.log supplementary scan - non-fatal if it fails or the
-    # log is missing/inaccessible; SFC's own summary line is still the
-    # primary signal either way.
-    $cbsErrorCount = 0
+if ($SkipSfcScanNowLab) {
+    Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "SKIPPED by explicit LAB/TEST override -SkipSfcScanNowLab. Protected Windows system-file integrity was NOT validated and CBS.log was not analyzed. Do not use this result for production acceptance."
+} else {
     try {
-        if (Test-Path $cbsLogPath) {
-            Get-Content -Path $cbsLogPath -Tail 20000 -ErrorAction SilentlyContinue | ForEach-Object {
-                if ($_ -match '^(?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})' -and $_ -match '(?i)\[SR\].*(cannot repair|corrupt)') {
-                    $lineTime = $null
-                    if ([datetime]::TryParseExact($Matches.ts, "yyyy-MM-dd HH:mm:ss", $null, [System.Globalization.DateTimeStyles]::None, [ref]$lineTime)) {
-                        if ($lineTime -ge $sfcScanStart) { $cbsErrorCount++ }
+        $cbsLogPath   = Join-Path $env:WINDIR "Logs\CBS\CBS.log"
+        $sfcScanStart = Get-Date
+        Write-Log "Running 'sfc /scannow' (may take several minutes)..."
+        $sfcOutput = & sfc.exe /scannow 2>&1 | Out-String
+        $sfcLogPath = Join-Path $script:LogDir "SfcScanNow_$($script:RunStamp).log"
+        Add-Content -Path $sfcLogPath -Value $sfcOutput -Encoding UTF8
+
+        # Best-effort CBS.log supplementary scan - non-fatal if it fails or the
+        # log is missing/inaccessible; SFC's own summary line is still the
+        # primary signal either way.
+        $cbsErrorCount = 0
+        try {
+            if (Test-Path $cbsLogPath) {
+                Get-Content -Path $cbsLogPath -Tail 20000 -ErrorAction SilentlyContinue | ForEach-Object {
+                    if ($_ -match '^(?<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})' -and $_ -match '(?i)\[SR\].*(cannot repair|corrupt)') {
+                        $lineTime = $null
+                        if ([datetime]::TryParseExact($Matches.ts, "yyyy-MM-dd HH:mm:ss", $null, [System.Globalization.DateTimeStyles]::None, [ref]$lineTime)) {
+                            if ($lineTime -ge $sfcScanStart) { $cbsErrorCount++ }
+                        }
                     }
                 }
             }
+        } catch {
+            Write-Log "Could not analyze CBS.log for supplementary SFC detail (non-blocking): $_" "WARN"
+        }
+
+        if ($sfcOutput -match "did not find any integrity violations") {
+            Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "PASS" -Detail "No integrity violations found."
+        } elseif ($sfcOutput -match "found corrupt files and successfully repaired") {
+            Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "FAIL" -Detail "Corrupt files were found (SFC repaired them automatically, but this confirms the system had integrity problems - CBS.log [SR] entries this run: $cbsErrorCount). BLOCKING - review $sfcLogPath and CBS.log, re-run SFC/DISM to confirm a clean result, then re-initiate the upgrade."
+        } elseif ($sfcOutput -match "unable to fix some of them") {
+            Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "FAIL" -Detail "Corrupt files found that SFC could NOT fully repair (CBS.log [SR] 'cannot repair'-style entries this run: $cbsErrorCount). BLOCKING - review $sfcLogPath and CBS.log, run 'Dism /Online /Cleanup-Image /RestoreHealth' then SFC /scannow again to repair, confirm clean, then re-initiate the upgrade."
+        } elseif ($sfcOutput -match "could not perform the requested operation") {
+            Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "SFC could not run (e.g. another servicing operation in progress, or requires Safe Mode) - proceeding anyway (non-blocking); see $sfcLogPath."
+        } else {
+            Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "Could not conclusively parse SFC output (CBS.log [SR] entries this run: $cbsErrorCount) - see $sfcLogPath. Proceeding, but review manually."
         }
     } catch {
-        Write-Log "Could not analyze CBS.log for supplementary SFC detail (non-blocking): $_" "WARN"
+        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "SFC scan failed to run (non-blocking): $_"
     }
-
-    if ($sfcOutput -match "did not find any integrity violations") {
-        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "PASS" -Detail "No integrity violations found."
-    } elseif ($sfcOutput -match "found corrupt files and successfully repaired") {
-        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "FAIL" -Detail "Corrupt files were found (SFC repaired them automatically, but this confirms the system had integrity problems - CBS.log [SR] entries this run: $cbsErrorCount). BLOCKING - review $sfcLogPath and CBS.log, re-run SFC/DISM to confirm a clean result, then re-initiate the upgrade."
-    } elseif ($sfcOutput -match "unable to fix some of them") {
-        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "FAIL" -Detail "Corrupt files found that SFC could NOT fully repair (CBS.log [SR] 'cannot repair'-style entries this run: $cbsErrorCount). BLOCKING - review $sfcLogPath and CBS.log, run 'Dism /Online /Cleanup-Image /RestoreHealth' then SFC /scannow again to repair, confirm clean, then re-initiate the upgrade."
-    } elseif ($sfcOutput -match "could not perform the requested operation") {
-        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "SFC could not run (e.g. another servicing operation in progress, or requires Safe Mode) - proceeding anyway (non-blocking); see $sfcLogPath."
-    } else {
-        Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "Could not conclusively parse SFC output (CBS.log [SR] entries this run: $cbsErrorCount) - see $sfcLogPath. Proceeding, but review manually."
-    }
-} catch {
-    Add-PreCheckResult -Name "System file integrity (SFC /scannow)" -Result "WARN" -Detail "SFC scan failed to run (non-blocking): $_"
 }
 
 # --- 2.6 Locate ISO / setup.exe + Edition match ------------------------------
@@ -1013,7 +947,14 @@ try {
                 -Detail "RD Session Host role is installed; configured CAL license server(s): $($licServers -join ', '). Requirement: each license server must run an OS version >= $targetDesc AND must already have CALs for $targetDesc installed/activated, or clients will be unable to obtain a valid RDS CAL once the post-upgrade licensing grace period ends. Findings: $($serverFindings -join ' | ') Reference: https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-client-access-license"
         }
     } else {
-        Write-Log "RDS Session Host role not installed - CAL license server check skipped." "INFO"
+        # Must still REPORT (not merely log) that this check ran, exactly like
+        # the VMware Tools check does on a non-VMware host above. Reporting is
+        # what increments $script:precheckStepsDone - so the previous
+        # log-and-move-on left every non-RDS server counting 13 of 14 checks,
+        # and Stage 1 visibly ended at 92% instead of 100% before handing over
+        # to Stage 2. (Caught 2026-09-26 by the step-count self-check added at
+        # the end of Section 2c.)
+        Add-PreCheckResult -Name "RDS Session Host CAL license server check" -Result "PASS" -Detail "RD Session Host role not installed - RDS CAL licensing check not applicable."
     }
 } catch {
     Add-PreCheckResult -Name "RDS Session Host CAL license server check" -Result "WARN" -Detail "Could not evaluate RDS Session Host role: $_"
@@ -1067,363 +1008,28 @@ try {
         Add-PreCheckResult -Name "Orphaned local user profiles" -Result "FAIL" -Detail "$($orphanedProfiles.Count) orphaned profile SID(s) found (registry entry exists but the owning account no longer resolves - typically a deleted user whose local profile was never cleaned up): $summaryText. BLOCKING - clean these up (see the cleanup options printed below) then re-initiate the upgrade."
         Set-UpgradeRegistryValue -Name "OrphanedProfileCount" -Value $orphanedProfiles.Count -Type DWord
 
-        # A ready-to-run cleanup script is GENERATED (never auto-executed) next
-        # to this script in the staging folder, so the admin has a third,
+        # A ready-to-run cleanup script is made available (never auto-executed)
+        # next to this script in the staging folder, so the admin has a third,
         # zero-copy-paste option alongside the printed per-SID commands and the
         # printed bulk script.
+        # CHANGED 2026-09-26: that script used to be GENERATED right here from
+        # a 341-line here-string embedded in this file. It now SHIPS as a real
+        # file (ServerB-Target\Remove-OrphanedProfiles.ps1, staged next to this
+        # one by the orchestrator, exactly like Update-UpgradeStatus.ps1 and
+        # the two .cmd hooks) so it gets syntax highlighting, linting and
+        # PSScriptAnalyzer coverage instead of being opaque text inside a
+        # string. What the admin sees and runs is byte-for-byte the same
+        # script; only where it comes from changed. If the file is missing
+        # (e.g. hand-copied staging that omitted it), Options 1 and 2 below
+        # are unaffected - only this convenience option is skipped, exactly
+        # as it already was whenever the old generation step failed.
         $orphanScriptDir  = if ($PSScriptRoot) { $PSScriptRoot } else { "C:\Temp\OSUpgradeStaging" }
         $orphanScriptPath = Join-Path $orphanScriptDir "Remove-OrphanedProfiles.ps1"
-        $orphanScriptWritten = $false
-        try {
-            if (-not (Test-Path $orphanScriptDir)) { New-Item -ItemType Directory -Path $orphanScriptDir -Force | Out-Null }
-            $orphanCleanupScriptBody = @'
-<#
-.SYNOPSIS
-    Removes orphaned local user profile registry entries so the OS upgrade
-    pre-check "Orphaned local user profiles" can pass.
-
-.DESCRIPTION
-    GENERATED automatically by Start-TargetUpgrade.ps1 when its pre-upgrade
-    assessment found orphaned profiles on this server. It was written to
-    disk but deliberately NOT executed - removing profile data is a human
-    decision, never something a pre-check should do unattended.
-
-    "Orphaned" = a SID under
-    HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList that no
-    longer resolves to any account (local or domain) - typically left behind
-    when a user account was deleted without also removing its local profile
-    via System Properties > Advanced > User Profiles > Delete.
-
-    This script is SELF-DISCOVERING: it re-scans ProfileList at run time and
-    removes WHATEVER is orphaned at that moment, so the same file keeps
-    working unchanged if different/new orphaned accounts appear later. No
-    SIDs are hardcoded.
-
-    Two separate things can be removed, each confirmed independently:
-      1. The ProfileList REGISTRY entries (and their .bak counterparts).
-         This alone is what clears the "Account Unknown" rows from
-         System Properties > Advanced > User Profiles > Settings and lets
-         the upgrade pre-check pass.
-      2. OPTIONALLY, the profile FOLDERS on disk (e.g. C:\Users\sam). This
-         deletes REAL USER DATA and cannot be undone, so it is a second,
-         explicit opt-in - answered separately, defaulting to NO.
-
-.PARAMETER Force
-    Skip the interactive confirmation prompt. Intended for a reviewed,
-    deliberate unattended run - not the default. On its own, -Force still
-    removes ONLY the registry entries.
-
-.PARAMETER IncludeProfileFolder
-    Also delete each orphaned profile's folder on disk. Interactively you
-    are asked about this anyway; pass this switch to answer "yes" up front
-    (required to delete folders during a -Force run, which never prompts).
-
-.EXAMPLE
-    powershell.exe -ExecutionPolicy Bypass -File .\Remove-OrphanedProfiles.ps1
-
-.EXAMPLE
-    powershell.exe -ExecutionPolicy Bypass -File .\Remove-OrphanedProfiles.ps1 -Force
-
-.EXAMPLE
-    Unattended, registry entries AND profile folders:
-    powershell.exe -ExecutionPolicy Bypass -File .\Remove-OrphanedProfiles.ps1 -Force -IncludeProfileFolder
-#>
-[CmdletBinding()]
-param(
-    [switch]$Force,
-    [switch]$IncludeProfileFolder
-)
-
-$ErrorActionPreference = 'Stop'
-
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) {
-    throw "This script must be run from an ELEVATED PowerShell session (Run as Administrator)."
-}
-
-function Confirm-YesNo {
-    param([string]$Prompt)
-    $answer = Read-Host $Prompt
-    return ("$answer".Trim() -match '^(y|yes)$')
-}
-
-function Get-FolderSizeMB {
-    param([string]$Path)
-    try {
-        $bytes = (Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
-                  Measure-Object -Property Length -Sum).Sum
-        if (-not $bytes) { return 0 }
-        return [math]::Round($bytes / 1MB, 1)
-    } catch { return $null }
-}
-
-function Test-SafeProfileFolder {
-    <#
-    Guard rail for the folder-deletion path. ProfileImagePath is attacker-
-    irrelevant here but IS operator-supplied data that has been wrong before
-    (blank, truncated, or pointing somewhere shared), and a bad value passed
-    to Remove-Item -Recurse -Force is unrecoverable - so refuse anything that
-    is not clearly an individual profile directory.
-    #>
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
-
-    $full = (Resolve-Path -LiteralPath $Path).ProviderPath.TrimEnd('\')
-
-    # Never a drive root (e.g. "C:\").
-    if ($full -match '^[A-Za-z]:$') { return $false }
-
-    $blocked = @(
-        $env:SystemRoot,
-        $env:ProgramData,
-        ${env:ProgramFiles},
-        ${env:ProgramFiles(x86)},
-        (Join-Path $env:SystemDrive 'Users'),
-        $env:USERPROFILE,
-        (Join-Path (Join-Path $env:SystemDrive 'Users') 'Public'),
-        (Join-Path (Join-Path $env:SystemDrive 'Users') 'Default'),
-        (Join-Path (Join-Path $env:SystemDrive 'Users') 'Default User'),
-        (Join-Path (Join-Path $env:SystemDrive 'Users') 'All Users')
-    ) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
-
-    foreach ($b in $blocked) {
-        # Equal to, or an ANCESTOR of, anything protected.
-        if ($full -ieq $b) { return $false }
-        if ($b.StartsWith($full + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
-    }
-    return $true
-}
-
-function Invoke-NativeQuiet {
-    <#
-    Runs a console tool, discarding its output and returning the exit code.
-    The $ErrorActionPreference dance is essential, not cosmetic: this script
-    runs with 'Stop', under which ANY native command writing to stderr raises
-    a terminating NativeCommandError. takeown/icacls routinely write to
-    stderr for individual files while still succeeding overall, so without
-    this the whole cleanup would abort partway through.
-    #>
-    param([string]$FilePath, [string[]]$ArgumentList)
-    $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        & $FilePath @ArgumentList 2>&1 | Out-Null
-        return $LASTEXITCODE
-    } catch {
-        return -1
-    } finally {
-        $ErrorActionPreference = $prev
-    }
-}
-
-function Remove-ProfileFolder {
-    <#
-    Deletes one orphaned profile folder in escalating stages, doing the least
-    invasive thing that works. Only ever called on a path that already passed
-    Test-SafeProfileFolder.
-
-    Stage 1 - Remove-Item. Fails on the legacy compatibility JUNCTIONS inside
-      AppData ('Application Data', 'Local Settings', ...) because it walks
-      INTO them and hits their by-design deny ACE:
-      "Access to the path ...\AppData\Local\Application Data is denied".
-    Stage 2 - cmd's 'rd /s /q', which deletes a reparse point as a LINK
-      instead of following it, and removes read-only files without asking.
-      This alone fixes the junction case - no permission changes needed.
-    Stage 3 - only if still present: take ownership and reset the ACLs, then
-      'rd' again. 'icacls /reset' matters here because a profile owned by a
-      deleted SID can carry explicit DENY entries, and /grant cannot override
-      a deny - it has to be cleared.
-
-    Escalation is deliberately LAST: 'takeown /R' and 'icacls /T' traverse
-    directory junctions, so on a profile containing a junction that points
-    outside itself they could rewrite ownership/permissions on unrelated
-    data. Stage 2 removes those junctions first, so by the time stage 3 runs
-    there is normally nothing left to traverse out of.
-    #>
-    param([string]$Path)
-
-    $firstError = $null
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-    } catch {
-        $firstError = $_.Exception.Message
-    }
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Success = $true; Method = 'direct delete'; Error = $null }
-    }
-
-    Invoke-NativeQuiet -FilePath 'cmd.exe' -ArgumentList @('/c', 'rd', '/s', '/q', $Path) | Out-Null
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Success = $true; Method = 'rd /s /q (junction-safe)'; Error = $null }
-    }
-
-    Write-Host ("   Delete blocked ({0})" -f $firstError) -ForegroundColor DarkYellow
-    Write-Host ("   Taking ownership and resetting permissions on {0} ..." -f $Path) -ForegroundColor Yellow
-
-    # *S-1-5-32-544 is the built-in Administrators SID - used instead of the
-    # group NAME so this still works on non-English Windows.
-    Invoke-NativeQuiet -FilePath 'takeown.exe' -ArgumentList @('/F', $Path, '/R', '/A', '/D', 'Y')                           | Out-Null
-    Invoke-NativeQuiet -FilePath 'icacls.exe'  -ArgumentList @($Path, '/reset', '/T', '/C', '/Q')                            | Out-Null
-    Invoke-NativeQuiet -FilePath 'icacls.exe'  -ArgumentList @($Path, '/grant', '*S-1-5-32-544:(OI)(CI)F', '/T', '/C', '/Q') | Out-Null
-    Invoke-NativeQuiet -FilePath 'attrib.exe'  -ArgumentList @('-R', '-S', '-H', "$Path\*", '/S', '/D')                      | Out-Null
-
-    Invoke-NativeQuiet -FilePath 'cmd.exe' -ArgumentList @('/c', 'rd', '/s', '/q', $Path) | Out-Null
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Success = $true; Method = 'takeown + icacls reset + rd'; Error = $null }
-    }
-
-    try {
-        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
-    } catch {
-        $firstError = $_.Exception.Message
-    }
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Success = $true; Method = 'takeown + icacls reset + Remove-Item'; Error = $null }
-    }
-
-    return [pscustomobject]@{ Success = $false; Method = 'all methods failed'; Error = $firstError }
-}
-
-$profileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-
-# Matches the detection logic in Start-TargetUpgrade.ps1 exactly: only real
-# user-account SIDs (S-1-5-21-*), so built-in/service SIDs are never touched.
-# @(...) is required: with exactly ONE orphan the pipeline returns a bare
-# PSCustomObject whose .Count is $null, which blanked every "N of M" message
-# and made the final "$removed -eq $orphans.Count" success test fail.
-$orphans = @(Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue |
-    Where-Object { $_.PSChildName -match '^S-1-5-21-' } |
-    ForEach-Object {
-        $sid = $_.PSChildName
-        $resolved = $true
-        try {
-            $null = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount])
-        } catch { $resolved = $false }
-        if (-not $resolved) {
-            [pscustomobject]@{
-                Sid         = $sid
-                PSPath      = $_.PSPath
-                ProfilePath = (Get-ItemProperty -Path $_.PSPath -Name ProfileImagePath -ErrorAction SilentlyContinue).ProfileImagePath
-            }
-        }
-    })
-
-if (-not $orphans) {
-    Write-Host "No orphaned profile SIDs found under ProfileList - nothing to do." -ForegroundColor Green
-    Write-Host "The 'Orphaned local user profiles' pre-check will pass; re-run the OS upgrade." -ForegroundColor Cyan
-    return
-}
-
-Write-Host ""
-Write-Host "The following $($orphans.Count) orphaned ProfileList registry entr(ies) will be REMOVED:" -ForegroundColor Yellow
-foreach ($o in $orphans) {
-    $shown = if ($o.ProfilePath) { $o.ProfilePath } else { '(unknown)' }
-    $sizeText = ''
-    if ($o.ProfilePath -and (Test-Path -LiteralPath $o.ProfilePath -PathType Container)) {
-        $mb = Get-FolderSizeMB -Path $o.ProfilePath
-        if ($null -ne $mb) { $sizeText = "  [$mb MB on disk]" }
-    } elseif ($o.ProfilePath) {
-        $sizeText = '  [folder no longer present]'
-    }
-    Write-Host ("   {0}    profile folder: {1}{2}" -f $o.Sid, $shown, $sizeText)
-}
-Write-Host ""
-Write-Host "Removing the registry entries clears these from System Properties > Advanced >" -ForegroundColor Yellow
-Write-Host "User Profiles (where they show as 'Account Unknown') and lets the upgrade" -ForegroundColor Yellow
-Write-Host "pre-check pass. The profile FOLDERS above are a separate question, asked next." -ForegroundColor Yellow
-Write-Host ""
-
-$deleteFolders = [bool]$IncludeProfileFolder
-
-if (-not $Force) {
-    if (-not (Confirm-YesNo "Proceed with removing the registry entries? Type Y or YES to confirm, anything else to abort")) {
-        Write-Host "Aborted - nothing was changed." -ForegroundColor Yellow
-        return
-    }
-    if (-not $deleteFolders) {
-        Write-Host ""
-        Write-Host "Also delete the profile FOLDERS listed above from disk?" -ForegroundColor Red
-        Write-Host "This permanently deletes REAL USER DATA (documents, desktop, profile" -ForegroundColor Red
-        Write-Host "settings) and CANNOT BE UNDONE. Answer N to keep the folders - the" -ForegroundColor Red
-        Write-Host "upgrade pre-check passes either way." -ForegroundColor Red
-        $deleteFolders = Confirm-YesNo "Delete the profile folders too? Type Y or YES to confirm, anything else to keep them"
-    }
-}
-
-if ($deleteFolders) {
-    Write-Host ""
-    Write-Host "Profile folders WILL be deleted along with the registry entries." -ForegroundColor Red
-} else {
-    Write-Host ""
-    Write-Host "Profile folders will be KEPT on disk (registry entries only)." -ForegroundColor Cyan
-}
-Write-Host ""
-
-$removed       = 0
-$foldersOk     = 0
-$foldersFailed = @()
-
-foreach ($o in $orphans) {
-    $shown = if ($o.ProfilePath) { $o.ProfilePath } else { '(unknown)' }
-
-    # Folder first: if it fails, the registry entry is still removed below so
-    # the upgrade is unblocked either way, and the leftover path is reported.
-    if ($deleteFolders -and $o.ProfilePath) {
-        if (Test-SafeProfileFolder -Path $o.ProfilePath) {
-            $fr = Remove-ProfileFolder -Path $o.ProfilePath
-            if ($fr.Success) {
-                Write-Host ("Deleted profile folder: {0}  [{1}]" -f $o.ProfilePath, $fr.Method) -ForegroundColor Green
-                $foldersOk++
-            } else {
-                Write-Host ("FAILED to delete profile folder {0} even after taking ownership: {1}" -f $o.ProfilePath, $fr.Error) -ForegroundColor Red
-                Write-Host "   A file there is most likely still open/locked by a running process." -ForegroundColor Red
-                $foldersFailed += $o.ProfilePath
-            }
-        } elseif (Test-Path -LiteralPath $o.ProfilePath) {
-            Write-Host ("SKIPPED folder '{0}' - not a safe individual profile directory (system/shared/root path). Delete it manually if it really is unwanted." -f $o.ProfilePath) -ForegroundColor Yellow
-            $foldersFailed += $o.ProfilePath
-        } else {
-            Write-Host ("Profile folder '{0}' does not exist - nothing to delete." -f $o.ProfilePath) -ForegroundColor DarkGray
-        }
-    }
-
-    try {
-        Remove-Item -Path $o.PSPath -Recurse -Force
-        $bak = $o.PSPath + '.bak'
-        if (Test-Path $bak) { Remove-Item -Path $bak -Recurse -Force }
-        Write-Host ("Removed orphaned ProfileList entry: {0} (was: {1})" -f $o.Sid, $shown) -ForegroundColor Green
-        $removed++
-    } catch {
-        Write-Host ("FAILED to remove {0}: {1}" -f $o.Sid, $_) -ForegroundColor Red
-    }
-}
-
-Write-Host ""
-Write-Host "$removed of $($orphans.Count) orphaned ProfileList entr(ies) removed." -ForegroundColor Green
-if ($deleteFolders) {
-    Write-Host "$foldersOk profile folder(s) deleted from disk." -ForegroundColor Green
-    if ($foldersFailed.Count -gt 0) {
-        Write-Host "The following folder(s) were NOT deleted and remain on disk - remove them manually if intended:" -ForegroundColor Yellow
-        $foldersFailed | ForEach-Object { Write-Host ("   " + $_) -ForegroundColor Yellow }
-    }
-} else {
-    Write-Host "Profile folders were left on disk. Note the ProfileList entries are now gone," -ForegroundColor Cyan
-    Write-Host "so the User Profiles dialog can no longer delete them - use Remove-Item if wanted." -ForegroundColor Cyan
-}
-if ($removed -eq $orphans.Count) {
-    Write-Host "NEXT STEP: re-run the OS upgrade from Server A (same command as before) -" -ForegroundColor Cyan
-    Write-Host "the 'Orphaned local user profiles' pre-check will now pass." -ForegroundColor Cyan
-} else {
-    Write-Host "Some entries could not be removed - resolve those before re-running the upgrade." -ForegroundColor Yellow
-}
-'@
-            Set-Content -Path $orphanScriptPath -Value $orphanCleanupScriptBody -Encoding UTF8 -Force
-            $orphanScriptWritten = $true
+        $orphanScriptWritten = Test-Path $orphanScriptPath
+        if ($orphanScriptWritten) {
             Set-UpgradeRegistryValue -Name "OrphanCleanupScriptPath" -Value $orphanScriptPath
-        } catch {
-            Write-Log "Could not write the ready-to-run orphaned-profile cleanup script to $orphanScriptPath : $_ - the copy/paste options printed below are unaffected." "WARN"
+        } else {
+            Write-Log "Companion 'Remove-OrphanedProfiles.ps1' is not present at $orphanScriptPath - the ready-to-run cleanup option is unavailable this run; the copy/paste options printed below are unaffected." "WARN"
         }
 
         $profileListRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
@@ -1475,10 +1081,10 @@ if ($removed -eq $orphans.Count) {
         Write-Log "        }"
         Write-Log "    }"
         Write-Log "--------------------------------------------------------------------"
-        Write-Log " OPTION 3 - RUN THE READY-MADE SCRIPT ALREADY GENERATED ON THIS SERVER"
+        Write-Log " OPTION 3 - RUN THE READY-MADE SCRIPT ALREADY STAGED ON THIS SERVER"
         Write-Log "--------------------------------------------------------------------"
         if ($orphanScriptWritten) {
-            Write-Log " A ready-to-run cleanup script has been written to $env:COMPUTERNAME at:"
+            Write-Log " A ready-to-run cleanup script is already staged on $env:COMPUTERNAME at:"
             Write-Log "   $orphanScriptPath"
             Write-Log " It does the same thing as Option 2 (self-discovering, removes ALL"
             Write-Log " orphaned accounts in one shot) but needs no copy/paste. It lists"
@@ -1496,7 +1102,7 @@ if ($removed -eq $orphans.Count) {
             Write-Log " profile folders too in the same unattended run):"
             Write-Log ("powershell.exe -ExecutionPolicy Bypass -File `"" + $orphanScriptPath + "`" -Force")
         } else {
-            Write-Log " (Unavailable this run - the script could not be written to"
+            Write-Log " (Unavailable this run - Remove-OrphanedProfiles.ps1 was not staged to"
             Write-Log "  $orphanScriptPath, see the WARN above. Use Option 1 or 2 instead.)"
         }
         Write-Log "--------------------------------------------------------------------"
@@ -1543,6 +1149,20 @@ try {
     Write-Log "Could not write dedicated pre-check report (non-blocking): $_" "WARN"
 }
 
+# DRIFT SELF-CHECK (2026-09-26). $totalPrecheckSteps is a hand-maintained
+# constant feeding a customer-visible percentage, and getting it wrong breaks
+# nothing - which is exactly why it drifts unnoticed. A check ADDED without
+# bumping it makes Stage 1 hit 100% early and sit there; a check REMOVED, or
+# one that returns without reporting (how the RDS CAL check behaved on every
+# non-RDS server until today), makes Stage 1 end BELOW 100%. Assert the real
+# number here instead of trusting the inventory comment in Section 2 to stay
+# accurate. Deliberately a WARN, never a throw: a miscounted progress bar is
+# not a reason to abort an otherwise healthy upgrade.
+if ($script:precheckStepsDone -ne $totalPrecheckSteps) {
+    $actualEndPct = [math]::Min(100, [int](100.0 * $script:precheckStepsDone / $totalPrecheckSteps))
+    Write-Log ("Pre-check step-count drift: $script:precheckStepsDone checks actually reported, but `$totalPrecheckSteps says $totalPrecheckSteps. Stage 1's percentage was wrong this run (ended at $actualEndPct%, not 100%); the upgrade itself is unaffected. Update the constant - and the check inventory comment beside it - to match the real number of checks that call Add-PreCheckResult.") "WARN"
+}
+
 if ($hardFailures.Count -gt 0) {
     $msg = ($hardFailures -join " | ")
     Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "Failed" -PercentComplete 0 -Notes $msg
@@ -1551,6 +1171,12 @@ if ($hardFailures.Count -gt 0) {
 }
 Write-Log "All hard-fail pre-checks PASSED. Warnings (non-blocking): $($warnings.Count)"
 foreach ($w in $warnings) { Write-Log "  - $w" "WARN" }
+
+if ($PrecheckOnly) {
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "AssessmentPassed" -PercentComplete 100 -PercentSource "Measured" -Notes "PrecheckOnly completed successfully. Backup and setup were skipped by request."
+    Write-Log "PrecheckOnly switch is set: all pre-checks passed. Exiting cleanly without proceeding to backup or setup.exe launch." "PASS"
+    return
+}
 
 # =============================================================================
 # SECTION 3 - STATE & POLICY BACKUP  (D:\UpgradeBackup by default)
@@ -1611,6 +1237,28 @@ try {
         Write-Log "Could not capture pre-upgrade services snapshot (non-blocking): $_" "WARN"
     }
     Update-BackupProgress -TaskName "Pre-upgrade services snapshot"
+
+    # --- 3.0b Host environment & configuration diagnostics -----------------
+    try {
+        Write-Log "Capturing host configuration diagnostics (computerinfo, systeminfo, ipconfig)..."
+        $compInfoPath = Join-Path $backupFolder "computerinfo.txt"
+        Get-ComputerInfo -Property WindowsBuildLabEx,WindowsEditionID -ErrorAction SilentlyContinue |
+            Out-File -FilePath $compInfoPath -Encoding UTF8
+        # Also copy to root BackupRoot for immediate accessibility
+        Copy-Item -Path $compInfoPath -Destination (Join-Path $BackupRoot "computerinfo.txt") -Force -ErrorAction SilentlyContinue
+
+        $sysInfoPath = Join-Path $backupFolder "systeminfo.txt"
+        & systeminfo.exe | Out-File -FilePath $sysInfoPath -Encoding UTF8
+        Copy-Item -Path $sysInfoPath -Destination (Join-Path $BackupRoot "systeminfo.txt") -Force -ErrorAction SilentlyContinue
+
+        $ipConfigPath = Join-Path $backupFolder "ipconfig.txt"
+        & ipconfig.exe /all | Out-File -FilePath $ipConfigPath -Encoding UTF8
+        Copy-Item -Path $ipConfigPath -Destination (Join-Path $BackupRoot "ipconfig.txt") -Force -ErrorAction SilentlyContinue
+
+        Write-Log "Host configuration diagnostics saved to $backupFolder and copied to $BackupRoot."
+    } catch {
+        Write-Log "Failed to collect one or more host configuration diagnostics (non-blocking): $_" "WARN"
+    }
 
     # --- 3.1 Registry hives -----------------------------------------------
     $regBackupDir = Join-Path $backupFolder "Registry"
@@ -1800,7 +1448,7 @@ try {
                 $installResult = Install-WindowsFeature -Name Windows-Server-Backup -ErrorAction Stop
                 if (-not $installResult.Success) { throw "Install-WindowsFeature reported Success=`$false for Windows-Server-Backup." }
                 if ($installResult.RestartNeeded -eq "Yes") {
-                    Write-Log "Windows Server Backup feature installed but reports a pending restart - proceeding anyway (non-blocking)." "WARN"
+                    throw "Windows Server Backup was installed but requires a restart. Reboot the target, rerun -PrecheckOnly, then restart the full upgrade so wbadmin runs from a settled servicing state."
                 } else {
                     Write-Log "Windows Server Backup feature installed successfully."
                 }
@@ -1815,13 +1463,24 @@ try {
                     Out-File -FilePath (Join-Path $backupFolder "SystemStateBackup_Location.txt") -Encoding UTF8 -Force
                 Write-Log "System state backup completed via wbadmin -> $wsbActualPath (log: $wsbLog)"
             } else {
-                Write-Log "wbadmin start systemstatebackup returned exit code $LASTEXITCODE (non-blocking) - see $wsbLog." "WARN"
+                throw "wbadmin start systemstatebackup returned exit code $LASTEXITCODE. Required recovery evidence was not created; see $wsbLog."
             }
         }
     } catch {
-        Write-Log "System state backup step failed (non-blocking): $_" "WARN"
+        Write-Log "Required system state backup failed - refusing to launch Windows Setup: $_" "ERROR"
+        throw
     }
     Update-BackupProgress -TaskName $(if ($SkipSystemStateBackup) { "System state backup (SKIPPED)" } else { "System state backup (wbadmin)" })
+
+    # Same drift self-check as Section 2c, for the same reason - $totalBackupSteps
+    # is hand-maintained. Structurally this one is harder to get wrong (all 8
+    # Update-BackupProgress calls sit unconditionally at the top level of this
+    # try block, deliberately OUTSIDE each task's own try/catch and if/else, so
+    # a skipped or failed task still counts as worked through), but the check
+    # costs nothing and would catch a task added without bumping the constant.
+    if ($script:backupStepsDone -ne $totalBackupSteps) {
+        Write-Log ("Backup step-count drift: $script:backupStepsDone tasks actually reported, but `$totalBackupSteps says $totalBackupSteps. Stage 2's percentage was wrong this run; the backup itself is unaffected. Update the constant to match the real number of Update-BackupProgress calls.") "WARN"
+    }
 
     Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -Notes "Backup completed at $backupFolder"
 } catch {
@@ -1865,16 +1524,29 @@ if (-not (Get-ItemProperty $script:RegRoot -Name "TargetBuild" -ErrorAction Sile
 }
 Write-Log "Current OS: $($osInfo.Caption) build $sourceBuild. Upgrade media: $($isoInfo.IsoPath) ($($isoInfo.DriveLetter):)"
 
-# Copy this script's companions (status tracker, cleanup, hooks) to the
-# ProgramData location that survives the whole upgrade so scheduled tasks /
-# setup.exe hooks always reference a stable, persistent path.
+# Copy this script's companions (status tracker, shared status plumbing,
+# cleanup, hooks) to the ProgramData location that survives the whole upgrade
+# so scheduled tasks / setup.exe hooks always reference a stable, persistent
+# path.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-foreach ($f in @("Update-UpgradeStatus.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd","LGPO.exe")) {
+foreach ($f in @("Update-UpgradeStatus.ps1","OSUpgradeShared.ps1","Remove-UpgradeArtifacts.ps1","setupcomplete.cmd","setuprollback.cmd","LGPO.exe")) {
     $src = Join-Path $here $f
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination $script:ScriptsDir -Force
     } elseif ($f -eq "LGPO.exe") {
         Write-Log "Optional companion 'LGPO.exe' not found next to this script - LGPO-based Local GPO backup was skipped earlier (non-blocking)." "WARN"
+    } elseif ($f -eq "OSUpgradeShared.ps1") {
+        # Reaching this is close to impossible - this very script dot-sourced
+        # that file at startup, so it existed minutes ago - but it is worth an
+        # explicit hard stop rather than a warning. Update-UpgradeStatus.ps1
+        # dot-sources it too and throws without it, so carrying on would hand
+        # off to setup.exe with EVERY status channel permanently dead: the
+        # 2-minute monitor, the reboot watcher and both setup.exe hooks would
+        # each throw on entry, and Server A would watch a server reboot into
+        # an upgrade it can never again get a phase, a percentage or a
+        # completion signal out of. Stopping here still leaves the machine
+        # fully intact (backup taken, nothing upgraded).
+        throw "Companion 'OSUpgradeShared.ps1' has disappeared from $here since this script started. It carries the status-tracking functions that Update-UpgradeStatus.ps1 needs to report progress after reboot - refusing to launch setup.exe without it. Nothing has been upgraded; restore the file and re-run."
     } else {
         Write-Log "Companion file '$f' not found next to this script - copy it manually into $script:ScriptsDir before relying on phase tracking / hooks." "WARN"
     }
@@ -1994,6 +1666,7 @@ $postRollbackCmd = Join-Path $script:ScriptsDir "setuprollback.cmd"
 $setupArgs = @(
     "/Auto", "Upgrade",
     "/Quiet",
+    "/Eula", "Accept",
     "/DynamicUpdate", "Disable",
     "/Telemetry", "Disable",
     "/Compat", "IgnoreWarning",
@@ -2043,7 +1716,9 @@ try {
     if ($launched) {
         Write-Log "Confirmed setup.exe process is running. This script does NOT wait for the full upgrade - progress is tracked via the '$script:TaskMonitor' scheduled task and $script:StatusJson from here on."
     } else {
-        Write-Log "setup.exe process was not observed running within 60s of the scheduled-task launch - it may still be starting slowly, or may have failed. Check Task Scheduler history for '$script:TaskSetupRun' and the Panther setupact.log/setuperr.log on $env:COMPUTERNAME." "WARN"
+        $setupTaskInfo = Get-ScheduledTaskInfo -TaskName $script:TaskSetupRun -ErrorAction SilentlyContinue
+        $taskResult = if ($setupTaskInfo) { $setupTaskInfo.LastTaskResult } else { "unavailable" }
+        throw "setup.exe was not observed within 60 seconds. Treating kickoff as failed rather than assuming a slow start. Scheduled-task LastTaskResult=$taskResult. Check '$script:TaskSetupRun' history and Panther setupact.log/setuperr.log."
     }
 
     if ($UseControlledReboot) {
@@ -2065,3 +1740,13 @@ try {
 }
 
 Write-Log "Start-TargetUpgrade.ps1 completed its kickoff work and is exiting. Monitor $env:COMPUTERNAME from Server A using Start-RemoteUpgradeOrchestrator.ps1."
+
+    } finally {
+        # Outer execution body completes (or throws)
+    }
+} finally {
+    if ($script:OwnsStarterMutex) {
+        $script:StarterMutex.ReleaseMutex()
+    }
+    $script:StarterMutex.Dispose()
+}

@@ -1,5 +1,36 @@
 # OS Upgrade Automation — Project Context & Session Notes
 
+## Reliability update - 2026-09-26
+
+See [CHANGE-TRACKING.md](CHANGE-TRACKING.md) for the implementation plan,
+specific fixes and reasons, safe test commands, verification evidence and
+required lab acceptance checks. This section supersedes historical statements
+below that describe accepting completion after repeated independent build-query
+failures, assuming no prior attempt when state cannot be queried, or lacking a
+WinRM status-data channel. The orchestrator now fails closed for uncertain
+startup state and requires live build confirmation for success.
+
+New assessment-only and monitor-only workflows support testing without starting
+Windows Setup. These are not substitutes for a full recoverable lab upgrade;
+assessment may write reports and temporarily mount media. See the change tracker
+for exact flags and limitations.
+
+New lab-only performance switch `-SkipDismScanHealthLab` skips only
+`Dism /Online /Cleanup-Image /ScanHealth`. The named pre-check is still recorded
+as `WARN` so assessment progress remains correct and the report explicitly says
+component-store health was not validated. A separate lab-only performance
+switch, `-SkipSfcScanNowLab`, skips `sfc /scannow` and its CBS.log analysis,
+records WARN and explicitly leaves protected system-file integrity unverified.
+The switches are independent. They may be combined for disposable functional
+testing, but neither may be used for production acceptance or production
+upgrades.
+
+Assessment-only logging fix: `-PrecheckOnly` now logs its successful completion
+with the target logger's supported `PASS` level. The earlier `SUCCESS` literal
+was valid only in the Server A logger and caused a passed target assessment to
+be returned as a failure. Retry command generation also recognizes Credential
+by parameter name, preserving the literal `-Credential $cred` placeholder.
+
 _Last updated: 2026-09-09 (orphaned-profile remediation expanded into three explicit options - per-SID commands, bulk copy/paste block, and a GENERATED ready-to-run Remove-OrphanedProfiles.ps1 on the target staging folder - plus a matching orchestrator failure banner branch; earlier same day: added automatic WinRM HTTPS/5986 fallback on Server A - previously every WinRM call hardcoded the HTTP/5985 default and a target with only a 5986 listener could never be reached; new -UseSSL / -SkipCertificateCheck switches. Previously: 2026-08-26 - added a 14th precheck, "Target media build is newer than current OS build" - hard FAIL, explicit customer decision - after a real TestVM2 run showed same-version media passes every existing check and launches a no-op repair-install; also fixed the SourceBuild==TargetBuild phase-detection stuck-at-Safe-OS bug and the stale cross-stage PercentComplete/PercentSource leak; added System State backup as backup task 8/8; enhanced the RDS Session Host CAL license server precheck; carried over the 2026-07-28 DISM/SFC revert-to-FAIL decision, the 2026-07-26 SFC/scannow + CBS.log check addition, orphaned-profiles hard FAIL + self-discovering cleanup script, and the 2026-07-24 GUI-percentage/task-count-based Stage 1/2 work)_
 
 > **How to use this file**: In a new chat session, tell me to "read
