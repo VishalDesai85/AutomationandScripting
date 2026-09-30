@@ -1,23 +1,3 @@
-# Reliability changes and validation
-
-## Goal and implementation plan
-
-Preserve the intended in-place Windows Server upgrade: Server A stages and
-monitors; Server B assesses, backs up, launches Setup, tracks reboot phases and
-validates the result. A management connection failure must not become proof of
-success, and uncertain state must not authorize another upgrade.
-
-This change set follows these steps:
-
-1. Inspect existing contracts and identify reproducible logic failures.
-2. Correct startup, backup, phase tracking and cleanup safety without changing
-   the normal upgrade goal or automatically removing user data.
-3. Provide explicit assessment-only and monitoring-only workflows for faster,
-   safer checks; retain real-upgrade safeguards by default.
-4. Add isolated regression tests and run syntax/static checks. Never test an
-   OS upgrade, registry modification, backup or cleanup on the development host.
-5. Record changes, evidence and outstanding lab acceptance requirements here.
-
 ## Original-code comparison baseline
 
 This document was checked against the original codebase supplied for reference:
@@ -126,6 +106,7 @@ The principle applied throughout the changes is:
 | Independent build verification | HTTP with explicit credentials passed an unsupported `Credential` argument to `Get-CimInstance`. Eight failed confirmations then silently authorized success. Missing target builds also authorized success. | Always authenticate through a disposable CIM session for HTTP/HTTPS. Require a matching live build; unavailable/missing/mismatched evidence keeps monitoring until timeout (exit 2), not success. |
 | Status channels | WinRM could be healthy while blocked SMB/DCOM left the monitor permanently blind. Missing registry values could look like a valid snapshot. | Add a bounded authenticated WinRM status read, reject incomplete JSON/registry snapshots and clean up jobs/sessions. No firewall or authentication policy is changed. |
 | Progress | A monotonic percentage clamp crossed stage boundaries, e.g. assessment 100% masked backup 0%. | Clamp only within the same stage; clamp displayed assessment percentage to valid bounds. |
+| Progress provenance and freshness | Windows Setup percentages could come from undocumented ChildCompletion or Panther regex values; status writes and real progress samples shared one timestamp; terminal failure reset progress to 0%. | Stage 3 now accepts only Microsoft MoSetup `SetupProgress`. Added `ProgressFreshness`, `ProgressUpdatedAtUtc`, `StatusUpdatedAtUtc` and stage high-water fields. Missing telemetry and terminal failure retain the highest verified stage value and its original progress timestamp. |
 | Reporting | Brief network outages and skipped polls were presented as proof of particular reboot behavior or a gap-free timeline. | Report only observed facts and direct operators to available target/Setup logs. A prior completion banner no longer asserts a verified current OS before the live check. |
 | Parameter validation | Zero/negative timing and malformed status paths failed late or produced invalid monitoring behavior. | Validate intervals, retention, patch age, disk threshold, target name and drive-qualified staging/status paths before operational work. An explicitly invalid source folder is no longer silently replaced with another folder. |
 | Read-only monitoring | Restarting the orchestrator could stage and start an upgrade when the operator only intended to inspect status. | Add `-MonitorOnly`; never stage/kick off in that mode. It can start while WinRM is unavailable. Use `-UseSSL` for an offline HTTPS-only target. |
@@ -140,6 +121,7 @@ The principle applied throughout the changes is:
 | Cleanup safeguards | Cleanup could delete files while starter/status was running or follow symbolic links. | Guarded with mutexes, added reparse point and path format assertions (`Assert-NoUpgradeReparsePoint`, `Assert-UpgradeCleanupPath`). |
 | Windows Setup EULA acceptance | `setup.exe` was launched unattended without `/Eula Accept`, so Setup self-terminated during Downlevel with `0xC190010E` ("User did not accept EULA at downlevel OS") before reaching Safe OS. | Pass `/Eula Accept` in the Setup argument list. Confirmed against a real WS2019 run that failed at this exact point. |
 | Downlevel Setup failure detection | With `$WINDOWS.~BT` present and no Setup process, the monitor unconditionally published Phase 4 "Safe OS Phase". A dead attempt was therefore reported as a healthy blind window indefinitely. | Read `setuperr.log` first; on a terminal Setup signature publish `Status=Failed` with the captured log line. The Safe OS branch now applies only when no failure evidence exists. |
+| Bounded dead-Setup detection | Setup could disappear without a Panther terminal signature and still be inferred as Safe OS forever. | Event 1074 sets `ExpectedDisconnect=true` without fabricating percentage. Without that evidence, ten continuous minutes of Setup absence publishes terminal failure with scheduled-task result, last-observed time and Panther log tails. |
 | Live build verification transport | `Get-RemoteOperatingSystem` called `New-CimSessionOption` with no protocol, so the mandatory `-Protocol` parameter prompted interactively and blocked the final success check. | Specify `Protocol = "Wsman"` explicitly, matching the DCOM reader that already passed `-Protocol Dcom`. |
 | Orchestrator log durability | Server A appended with bare `Add-Content` under `$ErrorActionPreference='Stop'`, so a transient file lock (AV scan, full disk) would terminate the orchestrator mid-upgrade. The equivalent hazard had already been fixed on the target side. | Route every write through a guarded `Add-LogFileLine` using `AppendAllText`, reporting a write failure once and continuing. Losing a log line must never stop monitoring. |
 | Target output lost from the log | The target's `Write-Host`/`Write-Warning` records reached Server A's console through `Receive-Job` but were never written to the orchestrator log file. All Stage 1/2 detail was therefore console-only and lost when the window closed. | Persist those records to the log file from the job's stream collections, using a per-stream index cursor so each is written exactly once. |

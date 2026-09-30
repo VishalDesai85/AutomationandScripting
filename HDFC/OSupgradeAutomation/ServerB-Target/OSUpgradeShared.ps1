@@ -121,6 +121,12 @@ function Write-StatusJson {
             Status                       = Get-SnapshotValue $reg "Status"
             PercentComplete              = Get-SnapshotValue $reg "PercentComplete"
             PercentSource                = Get-SnapshotValue $reg "PercentSource"
+            ProgressFreshness            = Get-SnapshotValue $reg "ProgressFreshness"
+            ProgressUpdatedAtUtc         = Get-SnapshotValue $reg "ProgressUpdatedAtUtc"
+            ProgressHighWaterPercent     = Get-SnapshotValue $reg "ProgressHighWaterPercent"
+            ProgressHighWaterStage       = Get-SnapshotValue $reg "ProgressHighWaterStage"
+            StatusUpdatedAtUtc           = Get-SnapshotValue $reg "StatusUpdatedAtUtc"
+            ExpectedDisconnect           = Get-SnapshotValue $reg "ExpectedDisconnect"
             SourceBuild                  = Get-SnapshotValue $reg "SourceBuild"
             TargetBuild                  = Get-SnapshotValue $reg "TargetBuild"
             TargetOSCaption              = Get-SnapshotValue $reg "TargetOSCaption"
@@ -161,12 +167,13 @@ function Set-Phase {
         [int]$PercentComplete = -1,
         [string]$Notes = "",
         # "Measured" = derived from a real, live data source (a task count we
-        # genuinely own, or a value regex-parsed out of setupact.log);
+        # genuinely own, or Windows Setup's documented MoSetup value);
         # "Estimated" (default) = a best-effort milestone marker where no live
         # telemetry source exists (Safe OS/WinPE blind window, or the one-shot
         # OOBE hook). Callers pass "Measured" explicitly ONLY where a real
         # value was actually obtained.
-        [ValidateSet("Measured","Estimated")][string]$PercentSource = "Estimated"
+        [ValidateSet("Measured","Estimated")][string]$PercentSource = "Estimated",
+        [ValidateSet("Live","Milestone")][string]$ProgressFreshness = "Live"
     )
     # ---- Monotonicity / truthfulness guards -------------------------------
     # These matter because Set-Phase is reached from FOUR uncoordinated
@@ -228,10 +235,13 @@ function Set-Phase {
         99      { "Stage 3/3: Windows Setup Execution (Rolled Back)" }
         default { "Stage 3/3: Windows Setup Execution" }
     }
+    $progressStage = if ($Phase -eq 99) { "Stage 3/3: Windows Setup Execution" } else { $stageLabel }
+    $statusUpdatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
     Set-UpgradeRegistryValue -Name "Stage"       -Value $stageLabel
     Set-UpgradeRegistryValue -Name "Phase"       -Value $Phase -Type DWord
     Set-UpgradeRegistryValue -Name "PhaseName"   -Value $PhaseName
     Set-UpgradeRegistryValue -Name "LastUpdated" -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    Set-UpgradeRegistryValue -Name "StatusUpdatedAtUtc" -Value $statusUpdatedAtUtc
     if ($PercentComplete -ge 0) {
         # Never let the displayed percentage visibly regress while a run is
         # still InProgress. Start-TargetUpgrade.ps1 writes an initial
@@ -252,13 +262,29 @@ function Set-Phase {
         # (e.g. Stage 2 finishing at 100%). Only clamp when the stored percent
         # came from THIS SAME stage - never carry a high-water mark across a
         # stage boundary, only within one.
-        if ($Status -eq "InProgress" -and (Get-UpgradeRegistryValue -Name "PercentStage") -eq $stageLabel) {
-            $priorPercent = [int](Get-UpgradeRegistryValue -Name "PercentComplete" -Default 0)
+        $priorPercentValue = Get-UpgradeRegistryValue -Name "PercentComplete"
+        $priorPercentStage = Get-UpgradeRegistryValue -Name "PercentStage"
+        $retainedTerminalProgress = $false
+        if ($Status -eq "Failed" -and $null -ne $priorPercentValue -and
+            ($priorPercentStage -eq $stageLabel -or ($Phase -eq 99 -and $storedPhase -ge 3))) {
+            $PercentComplete = [math]::Max($PercentComplete, [int]$priorPercentValue)
+            $retainedTerminalProgress = $true
+        } elseif ($Status -eq "InProgress" -and $priorPercentStage -eq $stageLabel) {
+            $priorPercent = [int]$priorPercentValue
             $PercentComplete = [math]::Max($PercentComplete, $priorPercent)
         }
         Set-UpgradeRegistryValue -Name "PercentComplete" -Value $PercentComplete -Type DWord
         Set-UpgradeRegistryValue -Name "PercentSource"   -Value $PercentSource
         Set-UpgradeRegistryValue -Name "PercentStage"    -Value $stageLabel
+        $priorHighWater = if ((Get-UpgradeRegistryValue -Name "ProgressHighWaterStage") -eq $progressStage) {
+            [int](Get-UpgradeRegistryValue -Name "ProgressHighWaterPercent" -Default 0)
+        } else { 0 }
+        Set-UpgradeRegistryValue -Name "ProgressHighWaterPercent" -Value ([math]::Max($PercentComplete, $priorHighWater)) -Type DWord
+        Set-UpgradeRegistryValue -Name "ProgressHighWaterStage" -Value $progressStage
+        Set-UpgradeRegistryValue -Name "ProgressFreshness" -Value $(if ($Status -in @("Completed", "CompletedWithWarnings", "Failed")) { "Terminal" } else { $ProgressFreshness })
+        if (-not $retainedTerminalProgress) {
+            Set-UpgradeRegistryValue -Name "ProgressUpdatedAtUtc" -Value $statusUpdatedAtUtc
+        }
     } elseif ((Get-UpgradeRegistryValue -Name "PercentStage") -and (Get-UpgradeRegistryValue -Name "PercentStage") -ne $stageLabel) {
         # BUG FIX (2026-08-26, real TestVM2 run): entering a NEW stage with no
         # fresh measurement yet used to leave the PREVIOUS stage's ending
@@ -274,9 +300,16 @@ function Set-Phase {
         # this stage.
         Remove-ItemProperty -Path $script:RegRoot -Name "PercentComplete" -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path $script:RegRoot -Name "PercentSource" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $script:RegRoot -Name "ProgressFreshness" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $script:RegRoot -Name "ProgressUpdatedAtUtc" -ErrorAction SilentlyContinue
         Set-UpgradeRegistryValue -Name "PercentStage" -Value $stageLabel
+    } elseif ($null -ne (Get-UpgradeRegistryValue -Name "PercentComplete")) {
+        Set-UpgradeRegistryValue -Name "ProgressFreshness" -Value $(if ($Status -in @("Completed", "CompletedWithWarnings", "Failed")) { "Terminal" } else { "CarriedForward" })
     }
     if ($Notes) { Set-UpgradeRegistryValue -Name "Notes" -Value $Notes }
+    if ($Status -in @("Completed", "CompletedWithWarnings", "Failed")) {
+        Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+    }
     # Publish the terminal indicator only AFTER its supporting fields. Server
     # A's CIM/DCOM channel reads these values one at a time, so writing Status
     # first would let it observe "Completed" alongside the previous phase's

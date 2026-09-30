@@ -172,8 +172,14 @@ $targetAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $targetPath, [ref]$targetTokens, [ref]$targetParseErrors)
 if ($targetParseErrors.Count) { throw ($targetParseErrors -join "`n") }
 $targetText = $targetAst.Extent.Text
+$orchestratorText = $ast.Extent.Text
 $targetParameterNames = @($targetAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
 Assert-True ($targetParameterNames -contains 'PrecheckOnly') 'Target starter exposes PrecheckOnly'
+Assert-True ($targetText -match 'ExpectedDisconnect.+REG_DWORD.+/d 1') 'Event 1074 watcher records an expected disconnect without percentage changes'
+Assert-True ($targetText -match 'monitorScript.+-RebootEvent') 'Event 1074 watcher mirrors its evidence through the shared JSON writer'
+Assert-True ($orchestratorText -match 'ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent') 'WinRM status projection includes progress evidence metadata'
+Assert-True ($orchestratorText -match 'ExpectedDisconnect\s*=\s*Get-UpgradeRegDWord') 'DCOM status projection includes expected-disconnect evidence'
+Assert-True ($orchestratorText -match 'expected reboot disconnect after Event ID 1074') 'Connectivity-gap display distinguishes an expected reboot'
 $targetWriteLog = $targetAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

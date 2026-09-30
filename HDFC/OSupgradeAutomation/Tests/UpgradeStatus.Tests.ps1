@@ -133,6 +133,7 @@ function Copy-Item { param($Path, $Destination, [switch]$Force, $ErrorAction) }
 function Get-Process { param($Name, $ErrorAction) return $script:setupProcesses }
 function Get-SetupLogTail { param($Path) return $null }
 function Get-SetupProgressPercent { param($LogPath) return $null }
+function Get-ScheduledTaskInfo { param($TaskName, $ErrorAction) return [pscustomobject]@{ LastTaskResult = 0 } }
 function Get-ScheduledTask { param($TaskPath, $ErrorAction) return $script:tasks }
 function Unregister-ScheduledTask { param($TaskName, $TaskPath, $Confirm, $ErrorAction)
     if ($script:failUnregister) { throw 'Mock task access denied' }
@@ -176,6 +177,28 @@ $script:state.PercentStage = 'Stage 2/3: Backup'
 $script:state.PercentComplete = 100
 Set-Phase -Phase 3 -PhaseName 'Downlevel'
 Assert-Equal $script:state.ContainsKey('PercentComplete') $false 'New stage clears old percentage'
+Reset-Fixture
+$script:state.PercentStage = 'Stage 3/3: Windows Setup Execution'
+$script:state.PercentComplete = 72
+$script:state.PercentSource = 'Measured'
+$script:state.ProgressUpdatedAtUtc = '2026-09-30T08:00:00.0000000Z'
+$script:state.ProgressHighWaterPercent = 72
+$script:state.ProgressHighWaterStage = 'Stage 3/3: Windows Setup Execution'
+Set-Phase -Phase 4 -PhaseName 'Safe OS'
+Assert-Equal $script:state.PercentComplete 72 'Missing telemetry carries the last verified percentage'
+Assert-Equal $script:state.ProgressFreshness 'CarriedForward' 'Missing telemetry is explicitly carried forward'
+Assert-Equal $script:state.ProgressUpdatedAtUtc '2026-09-30T08:00:00.0000000Z' 'Carried progress preserves its original timestamp'
+Set-Phase -Phase 4 -PhaseName 'Windows Setup Failed' -Status Failed -PercentComplete 0
+Assert-Equal $script:state.PercentComplete 72 'Terminal failure retains the verified stage high-water'
+Assert-Equal $script:state.ProgressHighWaterPercent 72 'Terminal failure does not lower stage high-water'
+Assert-Equal $script:state.ProgressFreshness 'Terminal' 'Retained terminal progress is labelled terminal'
+Assert-Equal $script:state.ProgressUpdatedAtUtc '2026-09-30T08:00:00.0000000Z' 'Terminal retention does not fabricate a new progress timestamp'
+Reset-Fixture
+$script:state.Phase = 0
+Set-Phase -Phase 1 -PhaseName 'Pre-Upgrade Assessment' -PercentComplete 25 -PercentSource Measured -ProgressFreshness Milestone
+Assert-Equal $script:state.ProgressFreshness 'Milestone' 'Task-count progress is identified as a milestone'
+Assert-Equal ([string]::IsNullOrWhiteSpace($script:state.StatusUpdatedAtUtc)) $false 'Every accepted status update receives a UTC timestamp'
+Assert-Equal ([string]::IsNullOrWhiteSpace($script:state.ProgressUpdatedAtUtc)) $false 'A new verified percentage receives a UTC timestamp'
 foreach ($missingEvidence in @('TargetBuild', 'PostUpgradeBuild', 'PostUpgradeValidationTime', 'PostUpgradeValidationResult')) {
     Reset-Fixture
     $script:state.PostUpgradeBuild = $script:state.TargetBuild
@@ -256,11 +279,44 @@ $RebootEvent = $false
 
 Reset-Fixture
 $script:build = $script:state.SourceBuild
+$script:state.SetupWasObserved = 1
+$script:paths["$env:SystemDrive\`$WINDOWS.~BT"] = $true
+Invoke-TestStatusPoll
+Assert-Equal $script:state.Phase 3 'First missing Setup observation remains in Downlevel'
+Assert-Equal ([string]::IsNullOrWhiteSpace($script:state.SetupMissingSinceUtc)) $false 'First missing Setup observation starts the confirmation window'
+Assert-Equal $script:state.Status 'InProgress' 'Missing Setup does not fail before the confirmation threshold'
+Reset-Fixture
+$script:build = $script:state.SourceBuild
+$script:state.SetupWasObserved = 1
+$script:state.SetupLastObservedAtUtc = '2026-09-30T07:00:00.0000000Z'
+$script:state.SetupMissingSinceUtc = (Get-Date).ToUniversalTime().AddMinutes(-11).ToString('o')
+$script:state.PercentStage = 'Stage 3/3: Windows Setup Execution'
+$script:state.PercentComplete = 63
+$script:state.ProgressUpdatedAtUtc = '2026-09-30T07:05:00.0000000Z'
+$script:paths["$env:SystemDrive\`$WINDOWS.~BT"] = $true
+Invoke-TestStatusPoll
+Assert-Equal $script:state.Status 'Failed' 'Setup missing for ten minutes without reboot evidence becomes terminal failure'
+Assert-Equal $script:state.PercentComplete 63 'Dead-Setup failure retains the highest verified progress'
+Assert-Equal ($script:state.Notes -match 'LastTaskResult=0') $true 'Dead-Setup failure includes scheduled-task diagnostics'
+Reset-Fixture
+$script:build = $script:state.SourceBuild
+$script:state.SetupWasObserved = 1
+$script:state.ExpectedDisconnect = 1
+$script:state.SetupMissingSinceUtc = (Get-Date).ToUniversalTime().AddMinutes(-11).ToString('o')
+$script:paths["$env:SystemDrive\`$WINDOWS.~BT"] = $true
+Invoke-TestStatusPoll
+Assert-Equal $script:state.Status 'InProgress' 'Expected reboot disconnect suppresses dead-Setup failure'
+Assert-Equal $script:state.Phase 4 'Expected reboot disconnect moves to inferred Safe OS'
+
+Reset-Fixture
+$script:build = $script:state.SourceBuild
 $script:setupProcesses = @([pscustomobject]@{ Name = 'setuphost' })
+$script:state.ExpectedDisconnect = 1
 $script:paths["$env:SystemDrive\`$WINDOWS.~BT"] = $true
 Invoke-TestStatusPoll
 Assert-Equal $script:state.Phase 3 'Active source-build setup stays downlevel'
 Assert-Equal $script:state.Status 'InProgress' 'Active setup is not completed prematurely'
+Assert-Equal $script:state.ExpectedDisconnect 1 'Active Setup poll cannot erase Event 1074 evidence before shutdown'
 Reset-Fixture
 $script:setupInProgress = 1
 Invoke-TestStatusPoll

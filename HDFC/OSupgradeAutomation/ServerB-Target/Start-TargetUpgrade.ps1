@@ -424,7 +424,7 @@ function Add-PreCheckResult {
     # due to a hard failure, which is an accurate reflection of reality.
     $script:precheckStepsDone++
     $pct = [math]::Min(100, [int](100.0 * $script:precheckStepsDone / $totalPrecheckSteps))
-    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -Notes "Check $script:precheckStepsDone/$totalPrecheckSteps complete: $Name ($Result)"
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "Check $script:precheckStepsDone/$totalPrecheckSteps complete: $Name ($Result)"
 }
 
 Write-Log "----- Running mandatory pre-checks -----"
@@ -1173,7 +1173,7 @@ Write-Log "All hard-fail pre-checks PASSED. Warnings (non-blocking): $($warnings
 foreach ($w in $warnings) { Write-Log "  - $w" "WARN" }
 
 if ($PrecheckOnly) {
-    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "AssessmentPassed" -PercentComplete 100 -PercentSource "Measured" -Notes "PrecheckOnly completed successfully. Backup and setup were skipped by request."
+    Set-Phase -Phase 1 -PhaseName "Pre-Upgrade Assessment" -Status "AssessmentPassed" -PercentComplete 100 -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "PrecheckOnly completed successfully. Backup and setup were skipped by request."
     Write-Log "PrecheckOnly switch is set: all pre-checks passed. Exiting cleanly without proceeding to backup or setup.exe launch." "PASS"
     return
 }
@@ -1204,7 +1204,7 @@ function Update-BackupProgress {
     param([string]$TaskName)
     $script:backupStepsDone++
     $pct = [math]::Min(100, [int](100.0 * $script:backupStepsDone / $totalBackupSteps))
-    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -Notes "Task $script:backupStepsDone/$totalBackupSteps complete: $TaskName"
+    Set-Phase -Phase 2 -PhaseName "State & Policy Backup" -Status "InProgress" -PercentComplete $pct -PercentSource "Measured" -ProgressFreshness "Milestone" -Notes "Task $script:backupStepsDone/$totalBackupSteps complete: $TaskName"
 }
 
 try {
@@ -1577,6 +1577,7 @@ try {
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Phase /t REG_DWORD /d 4 /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v PhaseName /t REG_SZ /d `"Safe OS Phase`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Status /t REG_SZ /d `"InProgress`" /f"
+        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ExpectedDisconnect /t REG_DWORD /d 1 /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Notes /t REG_SZ /d `"Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot.`" /f"
         "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v LastUpdated /t REG_SZ /d `"%date% %time%`" /f"
     )
@@ -1605,6 +1606,10 @@ try {
         $progressLogPath = Join-Path $backupFolder "OSUpgradeProgress.log"
         $regCmds += "echo [%date% %time%] [Stage 3/3: Windows Setup Execution] Phase=4 (Safe OS Phase) Status=InProgress Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot. Percent unchanged from last real Downlevel reading (no telemetry possible in WinPE). >> `"$progressLogPath`""
     }
+    # Keep the direct registry writes first because they are the quickest path
+    # in the narrow pre-shutdown window. Then let the mutex-protected shared
+    # writer mirror ExpectedDisconnect and the carried progress into JSON.
+    $regCmds += "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootEvent"
     $rebootAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c " + ($regCmds -join " && "))
     $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace "Root/Microsoft/Windows/TaskScheduler"
     $eventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
@@ -1714,6 +1719,10 @@ try {
         if (Get-Process -Name $setupProcNames -ErrorAction SilentlyContinue) { $launched = $true; break }
     }
     if ($launched) {
+        Set-UpgradeRegistryValue -Name "SetupWasObserved" -Value 1 -Type DWord
+        Set-UpgradeRegistryValue -Name "SetupLastObservedAtUtc" -Value ((Get-Date).ToUniversalTime().ToString("o"))
+        Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupMissingSinceUtc" -ErrorAction SilentlyContinue
         Write-Log "Confirmed setup.exe process is running. This script does NOT wait for the full upgrade - progress is tracked via the '$script:TaskMonitor' scheduled task and $script:StatusJson from here on."
     } else {
         $setupTaskInfo = Get-ScheduledTaskInfo -TaskName $script:TaskSetupRun -ErrorAction SilentlyContinue

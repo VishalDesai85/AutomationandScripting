@@ -62,22 +62,25 @@ CIM-DCOM / nothing-during-the-genuine-WinPE-blind-window):
   synchronously as part of the kickoff call itself.
 - **`Update-UpgradeStatus.ps1`** (Server B) - the actual phase/percent
   ENGINE for everything from Downlevel onward. Registered as a recurring
-  5-minute Scheduled Task (`OSUpgradePhaseMonitor`) by `Start-TargetUpgrade.ps1`,
-  PLUS invoked immediately (not waiting for the next 5-min tick) by three
+  2-minute Scheduled Task (`OSUpgradePhaseMonitor`) by `Start-TargetUpgrade.ps1`,
+  PLUS invoked immediately by three
   event hooks: the Event-ID-1074 watcher task (`OSUpgradeRebootWatcher`,
   fires the instant a restart is initiated), and Windows Setup's own
   `setupcomplete.cmd`/`setuprollback.cmd` (`/PostOOBE`/`/PostRollback`
   hooks, mandatory-exact filenames per Microsoft). It writes every
   phase/percent update to BOTH the registry AND the JSON file - this is the
   single source of truth Server A always reads from. `PercentComplete` is
-  always paired with a `PercentSource` field, currently always
-  `"Measured"` in practice - either regex-parsed/registry-read from Windows
-  Setup's own live telemetry (Downlevel, First Boot; carried forward
+  paired with a `PercentSource` field. Stage 3 accepts only Microsoft's
+  `mosetup\Volatile\SetupProgress` live telemetry (Downlevel, First Boot;
+  carried forward
   unchanged during Safe OS/OOBE where no telemetry can exist) or, for Stage
   1/2 (Pre-Upgrade Assessment/Backup, which have no telemetry source of
   their own at all), a genuine task-count fraction ("N of M checks/tasks
   done") - a real measurement either way, never a fabricated milestone
-  guess. A `PercentStage` field (internal bookkeeping, not exposed in the
+  guess. `ProgressFreshness`, `ProgressUpdatedAtUtc` and
+  `StatusUpdatedAtUtc` distinguish live/milestone/carried/terminal evidence
+  without changing the original timestamp of a carried sample. A
+  `PercentStage` field (internal bookkeeping, not exposed in the
   JSON) tracks which Stage the current `PercentComplete` belongs to, so the
   monotonic-never-decreases clamp only applies WITHIN a stage, never across
   a stage boundary (each Stage has its own independent 0-100 scale).
@@ -244,9 +247,11 @@ targetBuild` locally) rather than looping forever.
   (`throw`). If not, it automatically unregisters the 4 scheduled tasks,
   clears the registry key, removes stale OOBE/rollback markers, and renames
   away any leftover `$WINDOWS.~BT` - then proceeds with a clean run.
-- **Progress % sources** (in priority order): `HKLM:\SYSTEM\Setup\Status\ChildCompletion\setup.exe`
-  → regex scan of `setupact.log` (Panther logs) → phase-based conservative
-  baseline (25/55/70/95/100) if neither real source is available.
+- **Progress % sources**: Stage 1/2 use measured task-count milestones. Stage
+  3 uses only Microsoft-documented
+  `HKLM:\SYSTEM\Setup\mosetup\Volatile\SetupProgress`; when absent, the last
+  verified sample and its original timestamp are carried forward. Panther
+  logs remain diagnostic evidence and are not parsed for percentages.
 - **WinRM disconnect handling on Server A**: explicit `Test-WSMan`-based
   `Mode` state machine (`ActivePolling` / `Heartbeat` / `Offline`) with clear
   transition logging ("WinRM connectivity LOST/RESTORED..."). Final success
@@ -469,16 +474,12 @@ targetBuild` locally) rather than looping forever.
     scale. **Fix**: the initial placeholder is now an honest `0%` (removes
     the collision at the source) instead of an arbitrary `20%`, and
     `Set-Phase` (in `Update-UpgradeStatus.ps1`) additionally clamps
-    `PercentComplete` to never decrease while `Status=InProgress` (exempting
-    terminal Failed/RolledBack, which correctly show `0%`).
-16. **Added `PercentSource` field** (`Measured`/`Estimated`) alongside every
-    `PercentComplete` write, for banking-grade audit transparency about
-    which numbers are real live telemetry (regex-parsed from setupact.log,
-    Downlevel/First Boot only) vs. best-effort milestone markers (every
-    other phase, where no live data source can physically exist - e.g. Safe
-    OS/WinPE has no telemetry at all, OOBE's hook fires once with no
-    ongoing counter). Threaded through the registry, JSON, the CIM/DCOM
-    reader, and the live progress bar display.
+    `PercentComplete` to never decrease while `Status=InProgress`. Terminal
+    failure and rollback now retain the same stage's highest verified value.
+  16. **Added explicit progress evidence fields**: `PercentSource`,
+    `ProgressFreshness`, `ProgressUpdatedAtUtc`, `StatusUpdatedAtUtc` and a
+    stage high-water value are threaded through registry, JSON, CIM/DCOM,
+    WinRM and the live progress display.
 17. **`Get-CimInstance -Credential $Credential` threw "A parameter cannot be
     found that matches parameter name 'Credential'"** on every single final
     build-reconfirmation attempt (8x per run, ~2 min of WARN spam) whenever
@@ -1231,10 +1232,9 @@ needed for this.
   phases (Downlevel/Safe OS/First Boot/Second Boot-OOBE) as one continuous
   0-100 arc, so it no longer needs the old per-phase clamps
   (`[math]::Min(...,55)` / `[math]::Max(...,60)`) when it's the source -
-  those clamps are now only applied as a fallback for the less-authoritative
-  `ChildCompletion`/`setupact.log`-regex sources. New `Source` field on the
-  return object (`MoSetupRegistry`/`ChildCompletion`/`SetupActLog`) records
-  which one actually answered.
+  the old per-phase clamps. ChildCompletion and Panther regex percentages
+  have now been removed; if MoSetup is absent, the prior verified sample is
+  carried forward without changing its progress timestamp.
 - **Stage 1/2/3 grouping**: both `Set-Phase` functions (`Start-TargetUpgrade.ps1`
   and `Update-UpgradeStatus.ps1`) now also compute and persist a `Stage`
   registry/JSON value - "Stage 1/3: Pre-Upgrade Assessment" (Phase 1),
@@ -1297,12 +1297,12 @@ alongside this solution.
 |---|------|---------|-----------|
 | 1 | Pre-Upgrade Assessment | DC/cluster/diskspace/reboot/DISM/edition/licensing/patch-level/VMware Tools/RDS CAL/orphaned-profiles checks on Server B | Task-count based: (checks completed / 12) x 100, climbs with every check regardless of PASS/WARN/FAIL |
 | 2 | State & Policy Backup | Registry hives, Local GPO (+ optional LGPO.exe) + secedit export, gpresult, RDS CAL DB (if applicable) saved to `D:\UpgradeBackup` | Task-count based: (tasks completed / 7) x 100 |
-| 3 | Downlevel Phase | Still on the source build; `setup.exe` actively running (launched via `OSUpgradeSetupLaunch` Scheduled Task) | Measured from the `mosetup\Volatile\SetupProgress` registry key (unclamped) when available, else `ChildCompletion`/log-regex (clamped to <=55) - falls back to the last real carried-forward value if no source answers yet |
+| 3 | Downlevel Phase | Still on the source build; `setup.exe` actively running (launched via `OSUpgradeSetupLaunch` Scheduled Task) | Measured only from `mosetup\Volatile\SetupProgress`; otherwise carries the last verified value and timestamp |
 | 4 | Safe OS Phase | WinPE - the genuine blind window; no script/task can run here at all (Event 1074 marks the phase transition instantly, but writes no percent) | No telemetry possible - the last real Downlevel measurement (often already 80-90%+) persists unchanged through this phase |
-| 5 | First Boot Phase | New build has booted; `SystemSetupInProgress=1` while roles/settings migrate | Same MoSetup-registry-first Measured logic as Downlevel (clamped to >=60 for less-authoritative sources), else carries forward the last real value |
+| 5 | First Boot Phase | New build has booted; `SystemSetupInProgress=1` while roles/settings migrate | Same MoSetup-only live measurement as Downlevel; otherwise carries forward the last verified value |
 | 6 | Second Boot (OOBE) Phase | `setupcomplete.cmd` fired `/PostOOBE`; finalizing configuration/cleanup | One-shot hook, no ongoing counter - carries forward the last real First Boot measurement unchanged |
 | 7 | Completed | Post-upgrade validation ran (build/edition/activation/critical-services checks); `Completed` or `CompletedWithWarnings` | 100 (Measured - a verified fact, build match already confirmed locally) |
-| 99 | Rolled Back / Failed | `setuprollback.cmd` fired `/PostRollback` - upgrade failed and Windows reverted to the source OS; SetupDiag results copied if present | 0 (genuine terminal value, monotonic clamp deliberately does not apply to Failed/RolledBack) |
+| 99 | Rolled Back / Failed | `setuprollback.cmd` fired `/PostRollback` - upgrade failed and Windows reverted to the source OS; SetupDiag results copied if present | Retains the highest verified Stage 3 percentage and marks it `Terminal` |
 
 ## Open items / not yet done
 - No automated end-to-end test of a full upgrade run to completion yet

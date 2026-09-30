@@ -1123,6 +1123,12 @@ function Get-RemoteStatusViaCimDcom {
                 Status          = Get-UpgradeRegSZ    $cimSession "Status"
                 PercentComplete = Get-UpgradeRegDWord $cimSession "PercentComplete"
                 PercentSource   = Get-UpgradeRegSZ    $cimSession "PercentSource"
+                ProgressFreshness        = Get-UpgradeRegSZ    $cimSession "ProgressFreshness"
+                ProgressUpdatedAtUtc     = Get-UpgradeRegSZ    $cimSession "ProgressUpdatedAtUtc"
+                ProgressHighWaterPercent = Get-UpgradeRegDWord $cimSession "ProgressHighWaterPercent"
+                ProgressHighWaterStage   = Get-UpgradeRegSZ    $cimSession "ProgressHighWaterStage"
+                StatusUpdatedAtUtc        = Get-UpgradeRegSZ    $cimSession "StatusUpdatedAtUtc"
+                ExpectedDisconnect        = Get-UpgradeRegDWord $cimSession "ExpectedDisconnect"
                 SourceBuild     = Get-UpgradeRegSZ    $cimSession "SourceBuild"
                 TargetBuild     = Get-UpgradeRegSZ    $cimSession "TargetBuild"
                 LastUpdated     = Get-UpgradeRegSZ    $cimSession "LastUpdated"
@@ -1167,6 +1173,8 @@ function Get-RemoteStatusViaWinRM {
             }
             Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation" |
                 Select-Object Phase, PhaseName, Status, PercentComplete, PercentSource,
+                    ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent,
+                    ProgressHighWaterStage, StatusUpdatedAtUtc, ExpectedDisconnect,
                     SourceBuild, TargetBuild, LastUpdated, Notes, PostUpgradeOSCaption,
                     ServicesComparisonResult, ServicesComparisonReportPath,
                     ServicesAttentionCount, ServicesInfoCount, TargetOSCaption,
@@ -1369,7 +1377,7 @@ function Show-ProgressBar {
     param(
         [int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk,
         [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage,
-        $Phase, [int]$EvidenceAgeSec = -1
+        $Phase, [int]$EvidenceAgeSec = -1, [int]$ProgressAgeSec = -1
     )
 
     $pct = [math]::Max(0, [math]::Min(100, $PercentComplete))
@@ -1387,11 +1395,12 @@ function Show-ProgressBar {
     $stageText = if ($Stage) { $Stage } else { "Stage -" }
     # Staleness is the signal that distinguishes "working" from "frozen" - the
     # defect that previously let a dead run look healthy for hours.
-    $ageText = if ($EvidenceAgeSec -ge 0) { "target status unchanged for ${EvidenceAgeSec}s" } else { "no target status yet" }
+    $statusAgeText = if ($EvidenceAgeSec -ge 0) { "status ${EvidenceAgeSec}s" } else { "status age n/a" }
+    $progressAgeText = if ($ProgressAgeSec -ge 0) { "progress ${ProgressAgeSec}s" } else { "progress age n/a" }
 
     Write-Progress -Id 1 `
         -Activity "OS upgrade on $TargetComputer   |   $stageText   |   $pingText / $modeText" `
-        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $ageText)" `
+        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $statusAgeText, $progressAgeText)" `
         -CurrentOperation (Get-PhaseChecklist -Phase $Phase) `
         -PercentComplete $pct
 }
@@ -1458,6 +1467,9 @@ $stallWarningCount = 0
 $lastKnownPercent  = 0
 $lastKnownStage = $null
 $lastKnownPercentSource = "Estimated"
+$lastKnownProgressFreshness = $null
+$lastProgressUpdatedAtUtc = $null
+$lastExpectedDisconnect = $false
 # Intelligent "why didn't I see phase X" self-explanation (2026-07-20):
 # tracks the last REAL numeric Phase actually read from a genuine status
 # source (File/CIM-DCOM - the synthetic WinRMOnly/Heartbeat/Offline
@@ -1541,10 +1553,15 @@ while ($true) {
         $lastKnownStage = $status.Stage
         $lastKnownPercent       = $freshPct
         $lastKnownPercentSource = if ($status.PercentSource) { $status.PercentSource } else { "Estimated" }
-        $pctSourceForDisplay    = $lastKnownPercentSource
+        if ($status.ProgressFreshness) { $lastKnownProgressFreshness = $status.ProgressFreshness }
+        if ($status.ProgressUpdatedAtUtc) { $lastProgressUpdatedAtUtc = $status.ProgressUpdatedAtUtc }
+        $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
+        $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay"
     } else {
-        $pctSourceForDisplay = "$lastKnownPercentSource (cached)"
+        $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
+        $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay (cached)"
     }
+    if ($null -ne $status.ExpectedDisconnect) { $lastExpectedDisconnect = [bool][int]$status.ExpectedDisconnect }
     $pct = $lastKnownPercent
     # Same sticky principle as $lastKnownPercent above, applied to the
     # PHASE NAME itself: during a connectivity gap, show the last CONFIRMED
@@ -1552,15 +1569,27 @@ while ($true) {
     # guessed phase as if it were fact - see $lastConfirmedPhaseName above
     # for why that guess has been directly observed to be wrong.
     $lastConfirmedForDisplay = if ($null -ne $lastConfirmedPhaseName) { $lastConfirmedPhaseName } else { "no phase confirmed yet" }
-    $displayPhaseName = if ($null -ne $status.Phase) { $status.PhaseName } else { "$lastConfirmedForDisplay (connectivity gap - phase UNCONFIRMED; could be a Safe OS/WinPE reboot in progress, or just a transient interruption while still in this same phase - next real reading will confirm)" }
+    $displayPhaseName = if ($null -ne $status.Phase) {
+        $status.PhaseName
+    } elseif ($lastExpectedDisconnect) {
+        "$lastConfirmedForDisplay (expected reboot disconnect after Event ID 1074; phase unconfirmed until the target returns)"
+    } else {
+        "$lastConfirmedForDisplay (unexpected connectivity gap - reboot, network interruption, and host failure remain unconfirmed)"
+    }
 
     if ($status.LastUpdated -and $status.LastUpdated -ne $lastStatusStamp) {
         $lastStatusStamp      = $status.LastUpdated
         $lastEvidenceChangeAt = Get-Date
     }
     $evidenceAgeSec = [int]((Get-Date) - $lastEvidenceChangeAt).TotalSeconds
+    $progressAgeSec = -1
+    if ($lastProgressUpdatedAtUtc) {
+        try {
+            $progressAgeSec = [math]::Max(0, [int]((Get-Date).ToUniversalTime() - [datetime]::Parse($lastProgressUpdatedAtUtc).ToUniversalTime()).TotalSeconds)
+        } catch { $progressAgeSec = -1 }
+    }
 
-    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage -Phase $status.Phase -EvidenceAgeSec $evidenceAgeSec
+    Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status -PingOk $status.PingOk -Mode $status.Mode -Source $status.Source -PercentSource $pctSourceForDisplay -Stage $status.Stage -Phase $status.Phase -EvidenceAgeSec $evidenceAgeSec -ProgressAgeSec $progressAgeSec
 
     # The console bar is ephemeral and is never captured by redirection, so
     # without this the log file ends up with phase transitions but no

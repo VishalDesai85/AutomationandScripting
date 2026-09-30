@@ -2,8 +2,8 @@
 .SYNOPSIS
     Runs on a schedule (every 2 minutes, registered by Start-TargetUpgrade.ps1)
     on Server B. Detects which phase of the in-place upgrade is currently
-    active, estimates a progress percentage by parsing Windows Setup's own
-    Panther logs / registry, and writes the result to BOTH the registry
+    active, reads Windows Setup's Microsoft-documented MoSetup progress value,
+    and writes the result to BOTH the registry
     (HKLM:\SOFTWARE\OSUpgradeAutomation) and the JSON status file
     (D:\upgrade_status.json) so Server A can read it either way.
 
@@ -135,9 +135,9 @@ function Get-MoSetupVolatileProgress {
     during the upgrade process using this key" - it spans ALL FOUR phases
     (Downlevel/SafeOS/First boot/Second boot) as ONE continuous, cumulative
     0-100 arc reaching 100% precisely at the end of Second Boot/OOBE - unlike
-    ChildCompletion or the setupact.log regex scan, which are scoped/
-    heuristic per-phase signals. This is the single most authoritative live
-    source available and is tried FIRST.
+    ChildCompletion or setupact.log percentages, which are scoped/heuristic
+    signals and are deliberately not used. This is the sole live Windows
+    Setup percentage source.
     #>
     try {
         $val = (Get-ItemProperty "HKLM:\SYSTEM\Setup\mosetup\Volatile" -Name "SetupProgress" -ErrorAction SilentlyContinue).SetupProgress
@@ -154,47 +154,17 @@ function Get-MoSetupVolatileProgress {
 
 function Get-SetupProgressPercent {
     <#
-    Tries, in order:
-      1. HKLM:\SYSTEM\Setup\mosetup\Volatile\SetupProgress (REG_BINARY) - the
-         OFFICIAL Microsoft-documented overall progress counter, spanning all
-         four phases as one continuous arc (see Get-MoSetupVolatileProgress).
-         When this answers, it is returned as-is with Source="MoSetupRegistry"
-         and should NOT be phase-clamped by the caller - it's already the
-         authoritative overall percentage.
-      2. HKLM:\SYSTEM\Setup\Status\ChildCompletion\setup.exe (DWORD) - an
-         undocumented-but-widely-observed value Windows Setup itself updates
-         with an overall completion percentage during the engine phases.
-      3. Regex scan of the tail of setupact.log for the highest "NN%" value
-         found near lines mentioning progress.
-      Returns $null if none of the three sources yield a usable number
-      (caller should fall back to a phase-based estimate). Otherwise returns
-      a [pscustomobject]@{ Percent; Source } so the caller can tell an
-      authoritative cross-phase reading apart from a scoped/heuristic one.
+    Reads only HKLM:\SYSTEM\Setup\mosetup\Volatile\SetupProgress, the
+    Microsoft-documented overall progress counter spanning all Windows Setup
+    phases. ChildCompletion and Panther percentages are intentionally excluded
+    because they are scoped or heuristic and can make progress appear to jump.
+    Returns $null when the authoritative counter is unavailable; callers carry
+    forward the last verified sample without changing its timestamp.
     #>
     param([string]$LogPath)
 
     $moSetupPct = Get-MoSetupVolatileProgress
     if ($null -ne $moSetupPct) { return [pscustomobject]@{ Percent = $moSetupPct; Source = "MoSetupRegistry" } }
-
-    try {
-        $val = (Get-ItemProperty "HKLM:\SYSTEM\Setup\Status\ChildCompletion" -Name "setup.exe" -ErrorAction SilentlyContinue)."setup.exe"
-        if ($null -ne $val -and $val -is [int] -and $val -ge 0 -and $val -le 100) { return [pscustomobject]@{ Percent = [int]$val; Source = "ChildCompletion" } }
-    } catch {}
-
-    try {
-        if ($LogPath -and (Test-Path $LogPath)) {
-            $tail = Get-Content -Path $LogPath -Tail 200 -ErrorAction SilentlyContinue
-            $best = -1
-            foreach ($line in $tail) {
-                if ($line -match '(?i)progress.*?(\d{1,3})\s*%') {
-                    $n = [int]$Matches[1]
-                    if ($n -gt $best -and $n -le 100) { $best = $n }
-                }
-            }
-            if ($best -ge 0) { return [pscustomobject]@{ Percent = $best; Source = "SetupActLog" } }
-        }
-    } catch {}
-
     return $null
 }
 
@@ -478,6 +448,8 @@ if (Test-Path $script:MarkerRB) {
 
 if ($RebootEvent) {
     if ($lastStatus -eq "InProgress" -and $lastPhase -in @(3, 4)) {
+        Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 1 -Type DWord
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupMissingSinceUtc" -ErrorAction SilentlyContinue
         Set-Phase -Phase 4 -PhaseName "Safe OS Phase (pending/boot transition)" -Status "InProgress" `
             -Notes "Restart requested during Downlevel (Event ID 1074); Safe OS transition is inferred, not confirmed."
     }
@@ -499,6 +471,7 @@ if ($RebootEvent) {
 # removed at the start of every fresh run, so its presence here can only
 # mean THIS run's setupcomplete.cmd genuinely fired.
 if ((Test-Path $script:MarkerOOBE) -and $lastPhase -le 7) {
+    Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
     Set-Phase -Phase 6 -PhaseName "Second Boot (OOBE) Phase" -Status "InProgress" -Notes "PostOOBE hook fired; finalizing configuration/cleanup."
     Invoke-PostUpgradeValidation
     return
@@ -509,21 +482,19 @@ if ($currentBuild -eq $sourceBuild) {
     $setupProc = Get-Process -Name "setuphost","setupprep","setup" -ErrorAction SilentlyContinue
 
     if ($btPresent -and $setupProc) {
+        Set-UpgradeRegistryValue -Name "SetupWasObserved" -Value 1 -Type DWord
+        Set-UpgradeRegistryValue -Name "SetupLastObservedAtUtc" -Value ((Get-Date).ToUniversalTime().ToString("o"))
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupMissingSinceUtc" -ErrorAction SilentlyContinue
         $logPath = "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log"
         $logTail = Get-SetupLogTail -Path $logPath
         if ($logTail) { Set-UpgradeRegistryValue -Name "SetupLogTail" -Value $logTail }
         $result = Get-SetupProgressPercent -LogPath $logPath
         if ($null -ne $result) {
-            # The official MoSetup registry counter is already the
-            # authoritative OVERALL percentage across all 4 phases - do NOT
-            # phase-clamp it. The less authoritative sources (ChildCompletion/
-            # setupact.log regex) are scoped/heuristic, so keep the existing
-            # 55% ceiling for those to avoid over-stating Downlevel progress.
-            $pct = if ($result.Source -eq "MoSetupRegistry") { $result.Percent } else { [math]::Min($result.Percent, 55) }
+            $pct = $result.Percent
             $pctSource = "Measured"
             Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" -PercentComplete $pct -PercentSource $pctSource -Notes "setup.exe actively running on existing OS."
         } else {
-            # No real measurement available yet from ANY of the 3 sources
+            # No authoritative live measurement is available yet
             # (e.g. right at the very first poll after setup.exe launches,
             # before setupact.log/the mosetup registry key exist) - do NOT
             # fabricate an "Estimated" placeholder percentage here anymore
@@ -545,13 +516,47 @@ if ($currentBuild -eq $sourceBuild) {
                 -Notes "Windows Setup exited before Safe OS: $terminalSetupError"
             return
         }
-        # No telemetry can exist here by definition (about to reboot into
-        # WinPE) - omit -PercentComplete so the last real Downlevel reading
-        # (often already well past 55%, sometimes near 100% via the
-        # MoSetup registry) keeps showing instead of dropping to an
-        # artificial, LOWER "Safe OS milestone" that looks like a regression.
-        Set-Phase -Phase 4 -PhaseName "Safe OS Phase (pending/boot transition)" -Status "InProgress" `
-            -Notes "Setup image staged; process not resident - machine likely rebooting into Safe OS/WinPE. No heartbeat expected until First Boot."
+        $expectedDisconnect = [int](Get-UpgradeRegistryValue -Name "ExpectedDisconnect" -Default 0) -eq 1
+        if ($expectedDisconnect) {
+            Set-Phase -Phase 4 -PhaseName "Safe OS Phase (pending/boot transition)" -Status "InProgress" `
+                -Notes "Setup process ended after Event ID 1074 requested a restart; disconnect is expected until First Boot."
+            return
+        }
+
+        $setupWasObserved = [int](Get-UpgradeRegistryValue -Name "SetupWasObserved" -Default 0) -eq 1
+        if (-not $setupWasObserved) {
+            Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" `
+                -Notes "Setup artifacts exist, but this monitor has no prior process observation; waiting without inferring Safe OS or failure."
+            return
+        }
+
+        $nowUtc = (Get-Date).ToUniversalTime()
+        $missingSinceText = Get-UpgradeRegistryValue -Name "SetupMissingSinceUtc"
+        if (-not $missingSinceText) {
+            Set-UpgradeRegistryValue -Name "SetupMissingSinceUtc" -Value $nowUtc.ToString("o")
+            Set-Phase -Phase 3 -PhaseName "Downlevel Phase (Setup process missing)" -Status "InProgress" `
+                -Notes "Setup process is no longer present and no Event ID 1074 reboot evidence exists; starting the ten-minute confirmation window."
+            return
+        }
+
+        try { $missingSinceUtc = [datetime]::Parse($missingSinceText).ToUniversalTime() } catch { $missingSinceUtc = $nowUtc }
+        $missingMinutes = ($nowUtc - $missingSinceUtc).TotalMinutes
+        if ($missingMinutes -ge 10) {
+            $taskResult = "unavailable"
+            try {
+                $taskInfo = Get-ScheduledTaskInfo -TaskName "OSUpgradeSetupLaunch" -ErrorAction Stop
+                if ($taskInfo) { $taskResult = $taskInfo.LastTaskResult }
+            } catch {}
+            $setupActTail = Get-SetupLogTail -Path "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log" -Lines 8 -MaxChars 1200
+            $setupErrTail = Get-SetupLogTail -Path $logPath -Lines 8 -MaxChars 1200
+            $lastObserved = Get-UpgradeRegistryValue -Name "SetupLastObservedAtUtc" -Default "unavailable"
+            Set-Phase -Phase 4 -PhaseName "Windows Setup Failed" -Status "Failed" -PercentComplete 0 `
+                -Notes ("Setup remained absent for {0:N1} minutes without Event ID 1074 reboot evidence. Last observed={1}; scheduled-task LastTaskResult={2}; setuperr tail={3}; setupact tail={4}" -f $missingMinutes, $lastObserved, $taskResult, $setupErrTail, $setupActTail)
+            return
+        }
+
+        Set-Phase -Phase 3 -PhaseName "Downlevel Phase (Setup process missing)" -Status "InProgress" `
+            -Notes ("Setup process remains absent without reboot evidence; failure confirmation window is {0:N1}/10 minutes." -f $missingMinutes)
     } else {
         Write-Log "On source build, no upgrade artifacts detected - leaving phase as-is ($lastPhase)."
     }
@@ -560,6 +565,8 @@ if ($currentBuild -eq $sourceBuild) {
 
 # --- Now on the NEW build: First Boot / OOBE / Post-Upgrade Validation -------
 if ($currentBuild -eq $targetBuild) {
+    Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+    Remove-ItemProperty -Path $script:RegRoot -Name "SetupMissingSinceUtc" -ErrorAction SilentlyContinue
     $setupInProgress  = (Get-ItemProperty "HKLM:\SYSTEM\Setup" -Name "SystemSetupInProgress" -ErrorAction SilentlyContinue).SystemSetupInProgress
     $oobeMarkerExists = Test-Path $script:MarkerOOBE
 
@@ -569,7 +576,7 @@ if ($currentBuild -eq $targetBuild) {
         if ($logTail) { Set-UpgradeRegistryValue -Name "SetupLogTail" -Value $logTail }
         $result = Get-SetupProgressPercent -LogPath $logPath
         if ($null -ne $result) {
-            $pct = if ($result.Source -eq "MoSetupRegistry") { $result.Percent } else { [math]::Max($result.Percent, 60) }
+            $pct = $result.Percent
             $pctSource = "Measured"
             Set-Phase -Phase 5 -PhaseName "First Boot Phase" -Status "InProgress" -PercentComplete $pct -PercentSource $pctSource -Notes "New OS booted; migrating roles/settings (SystemSetupInProgress=1)."
         } else {
