@@ -27,18 +27,17 @@
                    "WinRM connectivity RESTORED" and transparently resumes
                    Active Polling the moment Test-WSMan succeeds again after
                    First/Second Boot - no manual reconnection is ever needed.
-                c. While in either mode, still opportunistically tries the
-                   JSON status file over the admin share
-                   (\\ServerB\D$\upgrade_status.json) and a CIM/WMI registry
-                   read over DCOM/RPC - both are independent of WinRM, so the
-                   progress bar can keep advancing even while WinRM is down.
-                   If those channels are unavailable but WinRM is up, reads
-                   status directly over the authenticated WinRM connection.
+                c. Prefers authenticated WinRM registry reads when available.
+                   Falls back to JSON over the admin share and registry over
+                   CIM/DCOM, both independent of WinRM.
                 d. If NONE of ping/WinRM/file/DCOM succeed, reports a
                    transient "Safe OS / unreachable" state (the one genuine
                    blind window - WinPE has no running Windows services at
                    all for any channel to reach).
-                e. Renders a clean ASCII progress bar + phase/status/mode line.
+                e. Renders native progress (indeterminate until measured) and
+                   periodic console/log tracking lines. Stale snapshots are
+                   labelled unconfirmed; requests the existing phase monitor
+                   on reconnect or staleness without starting Windows Setup.
     Step 4  - Prints a clear success banner once Server B is back online,
               WinRM has reconnected (Active Polling confirmed - not just a
               ping), Status=Completed(/CompletedWithWarnings), and its live
@@ -124,7 +123,8 @@
     Assessment still writes diagnostic reports and may temporarily mount media.
 
 .PARAMETER MonitorOnly
-    Read an existing attempt without staging files or starting an upgrade.
+    Observe an existing attempt without staging files or starting an upgrade.
+    May request the existing status-monitor task on reconnect or stale status.
     Useful for short monitoring checks with -TimeoutMinutes and shorter polling.
 
 .EXAMPLE
@@ -204,6 +204,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "Continue"
 if ($PrecheckOnly -and $MonitorOnly) {
     throw "-PrecheckOnly and -MonitorOnly are mutually exclusive."
 }
@@ -887,6 +888,9 @@ try {
     $lastJsonPoll = [datetime]::MinValue
     $driveLetter = ($StatusJsonPath -split ':')[0]
     $stage12UncPath = "\\$TargetComputer\$driveLetter`$\$(($StatusJsonPath -split ':', 2)[1].TrimStart('\'))"
+    $lastStage12Trail = $null
+    $lastStage12TrailAt = [datetime]::MinValue
+    Write-Progress -Id $stage12ProgressId -Activity $stage12Activity -Status "Waiting for assessment/backup status" -PercentComplete -1
     while ($remoteJob.State -eq 'Running') {
         Write-RemoteStreamsToLog -Job $remoteJob
         $received = Receive-Job -Job $remoteJob -ErrorAction SilentlyContinue
@@ -916,6 +920,12 @@ try {
         }
         if ($null -ne $stage12Pct) { $progressParams["PercentComplete"] = $stage12Pct }
         Write-Progress @progressParams
+        $stage12Trail = "${pctPrefix}Assessment/backup${phaseSuffix}"
+        if ($stage12Trail -ne $lastStage12Trail -or ((Get-Date) - $lastStage12TrailAt).TotalSeconds -ge 30) {
+            Write-Log "[PROGRESS] $stage12Trail | Elapsed: $($elapsed.ToString('mm\:ss'))"
+            $lastStage12Trail = $stage12Trail
+            $lastStage12TrailAt = Get-Date
+        }
         $spinnerIdx++
         Start-Sleep -Seconds 1
     }
@@ -1155,6 +1165,44 @@ function Get-RemoteStatusViaCimDcom {
     }
 }
 
+function Request-RemoteMonitorRefresh {
+    $params = Get-WinRMSessionParams
+    $job = $null
+    try {
+        $job = Invoke-Command @params -AsJob -ScriptBlock {
+            $ErrorActionPreference = "Stop"
+            $state = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation"
+            $build = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuildNumber
+            $task = Get-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -ErrorAction Stop
+            $info = Get-ScheduledTaskInfo -TaskName $task.TaskName -ErrorAction Stop
+            $requested = $false
+            if ($state.Status -eq "InProgress" -and [int]$state.Phase -ge 3 -and $task.State -ne "Running") {
+                Start-ScheduledTask -TaskName $task.TaskName -ErrorAction Stop
+                $requested = $true
+            }
+            [pscustomobject]@{
+                CurrentBuild = $build; TargetBuild = $state.TargetBuild
+                TaskState = [string]$task.State; LastTaskResult = $info.LastTaskResult
+                RefreshRequested = $requested
+            }
+        }
+        if (-not (Wait-Job -Job $job -Timeout 10)) { throw "Monitor refresh request timed out after 10 seconds." }
+        $result = Receive-Job -Job $job -ErrorAction Stop
+        if (-not $result.CurrentBuild -or -not $result.TaskState) { throw "Monitor refresh returned incomplete diagnostics." }
+        Write-Log "Monitor diagnostics: live build=$($result.CurrentBuild), expected build=$($result.TargetBuild), task state=$($result.TaskState), LastTaskResult=$($result.LastTaskResult), refresh requested=$($result.RefreshRequested). A refresh never launches Setup."
+        if ($result.LastTaskResult -notin @(0, 267009, 267011)) {
+            Write-Log "Phase monitor last run failed (LastTaskResult=$($result.LastTaskResult)). Inspect C:\ProgramData\OSUpgradeAutomation\Logs\Update-UpgradeStatus.log and the task action/permissions on $TargetComputer." "WARN"
+        }
+    } catch {
+        Write-Log "Cannot refresh phase tracking: $($_.Exception.Message). Upgrade state remains unconfirmed; inspect OSUpgradePhaseMonitor and target logs. Do not start another upgrade." "WARN"
+    } finally {
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Get-RemoteStatusViaWinRM {
     param([string]$JsonPath, [ref]$ErrorDetail)
     $params = Get-WinRMSessionParams
@@ -1163,6 +1211,17 @@ function Get-RemoteStatusViaWinRM {
         $job = Invoke-Command @params -AsJob -ScriptBlock {
             param($Path)
             $ErrorActionPreference = "Stop"
+            if (Test-Path -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation") {
+                return Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation" |
+                    Select-Object Phase, PhaseName, Status, PercentComplete, PercentSource,
+                        ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent,
+                        ProgressHighWaterStage, StatusUpdatedAtUtc, ExpectedDisconnect,
+                        SourceBuild, TargetBuild, LastUpdated, Notes, PostUpgradeOSCaption,
+                        PostUpgradeBuild, PostUpgradeValidationTime, PostUpgradeValidationResult,
+                        ServicesComparisonResult, ServicesComparisonReportPath,
+                        ServicesAttentionCount, ServicesInfoCount, TargetOSCaption,
+                        LicenseRecommendation, Stage
+            }
             if (Test-Path -LiteralPath $Path) {
                 try {
                     $state = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
@@ -1171,14 +1230,7 @@ function Get-RemoteStatusViaWinRM {
                     Write-Warning "Cannot read status JSON; attempting registry: $_"
                 }
             }
-            Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\OSUpgradeAutomation" |
-                Select-Object Phase, PhaseName, Status, PercentComplete, PercentSource,
-                    ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent,
-                    ProgressHighWaterStage, StatusUpdatedAtUtc, ExpectedDisconnect,
-                    SourceBuild, TargetBuild, LastUpdated, Notes, PostUpgradeOSCaption,
-                    ServicesComparisonResult, ServicesComparisonReportPath,
-                    ServicesAttentionCount, ServicesInfoCount, TargetOSCaption,
-                    LicenseRecommendation, Stage
+            throw "No complete registry or JSON upgrade status is available."
         } -ArgumentList $JsonPath
         if (-not (Wait-Job -Job $job -Timeout 10)) { throw "WinRM status read timed out after 10 seconds." }
         $result = Receive-Job -Job $job -ErrorAction Stop
@@ -1248,6 +1300,21 @@ function Get-UpgradeStatus {
     $winRmOk = Test-RemoteWinRM -ComputerName $ComputerName -Cred $Cred -TimeoutSec 5
     $mode    = if ($winRmOk) { "ActivePolling" } else { "Heartbeat" }
 
+    # Authenticated WinRM avoids repeated SMB timeouts when the admin share
+    # cannot use the supplied credentials, and reads registry ahead of stale JSON.
+    $winRmErr = $null
+    if ($winRmOk) {
+        $winRmStatus = Get-RemoteStatusViaWinRM -JsonPath $JsonPath -ErrorDetail ([ref]$winRmErr)
+        if ($winRmStatus) {
+            $winRmStatus | Add-Member -NotePropertyName PingOk -NotePropertyValue $pingOk -Force
+            $winRmStatus | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $true -Force
+            $winRmStatus | Add-Member -NotePropertyName Mode -NotePropertyValue $mode -Force
+            $winRmStatus | Add-Member -NotePropertyName Source -NotePropertyValue "WinRM" -Force
+            $script:fileDcomDiagLogged = $false
+            return $winRmStatus
+        }
+    }
+
     # Channel A - admin share JSON file (independent of WinRM; needs SMB/admin$ only).
     $driveLetter = ($JsonPath -split ':')[0]
     $uncPath = "\\$ComputerName\$driveLetter`$\$(($JsonPath -split ':', 2)[1].TrimStart('\'))"
@@ -1282,16 +1349,6 @@ function Get-UpgradeStatus {
 
     # WinRM is also a data channel, not just a reachability probe.
     if ($winRmOk) {
-        $winRmErr = $null
-        $winRmStatus = Get-RemoteStatusViaWinRM -JsonPath $JsonPath -ErrorDetail ([ref]$winRmErr)
-        if ($winRmStatus) {
-            $winRmStatus | Add-Member -NotePropertyName PingOk -NotePropertyValue $pingOk -Force
-            $winRmStatus | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $true -Force
-            $winRmStatus | Add-Member -NotePropertyName Mode -NotePropertyValue $mode -Force
-            $winRmStatus | Add-Member -NotePropertyName Source -NotePropertyValue "WinRM" -Force
-            $script:fileDcomDiagLogged = $false
-            return $winRmStatus
-        }
         # This specific combination (WinRM confirmed up, but BOTH the SMB
         # file-share AND CIM/DCOM channels came back empty) used to be
         # completely silent about WHY - it would just show "0%, no status
@@ -1375,12 +1432,13 @@ function Show-ProgressBar {
     regardless of host/redirection quirks.
     #>
     param(
-        [int]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk,
+        [Nullable[int]]$PercentComplete, [string]$PhaseName, [string]$Status, [bool]$PingOk,
         [string]$Mode, [string]$Source, [string]$PercentSource, [string]$Stage,
         $Phase, [int]$EvidenceAgeSec = -1, [int]$ProgressAgeSec = -1
     )
 
-    $pct = [math]::Max(0, [math]::Min(100, $PercentComplete))
+    $pct = if ($null -eq $PercentComplete) { -1 } else { [math]::Max(0, [math]::Min(100, $PercentComplete)) }
+    $pctText = if ($pct -lt 0) { "Awaiting measured progress" } else { "$pct%" }
     # If ping fails but some other channel confirms the host IS actually
     # reachable (Mode isn't "Offline"), showing a flat "OFFLINE" here would
     # visibly contradict "Active Polling"/"Heartbeat" right next to it - this
@@ -1400,7 +1458,7 @@ function Show-ProgressBar {
 
     Write-Progress -Id 1 `
         -Activity "OS upgrade on $TargetComputer   |   $stageText   |   $pingText / $modeText" `
-        -Status   "[$pct% $srcText]  $PhaseName   (Status=$Status, src:$Source, $statusAgeText, $progressAgeText)" `
+        -Status   "[$pctText $srcText]  $PhaseName   (Status=$Status, src:$Source, $statusAgeText, $progressAgeText)" `
         -CurrentOperation (Get-PhaseChecklist -Phase $Phase) `
         -PercentComplete $pct
 }
@@ -1416,7 +1474,7 @@ function Show-ProgressBar {
 # "reconnect"; polling continues on the same interval throughout.
 # =============================================================================
 Write-Log "Entering monitoring loop (poll every $PollIntervalSeconds sec, timeout $TimeoutMinutes min)..."
-Write-Log "Monitoring modes: ACTIVE (WinRM reachable - richest status) / HEARTBEAT (ping-only, WinRM down - expected during SafeOS/reboots) / OFFLINE (no ping response)."
+Write-Log "Monitoring modes: ACTIVE (WinRM reachable) / HEARTBEAT (some channel responds, WinRM down) / OFFLINE (all probes failed; phase unconfirmed)."
 $startTime      = Get-Date
 # Tracks the last CONFIRMED real Phase reading (File/CIM-DCOM) - never the
 # synthetic WinRMOnly/Heartbeat/Offline fallback text ("Safe OS/WinPE
@@ -1464,7 +1522,7 @@ $stallWarningCount = 0
 # Carried forward across polls whenever a poll has no real PercentComplete
 # (e.g. the "WinRMOnly" fallback) - see below for why this must never just
 # reset to a hard 0.
-$lastKnownPercent  = 0
+$lastKnownPercent  = $null
 $lastKnownStage = $null
 $lastKnownPercentSource = "Estimated"
 $lastKnownProgressFreshness = $null
@@ -1497,6 +1555,9 @@ $lastEvidenceChangeAt = Get-Date
 $lastTrailPct         = -1
 $lastTrailPhase       = $null
 $lastTrailAt          = [datetime]::MinValue
+$lastMonitorRefreshAt = [datetime]::MinValue
+$staleStatusWarningReported = $false
+Show-ProgressBar -PercentComplete $null -PhaseName "Waiting for target status" -Status "Unknown" -Mode "ActivePolling" -Stage "Stage 3/3: Windows Setup Execution"
 
 while ($true) {
     $elapsedMin = (New-TimeSpan -Start $startTime -End (Get-Date)).TotalMinutes
@@ -1558,8 +1619,14 @@ while ($true) {
         $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
         $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay"
     } else {
+        if ($status.Stage -and $status.Stage -ne $lastKnownStage) {
+            $lastKnownStage = $status.Stage
+            $lastKnownPercent = $null
+            $lastKnownProgressFreshness = $null
+            $lastProgressUpdatedAtUtc = $null
+        }
         $freshnessForDisplay = if ($lastKnownProgressFreshness) { $lastKnownProgressFreshness } else { "legacy" }
-        $pctSourceForDisplay = "$lastKnownPercentSource/$freshnessForDisplay (cached)"
+        $pctSourceForDisplay = if ($null -eq $lastKnownPercent) { "no verified sample" } else { "$lastKnownPercentSource/$freshnessForDisplay (cached)" }
     }
     if ($null -ne $status.ExpectedDisconnect) { $lastExpectedDisconnect = [bool][int]$status.ExpectedDisconnect }
     $pct = $lastKnownPercent
@@ -1582,6 +1649,22 @@ while ($true) {
         $lastEvidenceChangeAt = Get-Date
     }
     $evidenceAgeSec = [int]((Get-Date) - $lastEvidenceChangeAt).TotalSeconds
+    $statusIsStale = $evidenceAgeSec -ge 150 -and $status.Status -eq "InProgress"
+    if ($status.Mode -eq "ActivePolling" -and $status.Status -notin @("Completed", "CompletedWithWarnings", "Failed", "RolledBack") -and
+        ($lastMode -ne "ActivePolling" -or $statusIsStale) -and
+        ((Get-Date) - $lastMonitorRefreshAt).TotalSeconds -ge 60) {
+        $lastMonitorRefreshAt = Get-Date
+        Request-RemoteMonitorRefresh
+    }
+    if ($statusIsStale) {
+        $displayPhaseName = "$($status.PhaseName) (STALE snapshot; current phase unconfirmed)"
+        if (-not $staleStatusWarningReported) {
+            Write-Log "Target status has not advanced for ${evidenceAgeSec}s. '$($status.PhaseName)' is a stale snapshot, not evidence that the target is still in that phase. Requesting monitor refresh when WinRM is available." "WARN"
+            $staleStatusWarningReported = $true
+        }
+    } else {
+        $staleStatusWarningReported = $false
+    }
     $progressAgeSec = -1
     if ($lastProgressUpdatedAtUtc) {
         try {
@@ -1601,10 +1684,13 @@ while ($true) {
         $lastTrailPct   = $pct
         $lastTrailPhase = $trailPhase
         $lastTrailAt    = Get-Date
-        Add-LogFileLine ("[{0}] [TRACK] {1} | {2} | {3}% ({4}) | Status={5} | Mode={6} | Src={7} | TargetStatusAge={8}s" -f `
+        $trailPercent = if ($null -eq $pct) { "unknown" } else { "$pct%" }
+        $trailLine = ("[{0}] [TRACK] {1} | {2} | {3} ({4}) | Status={5} | Mode={6} | Src={7} | TargetStatusAge={8}s | Stale={9}" -f `
             (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), `
             $(if ($status.Stage) { $status.Stage } else { "Stage -" }), `
-            $trailPhase, $pct, $pctSourceForDisplay, $status.Status, $status.Mode, $status.Source, $evidenceAgeSec)
+            $trailPhase, $trailPercent, $pctSourceForDisplay, $status.Status, $status.Mode, $status.Source, $evidenceAgeSec, $statusIsStale)
+        Add-LogFileLine $trailLine
+        Write-Host $trailLine
     }
 
     # --- Explicit Active-Polling <-> Heartbeat transition logging ------------
@@ -1665,7 +1751,7 @@ while ($true) {
     # takes to reconnect, and gets explained in one shot the moment a real
     # reading resumes. Only fires for the normal 1-7 sequence (99=RolledBack
     # is a different, already-explained branch, not a "missed phase").
-    if ($null -ne $status.Phase) {
+    if ($null -ne $status.Phase -and -not $statusIsStale) {
         $curPhaseNum = [int]$status.Phase
         if ($null -ne $lastObservedPhaseNum -and $curPhaseNum -gt $lastObservedPhaseNum -and ($curPhaseNum - $lastObservedPhaseNum) -gt 1 -and $curPhaseNum -le 7) {
             $skippedNums  = ($lastObservedPhaseNum + 1)..($curPhaseNum - 1)
@@ -1694,7 +1780,7 @@ while ($true) {
     # an impossible backward phase regression (Safe OS -> Downlevel) appear
     # to happen, when Windows Setup's own model is strictly linear
     # (Downlevel -> Safe OS -> First Boot -> OOBE) and never goes backward.
-    if ($null -ne $status.Phase) {
+    if ($null -ne $status.Phase -and -not $statusIsStale) {
         if ($status.PhaseName -ne $lastConfirmedPhaseName) {
             if ($null -eq $lastConfirmedPhaseName) {
                 # The VERY FIRST real reading ever - there's nothing to

@@ -53,16 +53,21 @@ Automates and remotely monitors an in-place Windows Server OS upgrade:
 
 ## Architecture / who does what (for ServiceNow or any other remote-trigger integration)
 Three scripts run ON Server B and own ALL phase/percent tracking - Server A
-never computes progress itself, it only ever READS what Server B already
-computed, via one of three independent channels (file share / registry-via-
-CIM-DCOM / nothing-during-the-genuine-WinPE-blind-window):
+never computes progress itself: it reads what Server B computed over
+authenticated WinRM, file share or CIM/DCOM. It may request the existing
+monitor to refresh stale status; no channel supplies live progress during
+the genuine WinPE blind window:
 - **`Start-TargetUpgrade.ps1`** (Server B) - runs prechecks + backup, then
   sets Phase 1 -> 2 -> 3 as it progresses through its own steps, before ever
   launching `setup.exe`. This is the ONLY phase/percent writer that runs
   synchronously as part of the kickoff call itself.
 - **`Update-UpgradeStatus.ps1`** (Server B) - the actual phase/percent
   ENGINE for everything from Downlevel onward. Registered as a recurring
-  2-minute Scheduled Task (`OSUpgradePhaseMonitor`) by `Start-TargetUpgrade.ps1`,
+  2-minute and startup Scheduled Task (`OSUpgradePhaseMonitor`) by
+  `Start-TargetUpgrade.ps1`. A SYSTEM probe must succeed before Setup is
+  launched, and the first normal run is requested after the starter lock is
+  released. Server A also requests the existing monitor on reconnect or stale
+  status, without launching Setup or restarting an already-running monitor.
   PLUS invoked immediately by three
   event hooks: the Event-ID-1074 watcher task (`OSUpgradeRebootWatcher`,
   fires the instant a restart is initiated), and Windows Setup's own

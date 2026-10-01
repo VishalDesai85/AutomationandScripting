@@ -276,6 +276,16 @@ foreach ($phase in @(3, 5, 6)) {
     Assert-Equal $script:state.Phase $(if ($phase -eq 3) { 4 } else { $phase }) 'Reboot events affect only downlevel'
 }
 $RebootEvent = $false
+foreach ($terminal in @('Completed', 'CompletedWithWarnings', 'Failed')) {
+    Reset-Fixture
+    $script:state.Status = $terminal
+    $script:state.Phase = 7
+    $RebootEvent = $true
+    Invoke-TestStatusPoll
+    Assert-Equal $script:state.Phase 7 'Later reboot events cannot downgrade a terminal phase'
+    Assert-Equal $script:state.Status $terminal 'Later reboot events retain terminal outcomes'
+}
+$RebootEvent = $false
 
 Reset-Fixture
 $script:build = $script:state.SourceBuild
@@ -330,6 +340,18 @@ $script:setupInProgress = $null
 Invoke-TestStatusPoll
 Assert-Equal $script:state.Status 'InProgress' 'Missing Setup state is not treated as finished'
 Reset-Fixture
+$script:build = '20348'
+Invoke-TestStatusPoll
+Assert-Equal $script:state.Status 'Failed' 'A finished third build cannot be mistaken for the ISO target'
+Assert-Equal ($script:state.Notes -match 'Build mismatch') $true 'Unexpected target build exposes validation failure'
+Reset-Fixture
+$script:build = '20348'
+$script:setupInProgress = 1
+Invoke-TestStatusPoll
+Assert-Equal $script:state.Phase 5 'An unexpected booted build is exposed instead of repeating Downlevel'
+Assert-Equal $script:state.Status 'InProgress' 'An unexpected build still processing Setup cannot claim success'
+Assert-Equal ($script:state.Notes -match '20348.+17763') $true 'Unexpected build reports actual and expected builds'
+Reset-Fixture
 $script:state.SourceBuild = $script:state.TargetBuild
 Invoke-TestStatusPoll
 Assert-Equal $script:state.Status 'InProgress' 'Same-build equality alone cannot prove completion'
@@ -348,6 +370,25 @@ Assert-Equal $script:state.Status 'InProgress' 'Same-build equality alone cannot
     Assert-Equal (Write-StatusJson) $true 'JSON writer reports successful publication'
     $script:jsonSuccess = $false
     Assert-Equal (Write-StatusJson) $false 'JSON writer reports failed publication for retry'
+}
+
+& {
+    $writer = $asts['OSUpgradeShared.ps1'].Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-StatusJson'
+    }, $true)
+    . ([scriptblock]::Create($writer.Extent.Text))
+    function Move-Item { param($Path, $Destination, [switch]$Force) }
+    function Out-File {
+        param([Parameter(ValueFromPipeline)]$InputObject, $FilePath, $Encoding, [switch]$Force)
+        process { $script:publishedJson = $InputObject }
+    }
+    Reset-Fixture
+    $script:state.LastUpdated = '2026-10-01 04:25:41'
+    $script:StatusJson = 'D:\upgrade_status.json'
+    $null = Write-StatusJson
+    $published = $script:publishedJson | ConvertFrom-Json
+    Assert-Equal $published.LastUpdated '2026-10-01 04:25:41' 'Republishing JSON does not refresh a frozen phase timestamp'
 }
 
 foreach ($status in @($null, '', 'InProgress', 'Unexpected')) {

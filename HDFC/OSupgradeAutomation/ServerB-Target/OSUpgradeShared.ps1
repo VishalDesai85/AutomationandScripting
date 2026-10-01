@@ -132,7 +132,7 @@ function Write-StatusJson {
             TargetOSCaption              = Get-SnapshotValue $reg "TargetOSCaption"
             Stage                        = Get-SnapshotValue $reg "Stage"
             StartTime                    = Get-SnapshotValue $reg "StartTime"
-            LastUpdated                  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            LastUpdated                  = Get-SnapshotValue $reg "LastUpdated"
             Notes                        = Get-SnapshotValue $reg "Notes"
             SetupLogTail                 = Get-SnapshotValue $reg "SetupLogTail"
             PostUpgradeOSCaption         = Get-SnapshotValue $reg "PostUpgradeOSCaption"

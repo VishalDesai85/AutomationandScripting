@@ -1552,7 +1552,7 @@ foreach ($f in @("Update-UpgradeStatus.ps1","OSUpgradeShared.ps1","Remove-Upgrad
     }
 }
 
-# --- Register the 5-minute phase/progress monitor ----------------------------
+# --- Register the phase/progress monitor ------------------------------------
 $monitorScript = Join-Path $script:ScriptsDir "Update-UpgradeStatus.ps1"
 $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`""
 # Interval shortened from 5 to 2 minutes (2026-07-20): on a fast upgrade, Safe
@@ -1562,55 +1562,44 @@ $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoPro
 # and jumps straight to Phase 6). 2 minutes meaningfully narrows that blind
 # spot without materially increasing overhead (still a lightweight registry/
 # log-tail read).
-$trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3)
+$trigger   = @(
+    New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2) -RepetitionDuration (New-TimeSpan -Days 3)
+    New-ScheduledTaskTrigger -AtStartup
+)
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
 
 Unregister-ScheduledTask -TaskName $script:TaskMonitor -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $script:TaskMonitor -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
-Write-Log "Registered scheduled task '$script:TaskMonitor' (every 2 min, persists across reboots)."
+$probeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -Probe"
+Register-ScheduledTask -TaskName $script:TaskMonitor -Action $probeAction -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+Remove-ItemProperty -Path $script:RegRoot -Name "MonitorReadyAtUtc" -ErrorAction SilentlyContinue
+Start-ScheduledTask -TaskName $script:TaskMonitor -ErrorAction Stop
+$monitorReady = $false
+for ($probeAttempt = 0; $probeAttempt -lt 30; $probeAttempt++) {
+    Start-Sleep -Seconds 1
+    $probeTask = Get-ScheduledTask -TaskName $script:TaskMonitor -ErrorAction Stop
+    if ((Get-UpgradeRegistryValue -Name "MonitorReadyAtUtc") -and $probeTask.State -ne "Running") {
+        $probeInfo = Get-ScheduledTaskInfo -TaskName $script:TaskMonitor -ErrorAction Stop
+        if ($probeInfo.LastTaskResult -ne 0) {
+            throw "Phase monitor SYSTEM probe exited with LastTaskResult=$($probeInfo.LastTaskResult). Refusing to launch Setup without tracking. Inspect $script:LogDir\Update-UpgradeStatus.log."
+        }
+        $monitorReady = $true
+        break
+    }
+}
+if (-not $monitorReady) {
+    $probeInfo = Get-ScheduledTaskInfo -TaskName $script:TaskMonitor -ErrorAction Stop
+    throw "Phase monitor SYSTEM probe did not pass within 30 seconds (LastTaskResult=$($probeInfo.LastTaskResult)). Refusing to launch Setup without tracking. Inspect $script:LogDir\Update-UpgradeStatus.log and the task action/permissions."
+}
+Set-ScheduledTask -TaskName $script:TaskMonitor -Action $action -ErrorAction Stop | Out-Null
+Write-Log "Verified SYSTEM phase monitor; registered every 2 min plus startup to survive reboots."
 
 # --- Register the event-triggered Safe OS watcher (Event ID 1074) -----------
 try {
     Unregister-ScheduledTask -TaskName $script:TaskReboot -Confirm:$false -ErrorAction SilentlyContinue
-    $regCmds = @(
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Phase /t REG_DWORD /d 4 /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v PhaseName /t REG_SZ /d `"Safe OS Phase`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Status /t REG_SZ /d `"InProgress`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ExpectedDisconnect /t REG_DWORD /d 1 /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Notes /t REG_SZ /d `"Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot.`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v LastUpdated /t REG_SZ /d `"%date% %time%`" /f"
-    )
-    # This task deliberately runs via cmd.exe/reg.exe (not PowerShell) so it
-    # fires instantly/reliably in the narrow pre-shutdown window right
-    # before the real reboot - which means it can never call the Set-Phase
-    # PowerShell function, and so never mirrors into OSUpgradeProgress.log
-    # the way every other phase transition does. That left Phase 4 (Safe OS)
-    # completely invisible in that durable log, even though the live
-    # registry WAS updated correctly. Fix (2026-07-20): append one more
-    # command to the SAME cmd.exe chain that echoes a matching line straight
-    # into OSUpgradeProgress.log - no PowerShell dependency added, just a
-    # plain redirected echo, using the already-known $backupFolder path
-    # baked in at task-REGISTRATION time (this task itself only ever runs
-    # once, later, when Event ID 1074 fires).
-    #
-    # Deliberately does NOT touch PercentComplete/PercentSource at all
-    # anymore (2026-07-20 follow-up): this reg.exe chain used to hardcode a
-    # fake "40% (Estimated)" Safe OS milestone, which could visibly LOWER
-    # the displayed percentage below whatever real Downlevel reading (via
-    # the MoSetup registry, sometimes already in the 90s%) had just been
-    # measured moments before reboot - looking like a regression for no
-    # reason. Simply not writing those two values here leaves the registry's
-    # last real Measured percent untouched/still showing through Safe OS.
-    if ($backupFolder -and (Test-Path $backupFolder)) {
-        $progressLogPath = Join-Path $backupFolder "OSUpgradeProgress.log"
-        $regCmds += "echo [%date% %time%] [Stage 3/3: Windows Setup Execution] Phase=4 (Safe OS Phase) Status=InProgress Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot. Percent unchanged from last real Downlevel reading (no telemetry possible in WinPE). >> `"$progressLogPath`""
-    }
-    # Keep the direct registry writes first because they are the quickest path
-    # in the narrow pre-shutdown window. Then let the mutex-protected shared
-    # writer mirror ExpectedDisconnect and the carried progress into JSON.
-    $regCmds += "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootEvent"
-    $rebootAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c " + ($regCmds -join " && "))
+    # All restarts raise 1074, including later boot phases. Use the guarded
+    # writer so a later restart cannot overwrite Phase 5/7 with Downlevel/Safe OS.
+    $rebootAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootEvent"
     $eventTriggerClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace "Root/Microsoft/Windows/TaskScheduler"
     $eventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
     $eventTrigger.Subscription = @'
@@ -1730,6 +1719,15 @@ try {
         throw "setup.exe was not observed within 60 seconds. Treating kickoff as failed rather than assuming a slow start. Scheduled-task LastTaskResult=$taskResult. Check '$script:TaskSetupRun' history and Panther setupact.log/setuperr.log."
     }
 
+    $script:StarterMutex.ReleaseMutex()
+    $script:OwnsStarterMutex = $false
+    try {
+        Start-ScheduledTask -TaskName $script:TaskMonitor -ErrorAction Stop
+        Write-Log "Started phase monitor after releasing the starter lock; tracking is independent of the WinRM kickoff session."
+    } catch {
+        Write-Log "Setup is running, but the phase monitor could not be started: $_. Check scheduled-task state and Update-UpgradeStatus.log; Server A will retry monitor refresh without another upgrade kickoff." "ERROR"
+    }
+
     if ($UseControlledReboot) {
         Write-Log "UseControlledReboot specified: waiting for the setup.exe process to exit before triggering the first restart..."
         while (Get-Process -Name $setupProcNames -ErrorAction SilentlyContinue) { Start-Sleep -Seconds 15 }
@@ -1738,7 +1736,7 @@ try {
         # this point real Measured data from setupact.log/mosetup registry
         # has likely already progressed well past any such guess; simply
         # leave the last real value in place.
-        Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" -Notes "Staging complete; controlled reboot imminent."
+        Write-Log "Staging complete; controlled reboot imminent. The independent monitor owns phase/progress state."
         Start-Sleep -Seconds 60
         Restart-Computer -Force
     }
@@ -1756,6 +1754,7 @@ Write-Log "Start-TargetUpgrade.ps1 completed its kickoff work and is exiting. Mo
 } finally {
     if ($script:OwnsStarterMutex) {
         $script:StarterMutex.ReleaseMutex()
+        $script:OwnsStarterMutex = $false
     }
     $script:StarterMutex.Dispose()
 }

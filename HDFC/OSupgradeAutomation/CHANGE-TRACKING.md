@@ -1,3 +1,37 @@
+## 2026-10-01 - Frozen Downlevel snapshot and progress visibility
+
+The supplied WS2019 run returned the kickoff snapshot (`Launching setup.exe`,
+04:25:41) through later reconnects, without a measured Setup percentage.
+This establishes stalled status publication, not the underlying task exception;
+the target monitor log/task result is needed to distinguish execution, locking
+and publication failures. Its ISO selected Server 2025 build 26100, not
+Server 2022 build 20348.
+
+- Require a bounded SYSTEM monitor probe before Setup, explicitly start normal
+  monitoring after releasing the starter lock, and add a startup trigger.
+  Release occurs at confirmed Setup handoff, before any controlled-reboot wait,
+  so `-UseControlledReboot` cannot starve all Downlevel monitor invocations.
+- Replace the unguarded Event 1074 `cmd.exe/reg.exe` phase overwrite with the
+  shared guarded updater. Later reboots cannot downgrade a completed phase.
+- Log monitor entry, lock deferrals and exceptions before any silent early
+  return caused by lock contention.
+- Prefer authenticated WinRM registry status ahead of potentially stale JSON;
+  retain the original status timestamp when republishing JSON.
+- Mark snapshots unchanged for 150 seconds as stale. Request an existing monitor
+  run at initial connection/reconnect or during staleness, throttled to once a
+  minute; report live build, task state/result and errors without starting Setup.
+- Show an indeterminate native bar until a verified percentage exists, enable
+  progress rendering and mirror progress to periodic console text.
+- Report a booted build differing from both source and ISO target explicitly;
+  a finished mismatched build fails validation rather than remaining Downlevel.
+- Add isolated tests for unknown/measured progress, exact stale thresholds,
+  bounded monitor probing/refresh, later reboot guards, timestamp retention,
+  and unexpected-build validation. Existing build-confirmed success remains
+  required.
+
+See [README.md](README.md#progress-visibility-and-stale-status-recovery) for
+recovery of an existing stalled attempt without a second upgrade kickoff.
+
 ## Original-code comparison baseline
 
 This document was checked against the original codebase supplied for reference:
@@ -22,7 +56,7 @@ Key capabilities confirmed as **new relative to the supplied baseline**:
 | Capability | Original baseline | Current implementation |
 | --- | --- | --- |
 | Assessment without backup/Setup (`-PrecheckOnly`) | Not present | Added |
-| Read-only resume/observation (`-MonitorOnly`) | Not present | Added |
+| Resume/observation without starting Setup (`-MonitorOnly`) | Not present | Added; may refresh the existing phase-monitor task |
 | Lab-only DISM ScanHealth skip (`-SkipDismScanHealthLab`) | Not present | Added |
 | Lab-only SFC scan skip (`-SkipSfcScanNowLab`) | Not present | Added |
 | Cross-process starter mutex | Not present | Added |

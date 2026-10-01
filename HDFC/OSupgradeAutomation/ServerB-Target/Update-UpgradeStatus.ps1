@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs on a schedule (every 2 minutes, registered by Start-TargetUpgrade.ps1)
+    Runs on a schedule (every 2 minutes and startup, registered by Start-TargetUpgrade.ps1)
     on Server B. Detects which phase of the in-place upgrade is currently
     active, reads Windows Setup's Microsoft-documented MoSetup progress value,
     and writes the result to BOTH the registry
@@ -40,11 +40,16 @@
     Called by the Event ID 1074 watcher. Marks an inferred Safe OS transition
     only while the run is InProgress in Downlevel/Safe OS, never after boot
     progression or terminal completion.
+
+.PARAMETER Probe
+    Internal pre-kickoff SYSTEM task check. Opens the shared mutexes, loads
+    status helpers and records registry writability without changing phase.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$RebootEvent
+    [switch]$RebootEvent,
+    [switch]$Probe
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,26 +63,55 @@ $script:MarkerOOBE  = Join-Path $script:BaseDir "postoobe.marker"
 $script:MarkerRB    = Join-Path $script:BaseDir "rollback.marker"
 $script:LogFile     = Join-Path $script:LogDir "Update-UpgradeStatus.log"
 
+if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
+    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
+}
+
 # Scheduled polls, reboot events and Setup hooks can overlap. Keep each
 # read/transition/JSON publication together, including terminal validation.
-$starterMutex = [System.Threading.Mutex]::new($false, "Global\OSUpgradeAutomation.StartTargetUpgrade")
-$statusMutex = [System.Threading.Mutex]::new($false, "Global\OSUpgradeAutomation.Status")
+$starterMutex = $null
+$statusMutex = $null
 $ownsStarterMutex = $false
 $ownsStatusMutex = $false
 try {
+    Write-Log "Monitor invoked (RebootEvent=$RebootEvent, Probe=$Probe)."
+    $starterMutex = [System.Threading.Mutex]::new($false, "Global\OSUpgradeAutomation.StartTargetUpgrade")
+    $statusMutex = [System.Threading.Mutex]::new($false, "Global\OSUpgradeAutomation.Status")
+    if ($Probe) {
+        if (-not (Test-Path $script:RegRoot)) { throw "Monitor probe requires initialized upgrade state." }
+        try {
+            $ownsStatusMutex = $statusMutex.WaitOne(0)
+        } catch [System.Threading.AbandonedMutexException] {
+            $ownsStatusMutex = $true
+        }
+        if (-not $ownsStatusMutex) { throw "Monitor probe could not acquire the status lock." }
+        . (Join-Path $PSScriptRoot "OSUpgradeShared.ps1")
+        Set-UpgradeRegistryValue -Name "MonitorReadyAtUtc" -Value ((Get-Date).ToUniversalTime().ToString("o"))
+        Write-Log "SYSTEM scheduled-task probe passed; status helpers loaded and registry is writable."
+        return
+    }
     try {
         $ownsStarterMutex = $starterMutex.WaitOne(0)
     } catch [System.Threading.AbandonedMutexException] {
         $ownsStarterMutex = $true
     }
     # Starter owns initial state/marker resets; never inspect a partial run.
-    if (-not $ownsStarterMutex) { return }
+    if (-not $ownsStarterMutex) {
+        Write-Log "Monitor deferred: the starter still owns the initialization lock." "WARN"
+        return
+    }
     try {
         $ownsStatusMutex = $statusMutex.WaitOne(30000)
     } catch [System.Threading.AbandonedMutexException] {
         $ownsStatusMutex = $true
     }
-    if (-not $ownsStatusMutex) { return }
+    if (-not $ownsStatusMutex) {
+        Write-Log "Monitor deferred: the status lock was busy for 30 seconds." "WARN"
+        return
+    }
     # An obsolete task/hook must not recreate a run after cleanup.
     if (-not (Test-Path $script:RegRoot)) { return }
 
@@ -85,14 +119,6 @@ try {
 # so this script does not need its own parameter to stay in sync.
 $script:StatusJson = (Get-ItemProperty $script:RegRoot -Name "StatusJsonPath" -ErrorAction SilentlyContinue).StatusJsonPath
 if (-not $script:StatusJson) { $script:StatusJson = "D:\upgrade_status.json" }
-
-if (-not (Test-Path $script:LogDir)) { New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null }
-
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    Add-Content -Path $script:LogFile -Value $line -Encoding UTF8
-}
 
 # Status/phase tracking (Set-UpgradeRegistryValue, Get-UpgradeRegistryValue,
 # Write-StatusJson, Set-Phase) used to be copy-pasted between this script and
@@ -600,10 +626,19 @@ if ($currentBuild -eq $targetBuild) {
     } else {
         Write-Log "On target build, current phase $lastPhase unchanged - waiting."
     }
+} elseif ($currentBuild -ne $sourceBuild) {
+    Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+    $setupInProgress = (Get-ItemProperty "HKLM:\SYSTEM\Setup" -Name "SystemSetupInProgress" -ErrorAction SilentlyContinue).SystemSetupInProgress
+    Set-Phase -Phase 5 -PhaseName "Unexpected OS build" -Status "InProgress" `
+        -Notes "Live build $currentBuild differs from source $sourceBuild and expected target $targetBuild; upgrade success is not verified."
+    if ($setupInProgress -eq 0) { Invoke-PostUpgradeValidation }
 }
+} catch {
+    Write-Log "Status monitor failed: $($_.Exception.Message)" "ERROR"
+    throw
 } finally {
     if ($ownsStatusMutex) { $statusMutex.ReleaseMutex() }
-    $statusMutex.Dispose()
+    if ($statusMutex) { $statusMutex.Dispose() }
     if ($ownsStarterMutex) { $starterMutex.ReleaseMutex() }
-    $starterMutex.Dispose()
+    if ($starterMutex) { $starterMutex.Dispose() }
 }

@@ -95,11 +95,13 @@ $script:probePing = $false
 $script:probeWinRm = $true
 function Test-Connection { param($ComputerName, $Count, [switch]$Quiet, $ErrorAction) $script:probePing }
 function Test-RemoteWinRM { param($ComputerName, $Cred, $TimeoutSec) $script:probeWinRm }
-function Read-RemoteFileWithTimeout { param($Path, $TimeoutSec, [ref]$ErrorDetail) '{"unexpected":"payload"}' }
+$script:fileReads = 0
+function Read-RemoteFileWithTimeout { param($Path, $TimeoutSec, [ref]$ErrorDetail) $script:fileReads++; '{"unexpected":"payload"}' }
 function Invoke-CimMethod { param($CimSession, $Namespace, $ClassName, $MethodName, $Arguments) [pscustomobject]@{ ReturnValue = 2 } }
 $script:jobResult = [pscustomobject]@{ Phase = 3; Status = 'InProgress' }
 $result = Get-UpgradeStatus -ComputerName TestVM -JsonPath 'D:\status.json'
 Assert-True ($result.Source -eq 'WinRM' -and $result.Mode -eq 'ActivePolling' -and -not $result.PingOk) 'Blocked ICMP/SMB/DCOM still permits authenticated WinRM status'
+Assert-True ($script:fileReads -eq 0) 'Available authenticated WinRM avoids blocking on admin-share timeouts first'
 $script:jobResult = $null
 foreach ($probe in @(
     @{ Ping = $false; WinRm = $true; Mode = 'ActivePolling' },
@@ -164,6 +166,13 @@ $status.Status = 'Failed'
 $status.PercentComplete = 0
 . $updatePercentage
 Assert-True ($lastKnownPercent -eq 0) 'Terminal failure is not hidden by monotonic clamp'
+$status.Status = 'InProgress'
+$status.Stage = 'Stage 3/3'
+$status.PercentComplete = $null
+$lastKnownPercent = 100
+$lastKnownStage = 'Stage 2/3'
+. $updatePercentage
+Assert-True ($null -eq $lastKnownPercent -and $pctSourceForDisplay -eq 'no verified sample') 'New Setup stage cannot carry forward backup completion while its percentage is unknown'
 
 $targetPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'ServerB-Target\Start-TargetUpgrade.ps1'
 $targetTokens = $null
@@ -175,8 +184,12 @@ $targetText = $targetAst.Extent.Text
 $orchestratorText = $ast.Extent.Text
 $targetParameterNames = @($targetAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
 Assert-True ($targetParameterNames -contains 'PrecheckOnly') 'Target starter exposes PrecheckOnly'
-Assert-True ($targetText -match 'ExpectedDisconnect.+REG_DWORD.+/d 1') 'Event 1074 watcher records an expected disconnect without percentage changes'
+Assert-True ($targetText -notmatch 'reg\.exe add.+/v Phase') 'Event 1074 watcher cannot bypass phase/terminal guards with direct registry writes'
 Assert-True ($targetText -match 'monitorScript.+-RebootEvent') 'Event 1074 watcher mirrors its evidence through the shared JSON writer'
+Assert-True ($targetText -match 'New-ScheduledTaskTrigger -AtStartup') 'Target monitor runs at startup, not only on the repetition clock'
+Assert-True ($targetText -match 'Refusing to launch Setup without tracking') 'SYSTEM monitor health is required before Setup kickoff'
+Assert-True ($targetText -match '(?s)StarterMutex\.ReleaseMutex\(\).+Start-ScheduledTask -TaskName \$script:TaskMonitor') 'First normal monitor invocation occurs after starter lock release'
+Assert-True ($targetText -match '(?s)StarterMutex\.ReleaseMutex\(\).+Start-ScheduledTask -TaskName \$script:TaskMonitor.+if \(\$UseControlledReboot\)') 'Controlled-reboot waiting cannot hold the starter lock and starve Downlevel monitoring'
 Assert-True ($orchestratorText -match 'ProgressFreshness, ProgressUpdatedAtUtc, ProgressHighWaterPercent') 'WinRM status projection includes progress evidence metadata'
 Assert-True ($orchestratorText -match 'ExpectedDisconnect\s*=\s*Get-UpgradeRegDWord') 'DCOM status projection includes expected-disconnect evidence'
 Assert-True ($orchestratorText -match 'expected reboot disconnect after Event ID 1074') 'Connectivity-gap display distinguishes an expected reboot'
