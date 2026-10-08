@@ -44,12 +44,22 @@ Important values include:
 | `RunId` / `Sequence` | Stable run identity and monotonically increasing publication number |
 | `PercentComplete` / `OverallPercentComplete` | Monotonic end-to-end workflow percentage; the legacy name is retained for consumers |
 | `StagePercentComplete` | Local 0-100 progress inside the active stage |
+| `PhasePercentComplete` | Local 0-100 value for the current technical phase; resets at a phase boundary |
 | `PercentSource` | Whether the retained numeric value is measured or estimated |
 | `ProgressSource` | Concrete producer, such as task count, MoSetup, Event 1074, or validation |
 | `ProgressFreshness` | `Live`, `Milestone`, `CarriedForward`, or `Terminal` |
 | `ProgressUpdatedAtUtc` / `StatusUpdatedAtUtc` | Separate numeric-sample and status-publication timestamps |
-| `ExpectedDisconnect` | True only while Phase 4 predicts the WinPE blind window |
+| `ExpectedDisconnect` | A restart request was observed; not proof of Safe OS, and never an exemption from liveness checks |
 | `RebootCount` / `LastObservedBootTimeUtc` / `BootEvidence` | Unique boots counted by `LastBootUpTime`, corroborated by Events 12 and 6005 |
+| `UnexpectedRestartAtUtc` | Kernel-Power Event 41 corroborates an unexpected restart |
+| `SetupPhaseHistory` | Current-run Setup execution starts, with original timestamps and evidence; includes phases recovered retrospectively |
+| `MonitorLastError` | Explicit target monitor error, retained for the orchestrator to report |
+| `VerifiedTargetBuild` / `CompletionEvidence` | Local validation result and PostOOBE or clear-Setup-flags evidence |
+| `UserProfileCount` / `SpecialProfileCount` / `TotalProfileCount` | Non-special user profiles, system profiles, and their total from `Win32_UserProfile` |
+| `LoadedUserProfileCount` / `UserProfileInventoryPath` | Loaded non-special count and per-profile CSV location |
+| `DirtyBitCheckStatus` / `OrphanedProfileCheckStatus` | Explicit precheck outcome, including `Unknown` or an explicitly `Skipped` orphan check |
+| `UserProfileInventoryStatus` | `Collected` or `Unavailable`; profile counting is warning-only with no blocking threshold |
+| `PendingFileRenameCheckStatus` | Outcome of only the pending-file-rename gate; bypass does not apply to CBS/Windows Update |
 | `SourceBuild` | Windows build before Setup starts |
 | `TargetBuild` | Build extracted from the selected WIM/ESD image |
 | `StatusJsonPath` | Location of the externally readable JSON status file |
@@ -57,10 +67,16 @@ Important values include:
 | `StartTime` / `LastUpdated` | Run and latest-state timestamps |
 | `Notes` | Current detailed status or failure reason |
 
-The weighted ranges are fixed: prechecks 0-10, backup 10-25, Windows Setup
-25-95, and post-upgrade validation 95-100. A missing live sample never resets
-the value; the last verified high-water remains visible with freshness and
-timestamp metadata. Failure and rollback retain that high-water.
+The fixed workflow ranges are prechecks 0-10, backup 10-25, Downlevel 25-50,
+Safe OS 50-70, First Boot 70-85, Second Boot 85-95, and validation 95-100.
+These are workflow weights, not elapsed-time predictions or a copy of Setup's
+UI percentage. The supplied September 29 log reaches Downlevel 100% before
+Safe OS begins, so the MoSetup counter must not map directly into 25-95.
+`SetupTelemetryPercent` and `SetupTelemetryPhase` preserve the raw observation.
+`StagePercentComplete` remains cumulative across the whole Setup stage.
+Missing telemetry carries the last verified value; a confirmed phase boundary
+can advance its milestone. Failure/rollback retain the high-water. Only a
+successful terminal validation publishes 100 overall.
 
 The default target JSON is `D:\upgrade_status.json`. The orchestrator can read
 it through `\\ServerB\D$\upgrade_status.json` without using WinRM. Every write
@@ -94,6 +110,10 @@ File: `ServerA-Orchestrator/Start-RemoteUpgradeOrchestrator.ps1`
 
 `TargetComputer` is mandatory. `Credential` is optional, so an omitted value
 means integrated authentication using the account running the orchestrator.
+When `-Credential` is supplied, WinRM explicitly uses `-Authentication Negotiate`,
+matching the customer-tested reference script. No additional orchestrator
+switch is needed. Calls without explicit credentials retain their existing
+authentication defaults.
 
 The following values are passed to the target script:
 
@@ -105,6 +125,13 @@ The following values are passed to the target script:
 - `DisableAutoCleanup`: prevents cleanup-task registration.
 - `SkipPatchCheckLab`: changes a patch failure to a warning.
 - `SkipSystemStateBackup`: deliberately omits `wbadmin`.
+- `SkipOrphanedProfileCheck`: explicitly skips only the blocking SID-resolution
+  check, logs WARN/Skipped, and leaves profile counting and other gates enabled.
+- `SkipUserProfileCountCheck`: deprecated, accepted for command-line
+  compatibility only. Inventory and its duration warning always run; no
+  profile-count bypass is needed.
+- `SkipPendingFileRenameCheck`: bypasses only the `PendingFileRenameOperations`
+  blocker. It still reports operations and does not delete the registry value.
 - `MinVMwareToolsVersion`: minimum accepted Tools version on VMware.
 - `UseControlledReboot`: adds `/NoReboot` and lets the target script restart.
 - `MaxPatchAgeDays`: hotfix-age fallback threshold.
@@ -113,6 +140,13 @@ The remaining parameters control only Server A monitoring. The default normal
 poll is 15 seconds, the disconnected poll is 5 seconds, and the total monitor
 window is 180 minutes. `LocalStatusMirrorPath` optionally overrides the
 always-readable Server A JSON mirror location.
+`StatusStaleWarningMinutes` defaults to five and applies even when the same
+old status file remains readable. Each individual monitoring probe is bounded;
+the poll interval is the sleep after those probes, not a guaranteed sampling rate.
+`FinalValidationTimeoutSeconds` defaults to 60. Once the target reports
+completion, the orchestrator shows one "Validating update for a few seconds"
+message and retries live verification within this separate short budget
+(also capped by the remaining overall monitoring budget).
 
 `$ErrorActionPreference = "Stop"` promotes most PowerShell errors into
 terminating errors. Local `try/catch` blocks then decide which failures are
@@ -164,6 +198,17 @@ HTTPS is only added when the operator explicitly supplied
 `Get-WinRMSessionParams` converts that selection into one splatted hashtable.
 Every later PSSession and Invoke-Command uses the same transport and optional
 credential.
+Explicit-credential Negotiate also applies to all three probe transports,
+the independent WinRM JSON reader, the live status/build reader (including
+final validation), and the read-only readiness command. Session-based staging,
+file copies, and target kickoff inherit the authenticated PSSession. The
+independent DCOM fallback is unchanged.
+
+Negotiate selects Kerberos or NTLM according to the target/account context
+and Windows policy. It does not enable WinRM, open firewalls, bypass HTTPS
+certificate checks, or edit TrustedHosts. IP-address/workgroup targets still
+need an approved HTTPS or narrowly scoped TrustedHosts configuration and
+permission to use the negotiated authentication mechanism.
 
 ### 3.4 Local-file and reachability preflight
 
@@ -191,16 +236,20 @@ evidence:
 - The age of `C:\$WINDOWS.~BT\Sources\Panther\setupact.log`.
 - The current OS caption and build from `Win32_OperatingSystem`.
 
-`Status=InProgress` is considered genuinely active only if a Setup process is
-present or the Panther log is younger than five minutes.
+For precheck/backup state, activity evidence still helps distinguish abandoned
+kickoff work. Once Setup has been entered (Phase 3 or later), unresolved
+`InProgress` state always resumes monitoring, even with no Setup process.
+Otherwise a forced reset or missing completion hook could cause a second
+Setup launch and destroy useful diagnostic state.
 
 The decision table is:
 
 | Stored condition | Orchestrator action |
 |---|---|
 | In progress plus live evidence | Set `resumeExisting`; do not copy or relaunch |
-| Completed or completed with warnings | Set `resumeExisting`; print an already-upgraded banner |
-| In progress without live evidence | Treat as stale and perform a normal kickoff |
+| Completed or completed with warnings | Resume final live verification; a stored completion record alone is not success |
+| In progress at Phase 3 or later without live evidence | Resume monitoring and reconcile interruption/completion; never relaunch Setup |
+| Precheck/backup state without live evidence | Allow normal kickoff, subject to the target's own guard |
 | No usable state or query failure | Assume a new run |
 
 The target script independently repeats the active/stale test. That duplication
@@ -252,16 +301,22 @@ failure code.
 
 ### 3.8 Status acquisition channels
 
-`Get-UpgradeStatus` performs all four checks on every poll:
+`Get-UpgradeStatus` probes connectivity and selects usable status in this order:
 
 1. ICMP ping.
 2. A bounded WinRM probe using the previously selected transport.
-3. JSON through the drive's administrative share.
-4. Registry values through CIM with a DCOM session.
+3. When WinRM is up, a bounded live registry/build/Setup-flags read on the target.
+4. JSON through the drive's administrative share.
+5. Registry values through CIM with a DCOM session (eight-second whole-read cap).
+6. WinRM JSON fallback if the live helper could not be used.
 
-The first rich status source wins: JSON before DCOM. WinRM does not itself
-return the status payload; it proves remote-management liveness. This is why a
-`WinRMOnly` synthetic result can exist.
+Live WinRM status takes precedence over a stale SMB file. A stale file does
+not suppress a newer DCOM sequence. Different run IDs and older sequences are
+rejected. The live probe also requests the target status task when publication
+is stale, a new boot is observed, or the target build is ready for validation.
+If the task was lost during upgrade, it recreates only the status monitor from
+the already-staged script. It never relaunches Setup. Missing scripts, disabled
+tasks, and repair errors are surfaced rather than treated as success.
 
 Modes mean:
 
@@ -301,25 +356,52 @@ polls. This is an observation gap, not necessarily an execution gap.
 
 `PhaseStallWarningMinutes` only emits escalating warnings. It never changes
 status or stops the loop.
+The independent five-minute status watchdog also works during complete
+outages and when repeated reads return the same old snapshot. The progress
+display, console, and mirror's `Observer.HealthWarning` report the last phase
+and the need to check the target. `Observer.ProducerStatusAgeSeconds` is the
+age of publication, distinct from the age of the last successful read.
+Historical Setup phase starts are printed once per run with their original
+timestamps and explicitly labeled as recovered, not live observations.
 
 Every poll also updates the Server A mirror. File/DCOM records replace the
 producer snapshot; WinRM-only, heartbeat, offline, timeout, and polling-error
 records update only `Observer`, preserving `RunId`, `Sequence`, phase, and
 percentage from the last target-produced status.
 
-The loop terminates in three ways:
+The loop terminates in four ways:
 
 - Server B reports `Failed`.
 - Server B reports a successful terminal state, WinRM is active, and the build
   is independently confirmed.
 - Server A's overall monitoring timeout expires.
+- The target reports completion but Server A cannot verify it within the
+  final-validation grace period.
 
-For HTTPS, build confirmation creates a matching HTTPS CIM session. After
-eight failed independent build queries, the orchestrator accepts Server B's
-terminal state because Server B's own validation already checked the build.
+Final verification uses the same bounded WinRM live observation and resolved
+HTTP/HTTPS transport. The live build must match and both
+`SystemSetupInProgress` and `OOBEInProgress` must be present and zero. Failed
+queries never become success after a retry count; the overall deadline still
+ends monitoring with an unverified outcome.
+`Wait-UpgradeCompletion` checks immediately, with five-second delays between
+subsequent retries and a probe timeout no larger than its remaining budget.
+The progress UI shows "Validating update..." instead of repeated console
+warnings. Detailed errors still go to the orchestrator log and local mirror.
+A verified result prints the normal summary immediately. An exhausted grace
+period produces an explicit validation error; `Observer.ConnectivityMode`
+becomes `ValidationFailed`, with an explanation in `ObservationError` and
+`HealthWarning`. The target's producer status is preserved: inability to
+verify does not prove that the OS upgrade itself failed.
+
+The October 1 attached console output came from an older copy that supplied
+`-Credential` to `Get-CimInstance`, which has no such parameter. This is not
+fixed by waiting for the OS. The current code authenticates `Invoke-Command`
+over WinRM and queries CIM locally inside that remote context instead.
+Deploy the updated repository scripts, not the older attached text copy.
 
 The process exits `0` for either successful terminal state, `1` for failure,
-and `2` for timeout. Timeout does not stop Server B.
+`2` for overall monitoring timeout, and `3` for unconfirmed final validation.
+Neither observer timeout stops Server B or relaunches Setup.
 
 ## 4. Target Kickoff Script
 
@@ -344,8 +426,11 @@ Phase 3-7     -> Stage 3/3: Windows Setup Execution
 Phase 99      -> Stage 3/3: Windows Setup Execution (Rolled Back)
 ```
 
-The caller supplies local stage progress. `Set-Phase` maps it into the fixed
-overall range and refuses to lower either the stage value or overall value.
+The caller supplies local phase progress (local stage progress for prechecks
+and backup). `Set-Phase` maps it into the fixed phase range and refuses to lower
+overall progress. A phase counter resets at the next phase instead of inheriting
+Downlevel 100. Late in-progress writers cannot overwrite a terminal result or
+regress a confirmed phase; a rollback hook can still report failure.
 When no new number exists, it carries the prior sample and its source/timestamp
 forward. Status changes still receive a new sequence and status timestamp.
 
@@ -357,7 +442,9 @@ the requested privilege.
 ### 4.2 Local stale-state protection
 
 The target reads prior phase/status, process activity, and Panther log age. If
-an in-progress attempt still looks alive, it throws immediately.
+an in-progress attempt still looks alive, or has already reached Setup, it
+throws immediately. An unresolved Setup attempt is not auto-cleaned just
+because its process disappeared.
 
 Otherwise it removes old task registrations, registry state, and marker files.
 It renames an old `$WINDOWS.~BT` folder rather than recursively deleting it.
@@ -371,7 +458,7 @@ The new run then writes Phase 1, Status `InProgress`.
 1. Add a formatted line to the dedicated report.
 2. Log PASS, WARN, or FAIL.
 3. Add warnings or failures to their respective aggregate.
-4. Increment the completed-check count and publish `done / 14 * 100`.
+4. Increment the completed-check count and publish `done / 16 * 100`.
 
 A FAIL does not throw at the check site. This guarantees that the operator gets
 all detected blockers in one run.
@@ -388,12 +475,34 @@ role also blocks.
 **Free space:** `Get-PSDrive` reads free bytes on the actual system-drive
 letter. The value is converted to GB and compared with `MinFreeSpaceGB`.
 
+**Disk dirty bits:** `fsutil dirty query` checks every enumerated local fixed
+NTFS volume, including mounted volumes without a drive letter. The system
+volume must be included. Localized output can use the typed
+`Win32_Volume.DirtyBitSet` value. A dirty volume, failed command, or unknown
+result blocks the upgrade. No `dirty set`, dirty-bit clearing, CHKDSK repair, or
+automatic reboot is performed; repairs require an approved maintenance action.
+
 **Pending reboot:** the code checks the CBS `RebootPending` key, Windows Update
-`RebootRequired`, and `PendingFileRenameOperations`. Any finding blocks.
+`RebootRequired`, and `PendingFileRenameOperations`. All findings block by
+default. `-SkipPendingFileRenameCheck` removes only queued rename/delete
+operations from the blocking decision, with an explicit WARN/Skipped record.
+CBS and Windows Update still block, as do unreadable registry queries. Queue
+entries are never cleared, including under the bypass.
+
+The shared helper and the read-only `Test-UpgradeReadiness.ps1` retain
+`RebootPending`, `Reasons`, and `Operations` as observed facts. The new
+`UpgradeBlocked` and `BlockingReasons` reflect the effective decision after
+the explicit bypass. Therefore `RebootPending=true, UpgradeBlocked=false`
+is possible and is reported as bypassed, not as a clean reboot state.
 
 **DISM:** `Dism.exe /Online /Cleanup-Image /ScanHealth` output is captured in a
 separate log. An explicit no-corruption phrase passes. A recognized corruption
 phrase blocks. Unknown output or execution failure warns.
+Only `/ScanHealth` is executed, before SFC. `/RestoreHealth` appears only in
+manual remediation guidance; no repair task is launched after SFC by these
+scripts. Later `Get-WindowsImage` metadata queries and installation of the
+Windows Server Backup feature use Windows servicing, but are not a scripted
+DISM repair. This sequence is intentionally unchanged.
 
 **SFC:** `sfc.exe /scannow` output is saved. The script also scans recent CBS
 lines for scan-period `[SR]` corruption entries. A clean SFC summary passes.
@@ -432,14 +541,39 @@ non-VMware machines pass as not applicable.
 are queried in separate 15-second jobs. Their builds are compared with the
 target build. This always reports WARN because remote reachability and CAL
 installation cannot be proven reliably here. When the RDS Session Host role is
-not installed, the code only writes an informational log and does not call
-`Add-PreCheckResult`. That means the nominal 14-check percentage can finish at
-13/14, or 92 percent, on non-RDS systems even though the gate succeeds.
+not installed, the check reports a not-applicable PASS and counts as one
+completed check.
+
+**Profile inventory:** `Win32_UserProfile` counts all registered profiles, with
+separate user (`Special=false`), system/special, total, and loaded-user counts.
+This counts profiles, not account objects or every directory under `C:\Users`.
+It includes local, domain, and orphaned user profiles returned by that provider.
+The counts and duration-risk note go to the console, precheck report, registry,
+status JSON, mirror, and final summary. A per-profile CSV is written to the
+target logs and copied into the run's backup folder for retention.
+**Profile counts never block the upgrade, including counts above 25.** Every
+successful inventory reports WARN with the actual non-special user count:
+
+> Detected X user profiles on the target server. Systems with a higher number
+> of user profiles may experience increased upgrade time due to additional
+> profile migration and processing activities during setup.
+
+The same result includes the loaded/system/total counts and CSV location.
+An unavailable inventory or CSV write failure is explicitly reported as a
+non-blocking warning; an unknown count is not fabricated as zero. The removed
+`UserProfileCountCheckStatus` / `UserProfileCountLimit` fields and count-gate
+summary are no longer published. `-SkipUserProfileCountCheck` remains accepted
+for compatibility, logs that it is deprecated, and changes nothing: inventory
+and warnings still run. The separate orphan-account and other safety gates
+remain unchanged. No profiles are removed automatically.
 
 **Orphaned profiles:** each `S-1-5-21-*` ProfileList SID is translated to an
 NT account. Translation failure means the registry profile no longer maps to a
 live account. Confirmed orphans block. An inability to evaluate the registry
 warns instead of blocking.
+`-SkipOrphanedProfileCheck` bypasses SID resolution and this gate only, with an
+explicit WARN/Skipped record. It defaults off, does not run remediation, and
+does not skip the independent profile inventory or disk health checks.
 
 For confirmed orphans, the script writes a separate remediation script beside
 the staged target script. That generated script is self-discovering, requires
@@ -474,7 +608,11 @@ The tasks are:
 1. Export all services and their status/start type to
    `Services_PreUpgrade.csv`.
 2. Enable backup privileges and run `reg.exe save` for SYSTEM, SOFTWARE, SAM,
-   and SECURITY into real hive files.
+   SECURITY, and `HKU\.DEFAULT` into real hive files. The added artifact is
+   `Registry\HKU_.DEFAULT.hiv` inside the run's backup folder. This backs up
+   the registry hive, not the `C:\Users\Default` profile template. A save
+   failure retains the existing per-hive WARN policy and is never logged as
+   a successful save.
 3. Mirror Local Group Policy and GroupPolicyUsers with `robocopy`.
 4. If supplied, run `LGPO.exe /b` and parse machine/user Registry.pol files.
 5. Export local security policy with `secedit.exe`.
@@ -504,12 +642,14 @@ three days. It also fires at startup and for Kernel-General Event 12 or EventLog
 Event 6005. `MultipleInstances IgnoreNew` prevents overlapping invocations.
 `LastBootUpTime` is the unique reboot identity; Events 12/6005 only corroborate
 the boot and can safely trigger duplicate refresh attempts.
+The task has a ten-minute execution limit so a hung invocation cannot suppress
+future runs indefinitely. A separate monitor mutex serializes scheduled and
+direct hook invocations; the status writer has its own publication mutex.
 
 `OSUpgradeRebootWatcher` uses a Task Scheduler event trigger for User32 Event
-ID 1074. Its action is deliberately a short `cmd.exe` chain that directly
-writes Phase 4 registry fields immediately before shutdown, followed by a
-best-effort status-engine action that atomically publishes JSON/history. It
-does not invent a percentage.
+ID 1074. Its best-effort action records a restart request while preserving the
+current phase. Arbitrary restart events, outage durations, and WinRM/SMB
+availability are not sufficient proof of Safe OS.
 
 `OSUpgradeAutoCleanup` runs once at kickoff plus `RetentionDays`. The timer is
 from kickoff, not completion. Cleanup later checks whether status is terminal.
@@ -573,17 +713,30 @@ D:\UpgradeBackup\<run>\OSUpgradeProgress.log
 It handles either a byte array or numeric representation and accepts only
 values from 0 through 100.
 
-`Get-SetupProgressPercent` accepts only MoSetup's documented overall
+`Get-SetupProgressPercent` accepts only MoSetup's documented
 `SetupProgress`. `ChildCompletion` and percentage-like text in `setupact.log`
 are intentionally excluded because they are scoped implementation details, not
-reliable end-to-end counters. Panther tails are retained only for diagnostics.
+reliable end-to-end counters. MoSetup itself is used only within the current
+phase's range, never as proof of completion.
 When MoSetup is absent, callers preserve the last sample and mark it
 `CarriedForward`.
 
+`Get-SetupPhaseEvidence` separately recognizes actual `SP Executing phase [...]`
+and `OPERATIONTRACK ExecuteOperations: Start execution phase ...` events from
+the current run, using `SetupLaunchTimeUtc` to reject old attempts. Queued
+operations and `Add phase` lines are not execution evidence. Both Panther log
+locations are inspected. File length/write-time signatures avoid rescanning
+unchanged logs; the earliest confirmed start per phase is persisted in
+`SetupPhaseHistory`. Safe OS can be recovered retrospectively even though this
+solution has no monitor running inside WinPE.
+
 ### 5.3 Post-upgrade validation
 
-`Invoke-PostUpgradeValidation` accumulates issues instead of failing at the
-first one.
+`Invoke-PostUpgradeValidation` first requires registry and live OS builds to
+match the expected target. A build mismatch is Failed, never a successful
+upgrade with warnings. An unavailable core query leaves validation pending
+with `MonitorLastError` for retry; it does not publish false success.
+Noncritical edition/licensing/service issues are then accumulated.
 
 It checks current build against target build and current edition against source
 edition. It compares pre/post activation and writes a complete human-readable
@@ -612,24 +765,30 @@ Order is important:
    return.
 3. If the rollback marker exists, set Phase 99/Failed, copy SetupDiag results
    when available, remove active tasks, and return.
-4. If the OOBE marker exists and status is nonterminal, set Phase 6 when needed,
+4. On a restart notification, record the request without changing the phase.
+   Otherwise update boot evidence and current-run Setup phase history.
+5. If the OOBE marker exists and status is nonterminal, set Phase 6 when needed,
    validate, and return. A later invocation resumes an interrupted Phase 7
    validation without regressing to Phase 6.
-5. If current build equals source build, distinguish Downlevel from a likely
-   Safe OS transition.
-6. If current build equals target build, distinguish First Boot, OOBE, and the
-   fallback completed state.
+6. On the target build, clear Setup/OOBE flags plus no Setup process can also
+   trigger validation when the hook was missed, including an interrupted Phase 7.
+7. On the source build, track Setup liveness; a prior restart request is not
+   an exemption from the missing-process deadline.
+8. Otherwise identify First Boot/OOBE from live state and execution evidence,
+   or report an unexpected-build failure.
 
 ### 5.5 Downlevel branch
 
 When a Setup process exists, the engine captures a Panther tail for diagnostics
 and publishes Phase 3. Only MoSetup can update the numeric value.
 
-The engine enters Phase 4 only after Event 1074 has set explicit reboot intent;
-a vanished process alone is not treated as SafeOS. Without reboot evidence, a
-missing Setup process starts a ten-minute grace period. If no process or reboot
-evidence returns, the run becomes terminal `Failed` with scheduled-task and
-Panther diagnostic guidance.
+A missing Setup process on the source OS immediately publishes an ATTENTION
+note and starts a persistent ten-minute grace period, even if Phase 4 or
+`ExpectedDisconnect` was stored by an older watcher. If the process resumes,
+the timer clears. Otherwise the run becomes Failed with its last phase,
+boot/reset evidence, task result, and diagnostic paths. A reset that leaves
+the target unreachable is reported by Server A's stale-status watchdog;
+network loss alone does not prove that Setup failed.
 
 ### 5.6 New-build branch
 
@@ -640,8 +799,10 @@ value is carried forward.
 If the OOBE marker exists, it publishes the deterministic 100% Setup milestone
 (95% overall) at Phase 6 and immediately validates.
 
-If `SystemSetupInProgress=0` but the marker is unexpectedly missing, the engine
-uses this as a fallback completion signal and still performs validation.
+If both Setup and OOBE flags are present and zero, no Setup process remains,
+and the live build is the target, the engine can validate without the marker.
+Unknown flags are not zero. Interrupted Phase 7 validation is retried on either
+completion-evidence path.
 
 ## 6. Windows Setup Hook Files
 
@@ -699,13 +860,14 @@ The script never removes `D:\UpgradeBackup` or `WindowsImageBackup`.
 10. The monitor, reboot watcher, cleanup, and Setup tasks are registered.
 11. Server B enters Phase 3 and starts the Setup task as SYSTEM.
 12. The remote kickoff job returns; Server A closes its PSSession.
-13. The status task maps MoSetup progress into the overall 25-95 range.
-14. Event 1074 marks Phase 4 immediately before reboot.
+13. The status task maps Downlevel MoSetup progress into overall 25-50.
+14. Event 1074 records a restart request without asserting Safe OS.
 15. During WinPE, all target channels can be unavailable; Server A keeps its
    local JSON mirror readable and marks the producer snapshot carried forward.
 16. At startup, Event 12/6005 trigger a refresh; `LastBootUpTime` increments
    the unique reboot count and both events are recorded as corroboration.
-17. On the target build, the status task can observe Phase 5.
+17. On the target build, the status task can observe Phase 5 and recovers any
+    missed Safe OS/First Boot starts from the actual Setup execution log.
 18. Windows Setup executes `setupcomplete.cmd` after OOBE.
 19. The marker causes Phase 6 at 95% overall followed immediately by validation.
 20. Validation writes Phase 7 and 100% with a successful terminal status.
@@ -740,8 +902,8 @@ The ISO can already be mounted because media inspection is itself a precheck.
 An orchestrator timeout is not an upgrade failure. Server A exits two, but
 Server B's Setup process, scheduled tasks, hooks, registry, and JSON remain.
 
-When the same command is run again, resume detection sees either live Setup
-evidence or a completed terminal state. It skips a second kickoff and resumes
+When the same command is run again, unresolved Phase 3-or-later state or a
+completed terminal record skips a second kickoff and resumes
 monitoring/reporting. The Server A mirror is loaded from disk first, so its last
 producer `RunId`, sequence, phase, and percentage remain available while the
 target is still offline; `Observer.CacheState` is `RecoveredFromDisk` until a

@@ -1,6 +1,6 @@
 # OS Upgrade Automation — Project Context & Session Notes
 
-_Last updated: 2026-09-09 (orphaned-profile remediation expanded into three explicit options - per-SID commands, bulk copy/paste block, and a GENERATED ready-to-run Remove-OrphanedProfiles.ps1 on the target staging folder - plus a matching orchestrator failure banner branch; earlier same day: added automatic WinRM HTTPS/5986 fallback on Server A - previously every WinRM call hardcoded the HTTP/5985 default and a target with only a 5986 listener could never be reached; new -UseSSL / -SkipCertificateCheck switches. Previously: 2026-08-26 - added a 14th precheck, "Target media build is newer than current OS build" - hard FAIL, explicit customer decision - after a real TestVM2 run showed same-version media passes every existing check and launches a no-op repair-install; also fixed the SourceBuild==TargetBuild phase-detection stuck-at-Safe-OS bug and the stale cross-stage PercentComplete/PercentSource leak; added System State backup as backup task 8/8; enhanced the RDS Session Host CAL license server precheck; carried over the 2026-07-28 DISM/SFC revert-to-FAIL decision, the 2026-07-26 SFC/scannow + CBS.log check addition, orphaned-profiles hard FAIL + self-discovering cleanup script, and the 2026-07-24 GUI-percentage/task-count-based Stage 1/2 work)_
+_Last updated: 2026-10-08 (profile counting reverted to warning-only; removed the >25 blocking threshold while retaining inventory and other safety checks)._
 
 > **How to use this file**: In a new chat session, tell me to "read
 > `PROJECT-NOTES.md` in OSUpgradeAutomation1 and continue" - that gives me
@@ -13,7 +13,214 @@ _Last updated: 2026-09-09 (orphaned-profile remediation expanded into three expl
 > ask me to refresh it.
 
 ## What this solution does
-### Latest Fix: Precheck/Backup Display And Pending Reboot Diagnostics
+### Latest Change: Profile Counts Are Warning-Only
+
+- Removed the user-profile-count blocking gate, including the limit of 25.
+  Successful inventory now always reports a non-blocking warning with the
+  actual non-special user count:
+
+  > Detected X user profiles on the target server. Systems with a higher number
+  > of user profiles may experience increased upgrade time due to additional
+  > profile migration and processing activities during setup.
+
+- User, loaded-user, system/special, and total profile counts remain available
+  in the precheck report, registry/JSON, mirror, and final inventory summary.
+  The CSV is still produced and retained with the backup. Inventory/CSV errors
+  remain explicit warnings, not blockers or fabricated zero counts.
+- Removed the obsolete count-limit/status fields and count-gate failure/summary
+  messages. `-SkipUserProfileCountCheck` is no longer needed but remains accepted
+  for compatibility with existing launch commands; it logs a deprecation notice
+  and does not suppress inventory or the requested warning.
+- The 16-check accounting and other safety gates are unchanged, including
+  orphaned-profile detection, disk health, pending reboot, and the explicit
+  pending-file-rename override. Negotiate authentication and bounded final
+  validation are unchanged.
+- Updated regression cases assert the exact warning for 0, 24, 25, 26, and 1000
+  user profiles, non-blocking inventory/CSV errors, legacy-switch compatibility,
+  and continued blocking for independent safety failures.
+
+### Previous Changes: Final Validation, Profile Limit, Rename Bypass, And Backup
+
+- WinRM authentication follow-up: integrated the supplied text reference's
+  `Authentication=Negotiate` whenever explicit credentials are supplied.
+  Applied consistently to HTTP/HTTPS/certificate-bypass probes, resume and
+  staging sessions, WinRM JSON reads, live status/build/final-validation
+  reads, and `Test-UpgradeReadiness.ps1`. Session-based copy/kickoff inherits
+  those settings. No extra public switch is required; use `-Credential $cred`.
+  Without credentials, existing current-user authentication defaults are
+  retained. DCOM, certificate-validation policy, and TrustedHosts are unchanged.
+  Negotiate does not bypass a customer's NTLM/Kerberos policy; IP/workgroup
+  connections may still require approved HTTPS or a narrowly scoped
+  TrustedHosts entry. Offline tests reproduce rejection without Negotiate
+  and cover both credential modes across all three WinRM transports,
+  HTTP-to-HTTPS fallback, and temporary-session cleanup.
+
+- The October 1 noise attachment identifies an unsupported `-Credential`
+  parameter supplied to `Get-CimInstance` in an older orchestrator, not a
+  normal delay fetching the new OS. The repository already uses authenticated
+  WinRM with local queries inside the remote session. Keep this corrected
+  transport path and deploy the repository version, not the old attached
+  text copy.
+- Once the target reports Completed/CompletedWithWarnings, Server A now shows
+  one **"Validating update for a few seconds"** message. It checks immediately
+  and retries with five-second delays for up to 60 seconds, configurable with
+  `-FinalValidationTimeoutSeconds` (1-600), capped by the remaining overall
+  monitoring budget. Successful verification prints the summary immediately.
+  Retry details go to the log and status mirror instead of repeated warnings
+  on the console.
+- If completion remains unverified, the orchestrator prints an explicit
+  error and exits **3**. The mirror's `Observer.ConnectivityMode` becomes
+  `ValidationFailed`; `ObservationError`/`HealthWarning` explain the reason.
+  Producer status is not rewritten to Failed merely because the observer
+  cannot verify it. A genuine target rollback/failure still exits 1; overall
+  monitoring timeout still exits 2. No unverified-success fallback is used.
+- The October 7 >25-user-profile gate and its bypass were superseded on
+  October 8 by the warning-only behavior described above. No count threshold
+  or profile-count bypass is required.
+- New **`-SkipPendingFileRenameCheck`** bypasses only
+  `PendingFileRenameOperations`; **CBS RebootPending and Windows Update
+  RebootRequired remain blocking**. Registry access failures still block.
+  The queue is never deleted and detected operations remain in diagnostics.
+  The switch is available on Server A, Server B, and the read-only
+  `Test-UpgradeReadiness.ps1` command.
+- Reboot diagnostics retain `RebootPending`, `Reasons`, and `Operations` as
+  observed facts. `UpgradeBlocked` and `BlockingReasons` describe the effective
+  gate after an explicit bypass. The read-only command can therefore report
+  a pending queue but no remaining blocker, clearly labeled as bypassed rather
+  than a clean reboot state. `PendingFileRenameCheckStatus` is exposed through
+  registry/JSON, all reader channels, and the final summary. The obsolete
+  profile-count gate fields were removed in the October 8 change.
+- Registry backup now also saves **`HKU\.DEFAULT`** to
+  `D:\UpgradeBackup\<run>\Registry\HKU_.DEFAULT.hiv` (or the corresponding
+  custom backup root). It uses the same `reg.exe save`, privilege handling,
+  and explicit per-hive warning policy as existing hives. The eight-task
+  backup count and 16 logical prechecks remain unchanged.
+- DISM/SFC investigation found only **DISM `/ScanHealth` before SFC
+  `/scannow`**. `/RestoreHealth` is printed as manual remediation guidance,
+  not executed after SFC. Later WIM inspection (`Get-WindowsImage`) and
+  installation of the Windows Server Backup feature can use servicing, but
+  are not a scripted repair. This behavior is unchanged; the exact origin of
+  any external repair task requires its process/task history.
+
+The pending-file-rename bypass is deliberate risk acceptance and must not be
+enabled by default. Example after approval, from the project directory on Server A:
+
+```powershell
+.\ServerA-Orchestrator\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer ServerB `
+    -SkipPendingFileRenameCheck `
+    -FinalValidationTimeoutSeconds 60
+```
+
+Read-only inspection using the same narrow reboot decision:
+
+```powershell
+.\ServerA-Orchestrator\Test-UpgradeReadiness.ps1 -TargetComputer ServerB -SkipPendingFileRenameCheck
+```
+
+Offline regression remains:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Test-ProgressAndReadiness.ps1
+```
+
+Coverage includes warning-only profile counts, counts distinct from system
+profiles, independent default-off safety bypasses, actual aggregate gate rejection for other checks,
+unknown inventory/CSV errors, CBS/WU preservation, exact default-hive output
+and save failure, quiet validation with and without credentials, transient
+recovery, short deadlines, wrong builds/runs, missing flags, rollback, and
+the exit-3 summary. These are offline tests with mocked Windows I/O, not
+certification of a live upgrade. Use the complete updated companion set on
+a disposable target VM before customer deployment.
+
+### Previous Fix: Phase Evidence, Reset Recovery, Completion, And Readiness
+
+This section supersedes historical claims below that Event 1074 proves Safe OS
+or that the Downlevel MoSetup counter is a cumulative end-to-end percentage.
+
+- The supplied September 29 Setup log reaches Downlevel 100% at 17:30:25,
+  starts Safe OS at 17:31:01, First Boot work at 17:31:17, and OOBE work at
+  17:32:23 (timestamps as written in the log). Log replay verified all four
+  phases. The console log in the repository is dated July 19 and must not be
+  treated as the same run as that September attachment.
+- Workflow weighting is now prechecks 0-10, backup 10-25, Downlevel 25-50,
+  Safe OS 50-70, First Boot 70-85, OOBE 85-95, and validation 95-100.
+  These are workflow weights, not time estimates. `PhasePercentComplete`
+  resets at phase boundaries; `StagePercentComplete` still covers the whole
+  Setup stage. Downlevel 100 can no longer pin a new run at overall 95.
+- `SetupPhaseHistory` records actual execution-start events from both Panther
+  locations, filtered by this run's Setup launch time. Planned/queued phases
+  are ignored. Unchanged files are not rescanned. Safe OS/short First Boot
+  phases are printed with their original timestamps after services return,
+  explicitly as recovered evidence, not live telemetry from WinPE.
+- WinRM up with SMB down does **not** establish Safe OS. It can reflect service
+  startup, a normal/new-OS boot, rollback, or network policy. Event 1074 also
+  records only a restart request. Connectivity gaps keep the last confirmed
+  phase and percentage; they never manufacture a new phase.
+- On the source OS, no Setup process immediately produces an ATTENTION note.
+  After ten minutes without recovery it becomes Failed with the last phase,
+  boot/reset evidence, task result, and log guidance. A prior Phase 4 or
+  `ExpectedDisconnect` no longer disables this check. A resumed process clears
+  the timer. A genuine unreachable/WinPE interval is not automatically failed.
+- Server A warns after five minutes of stale/unavailable status, even if an
+  old JSON file remains readable. `-StatusStaleWarningMinutes` controls that
+  warning. It reports publication age separately from successful read age in
+  `Observer`, alongside `HealthWarning` and live OS evidence. Payload reads are
+  bounded; the whole DCOM read is capped at eight seconds and the live WinRM
+  probe at fifteen. The poll interval is additional sleep, not an exact sample rate.
+- Live WinRM registry/build/Setup-flags observations take precedence over stale
+  SMB data. An outdated/missing status monitor is refreshed or recreated from
+  its already-staged script, without relaunching Setup. Monitor tasks have a
+  ten-minute execution limit; a mutex also serializes direct hook invocations.
+  Unresolved Setup state resumes monitoring even when no Setup process exists;
+  it is not auto-cleaned and relaunched after a reset.
+- A missing PostOOBE hook can be reconciled from the target build, clear Setup
+  and OOBE flags, and absent Setup processes. Interrupted Phase 7 validation is
+  retried with or without the marker. Wrong builds are Failed, not
+  CompletedWithWarnings. Server A requires a fresh matching live build and
+  clear flags before declaring success; repeated read failures no longer
+  become success. The overall monitor deadline remains an unverified timeout,
+  not proof that the upgrade itself failed.
+- Full prechecks now have 16 logical steps. Disk dirty-bit validation runs
+  `fsutil dirty query` on local fixed NTFS volumes (including the system
+  volume); a dirty, unreadable, or unknown result blocks. Typed CIM dirty-bit
+  data supports localized utility output. No disk repair, dirty-bit
+  modification, or automatic remedial reboot is performed.
+- `-SkipOrphanedProfileCheck` defaults off and is passed from Server A to B.
+  It explicitly records WARN/Skipped and bypasses only SID-to-account
+  resolution. It neither deletes profiles nor disables any other check.
+- Profile inventory always runs, even with that switch: non-special user,
+  special/system, total registered, and loaded-user counts from
+  `Win32_UserProfile`. Counts and a duration-risk note are reported in the
+  console/precheck report, registry/JSON, Server A mirror, and final summary.
+  Per-profile details are saved to CSV and retained with the backup. The
+  October 8 change makes counts warning-only with no threshold; unavailable
+  counts are still unknown, never fabricated as zero.
+
+Example explicit orphan-check bypass (all other checks remain enabled):
+
+```powershell
+.\ServerA-Orchestrator\Start-RemoteUpgradeOrchestrator.ps1 -TargetComputer ServerB -SkipOrphanedProfileCheck
+```
+
+Offline regression, optionally replaying a supplied Setup log:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Test-ProgressAndReadiness.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Test-ProgressAndReadiness.ps1 -SetupLogPath C:\Logs\setupact.log
+```
+
+Tests cover phase weighting/history, forced-reset grace/failure, legacy reboot
+state, missing hooks, interrupted validation, wrong builds, watchdogs,
+stale-SMB precedence, monitor repair without Setup relaunch, transport identity,
+real local-job timeout/cleanup, dirty-bit decisions, bypass wiring, and exact
+profile counts. Windows I/O is mocked except temporary test artifacts and
+optional read-only log replay. This is not a live full-upgrade certification;
+retest the successful-upgrade and forced-reset scenarios on a disposable VM.
+Deploy the complete updated companion set, not just the Server A script.
+Existing runs retain their already-published high-water percentage; the new
+phase weights apply cleanly to new runs.
+
+### Previous Fix: Precheck/Backup Display And Pending Reboot Diagnostics
 
 - Startup follow-up: `SourceFilesPath` is now resolved in the script body,
   not in a parameter default that can see an empty `$PSScriptRoot` under
@@ -34,8 +241,9 @@ _Last updated: 2026-09-09 (orphaned-profile remediation expanded into three expl
 - Pending reboot checks now report individual rename/delete source and
   destination paths. All-empty values are ignored; real operations and
   malformed nonempty entries still block. CBS/Windows Update gates remain.
-  Registry read failures are not treated as a pass. No queue is deleted and
-  no pending-reboot bypass is added.
+  Registry read failures are not treated as a pass. No queue is deleted.
+  The later October 7 change adds only an explicit file-rename gate bypass;
+  CBS and Windows Update reboot gates remain enabled.
 - `ServerA-Orchestrator/Test-UpgradeReadiness.ps1` is a read-only WinRM check
   of those reboot flags, queued operations and last boot time. It does not
   stage files, run DISM/SFC, take backups, start Setup, or reboot. It is not
@@ -100,17 +308,18 @@ during the genuine WinPE blind window:
   1074 watcher (`OSUpgradeRebootWatcher`, restart initiation) and Setup's
   `setupcomplete.cmd`/`setuprollback.cmd` (`/PostOOBE`/`/PostRollback`
   hooks). Only Microsoft's `mosetup\Volatile\SetupProgress` can supply a live
-  Setup percentage. Events change phase/evidence, never invent percentages.
+  phase-scoped Setup percentage. Restart events record evidence, not a phase.
 - **Progress contract** - Stage 1 task count maps to overall 0-10, Stage 2
-  task count maps to 10-25, Windows Setup maps to 25-95, and validation maps
-  to 95-100. `PercentComplete` is the compatibility alias for
+  task count maps to 10-25, the four Setup phases map to 25-50/50-70/70-85/85-95,
+  and validation maps to 95-100. `PercentComplete` is the compatibility alias for
   `OverallPercentComplete`; `StagePercentComplete` retains the local 0-100
   value. Missing telemetry and terminal failures retain the high-water value.
-- **`Start-RemoteUpgradeOrchestrator.ps1`** (Server A) - a pure READER/
-  monitor. Polls Server B every `-PollIntervalSeconds` (default 15s) via
-  whichever channel answers (file share, then CIM/DCOM, then WinRM JSON;
-  connectivity-only observations when no status payload is readable
-  during the genuine WinPE blind window), renders `Write-Progress`, logs
+- **`Start-RemoteUpgradeOrchestrator.ps1`** (Server A) - a status reader with
+  bounded status-task recovery (never a replacement percentage writer).
+  Polls Server B with `-PollIntervalSeconds` sleep (default 15s) via
+  live WinRM registry/build observations, then file share/CIM/DCOM/WinRM JSON
+  (connectivity-only observations when no status payload is readable).
+  It renders `Write-Progress`, logs
   phase transitions, and prints a final summary banner (Status/Server OS/
   Build/services-comparison result) before exiting 0 (success) / 1 (failed)
   / 2 (timeout). It atomically maintains a local JSON mirror whose top-level
@@ -137,16 +346,12 @@ OSUpgradeAutomation1/
 ## Why phase transitions can appear to "skip" (Downlevel -> Completed with
 no visible Safe OS/First Boot/OOBE in between) - and whether the logic to
 track them exists anyway
-This IS expected on fast/lightweight VMs, and it's a **visibility**
-limitation of Server A's 15-second polling snapshot - NOT a gap in the
-underlying tracking logic, which DOES fully exist and fire for every phase:
-- Phase 4 (Safe OS) can be set INSTANTLY by the Event-1074 watcher, but on
-  a small/fast VM the WinPE apply + reboot + First Boot + OOBE can all
-  complete within a single short WinRM-down window (seen: ~17-40 seconds).
-  Server A only re-polls every 15s and only WHEN WinRM is reachable again -
-  if by the time it reconnects the machine has already raced past Safe
-  OS/First Boot straight to OOBE, Server A's snapshot simply never landed
-  on those intermediate values.
+Polling can miss brief phases or the complete WinPE interval. It can also read
+stale producer state; a phase gap must not automatically be dismissed as a fast
+VM. The September fix above distinguishes these cases:
+- Event 1074 no longer asserts Phase 4. Current-run Setup execution logs
+  confirm Safe OS and First Boot with original timestamps once readable.
+  WinRM returning without SMB is not enough to identify either phase.
 - Phase 6 (OOBE) -> Phase 7 (Completed) is the most likely to be missed
   entirely: `setupcomplete.cmd` calls `Update-UpgradeStatus.ps1` directly
   (not waiting for the one-minute schedule), which sets Phase 6, then
@@ -154,12 +359,11 @@ underlying tracking logic, which DOES fully exist and fire for every phase:
   which sets Phase 7 a few hundred milliseconds later - both writes happen
   faster than Server A's 15-second poll interval, so Server A's snapshot
   can easily only ever see Phase 7.
-- **The full-fidelity record still exists** even when Server A's live view
-  skips a step: `Update-UpgradeStatus.log` on Server B (and now also
-  `D:\UpgradeBackup\<run>\OSUpgradeProgress.log` - see below) records EVERY
-  phase transition with a timestamp, so the true Downlevel-to-Completed
-  timeline (or exactly which phase a failure occurred at) is always
-  reconstructable after the fact even if the live console view skipped it.
+- **Recovered evidence is separate from sampled state**:
+  `SetupPhaseHistory` retains actual Setup execution starts when the logs
+  provide them. `OSUpgradeProgress.log` records the monitor's observations,
+  not a guaranteed gap-free timeline inside WinPE. Missing log evidence is
+  reported honestly instead of generating fictional transitions.
 - **Overall percentage IS tracked spanning all phases** (not per-phase
   only): `PercentComplete` in the registry/JSON is a single 0-100 value
   that advances monotonically across the whole run: prechecks 0-10, backup
@@ -1273,12 +1477,11 @@ needed for this.
   registry value** (REG_BINARY, 0-100, confirmed via Microsoft Learn's
   "Windows 10 upgrade issues troubleshooting" article) as the new
   top-priority source in `Get-SetupProgressPercent` (`Update-UpgradeStatus.ps1`).
-  Unlike the previously-top-priority undocumented `ChildCompletion\setup.exe`
-  DWORD, this key is officially documented AND spans all four Windows-Setup
-  phases (Downlevel/Safe OS/First Boot/Second Boot-OOBE) as one continuous
-  0-100 arc. The later v2 redesign removed the old per-phase clamps and all
-  `ChildCompletion`/`setupact.log` percentage fallbacks entirely; absence now
-  carries the last verified MoSetup sample with freshness metadata.
+  The original assumption that this represented one continuous end-to-end
+  0-100 arc was corrected on September 30 after the supplied log showed
+  Downlevel reaching 100 before reboot. MoSetup is now phase-scoped.
+  `ChildCompletion`/arbitrary log-percentage fallbacks remain excluded;
+  missing telemetry retains the last verified value with freshness metadata.
 - **Stage 1/2/3 grouping**: the shared `OSUpgradeStatus.ps1` `Set-Phase`
   function computes and persists a `Stage`
   registry/JSON value - "Stage 1/3: Pre-Upgrade Assessment" (Phase 1),
@@ -1339,12 +1542,12 @@ alongside this solution.
 ## Full phase list
 | # | Name | Meaning | Percent behavior |
 |---|------|---------|-----------|
-| 1 | Pre-Upgrade Assessment | Fourteen DC/cluster/disk/reboot/health/media/licensing/patch/platform/RDS/profile checks | Local task count maps into 0-10 overall |
+| 1 | Pre-Upgrade Assessment | Sixteen checks, including disk dirty bits and independent profile inventory | Local task count maps into 0-10 overall |
 | 2 | State & Policy Backup | Eight backup units saved to `D:\UpgradeBackup` / `WindowsImageBackup` | Local task count maps into 10-25 overall |
-| 3 | Downlevel Phase | Source build; Setup launched through `OSUpgradeSetupLaunch` | MoSetup `SetupProgress` maps into 25-95 overall; otherwise carry the last sample |
-| 4 | Safe OS Phase | Event 1074 observed; WinPE is the genuine target-side blind window | No invented value; retain high-water and original progress timestamp, with `ExpectedDisconnect=true` |
-| 5 | First Boot Phase | Target build with `SystemSetupInProgress=1` | MoSetup remains the only live numeric source; otherwise carry forward |
-| 6 | Second Boot (OOBE) Phase | `/PostOOBE` hook fired | Deterministic Setup-complete milestone: 95 overall, then validation starts |
+| 3 | Downlevel Phase | Source build; Setup launched through `OSUpgradeSetupLaunch` | MoSetup maps into 25-50 overall; otherwise carry the last sample |
+| 4 | Safe OS Phase | Actual execution log confirms WinPE work, usually retrospectively | 50-70 weighting; no live progress invented during the blind window |
+| 5 | First Boot Phase | New build/Setup state or confirmed execution history | Phase-local MoSetup maps into 70-85; otherwise a confirmed boundary/carry-forward |
+| 6 | Second Boot (OOBE) Phase | OOBE flags/execution history; completion via hook or verified fallback | 85-95; 95 at Setup completion, then validation |
 | 7 | Post-Upgrade Validation / Completed | Build, edition, activation, and services validation | 95 while validating; 100 only for `Completed`/`CompletedWithWarnings` |
 | 99 | Rolled Back / Failed | `/PostRollback` fired; SetupDiag copied if present | Terminal status retains the highest verified overall percentage and sample timestamp |
 

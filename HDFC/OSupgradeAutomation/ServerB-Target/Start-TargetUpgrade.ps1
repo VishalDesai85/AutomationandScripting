@@ -76,6 +76,21 @@
     artifact you would need for a bare-metal/AD-level restore if the upgrade
     goes badly.
 
+.PARAMETER SkipOrphanedProfileCheck
+    Explicitly bypass SID-to-account resolution and the orphaned-profile
+    blocking check. Logged as a warning, not a pass. Does not delete profiles
+    or bypass profile inventory, disk health, or any other safety check.
+
+.PARAMETER SkipUserProfileCountCheck
+    Deprecated compatibility switch; no longer needed. Profile counting is
+    warning-only for every count. This switch does not suppress inventory or
+    the duration warning and does not bypass orphaned-profile checks.
+
+.PARAMETER SkipPendingFileRenameCheck
+    Ignore only PendingFileRenameOperations as an upgrade blocker. Still
+    reports the queued operations and never modifies them. CBS RebootPending
+    and Windows Update RebootRequired remain blocking.
+
 .PARAMETER MinVMwareToolsVersion
     Minimum acceptable VMware Tools version when Server B is a VMware VM.
     Default: "12.0.0". Ignored entirely on Hyper-V/physical hardware.
@@ -110,6 +125,9 @@ param(
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
     [switch]$SkipSystemStateBackup,
+    [switch]$SkipOrphanedProfileCheck,
+    [switch]$SkipUserProfileCountCheck,
+    [switch]$SkipPendingFileRenameCheck,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
     [int]   $MaxPatchAgeDays    = 60
@@ -289,8 +307,8 @@ if ($priorStatus) {
     # stale attempt slip through as a false positive - fixed here.)
     $looksActive = $setupIsRunning -or ($pantherFreshMin -lt 5)
 
-    if ($priorStatus -eq "InProgress" -and $looksActive) {
-        throw "A prior upgrade attempt looks genuinely ACTIVE on $env:COMPUTERNAME (Phase=$priorPhase, Status=InProgress, setup process running=$setupIsRunning, setupact.log age=$([math]::Round($pantherFreshMin,1)) min). Refusing to start a new attempt on top of it - wait for it to finish, or investigate manually if you're certain it's actually dead."
+    if ($priorStatus -eq "InProgress" -and ($looksActive -or [int]$priorPhase -ge 3)) {
+        throw "A prior upgrade attempt is unresolved on $env:COMPUTERNAME (Phase=$priorPhase, setup running=$setupIsRunning). Refusing a second Setup launch or deletion of diagnostic state. Resume the orchestrator to reconcile completion/interruption, or investigate manually."
     } else {
         Write-Log "Detected leftover state from a prior attempt (Phase=$priorPhase, Status=$priorStatus) that does NOT look active (setup process running=$setupIsRunning, setupact.log age=$([math]::Round($pantherFreshMin,1)) min) - cleaning it up before starting fresh." "WARN"
         Unregister-ScheduledTask -TaskName @($script:TaskMonitor, $script:TaskReboot, $script:TaskCleanup, $script:TaskSetupRun) -Confirm:$false -ErrorAction SilentlyContinue
@@ -309,6 +327,7 @@ if ($priorStatus) {
     }
 }
 
+Remove-Item -Path $script:MarkerOOBE, $script:MarkerRB -Force -ErrorAction SilentlyContinue
 $runStartedAt = Get-Date
 Set-UpgradeRegistryValue -Name "RunId" -Value ([guid]::NewGuid().ToString())
 Set-UpgradeRegistryValue -Name "StartTime" -Value ($runStartedAt.ToString("yyyy-MM-dd HH:mm:ss"))
@@ -333,20 +352,21 @@ $preCheckLog  = @()   # human-readable PASS/FAIL/WARN lines for the dedicated pr
 # signal of its own - but the NUMBER OF DISCRETE CHECKS is a real, countable
 # quantity, so "N of M checks done" is a genuine measurement, not a guess.
 # IMPORTANT: keep $totalPrecheckSteps in sync with the actual number of
-# DISTINCT check NAMES passed to Add-PreCheckResult below - currently 14:
+# logical checks reported by Add-PreCheckResult below - currently 16:
 # 1) Not a Domain Controller, 2) Not a Failover Cluster node, 3) C: free disk
 # space, 4) No pending reboot, 5) Component store health (DISM ScanHealth),
 # 6) System file integrity (SFC /scannow), 7) Locate setup.exe on ISO media,
 # 8) ISO edition matches current OS, 9) Target media build is newer than
 # current OS build, 10) OS activation/licensing healthy, 11) Patch level
 # up-to-date, 12) VMware Tools check, 13) RDS Session Host CAL license
-# server check, 14) Orphaned local user profiles. Bump this number (and the
+# server check, 14) Orphaned local user profiles, 15) Disk dirty-bit validation,
+# 16) User profile inventory. Bump this number (and the
 # comment above) whenever a check is added/removed - each name should only
 # ever be reported ONCE per run (exactly one PASS/WARN/FAIL branch fires per
 # check), so a simple running counter incremented on every
 # Add-PreCheckResult call accurately reflects "how many of the total checks
 # have completed".
-$totalPrecheckSteps = 14
+$totalPrecheckSteps = 16
 $script:precheckStepsDone = 0
 
 function Add-PreCheckResult {
@@ -411,16 +431,46 @@ try {
     Add-PreCheckResult -Name "C: free disk space" -Result "FAIL" -Detail "Could not determine free space: $_"
 }
 
+# --- Disk dirty-bit validation (read-only, all local fixed NTFS volumes) -----
+try {
+    $dirtyBitResults = @(Get-UpgradeDiskDirtyState)
+    $dirtyVolumes = @($dirtyBitResults | Where-Object { $_.IsDirty })
+    $dirtyDetail = ($dirtyBitResults | ForEach-Object { "$($_.Volume): $($_.Output)" }) -join "; "
+    if ($dirtyVolumes.Count) {
+        Set-UpgradeRegistryValue -Name "DirtyBitCheckStatus" -Value "Failed"
+        Add-PreCheckResult -Name "Disk dirty-bit validation" -Result "FAIL" -Detail "$dirtyDetail. Resolve filesystem issues with an approved CHKDSK/repair and reboot, then rerun prechecks. No repair or dirty-bit changes were made."
+    } else {
+        Set-UpgradeRegistryValue -Name "DirtyBitCheckStatus" -Value "Passed"
+        Add-PreCheckResult -Name "Disk dirty-bit validation" -Result "PASS" -Detail "$dirtyDetail. All $($dirtyBitResults.Count) local fixed NTFS volume(s) are clean."
+    }
+} catch {
+    Set-UpgradeRegistryValue -Name "DirtyBitCheckStatus" -Value "Unknown"
+    Add-PreCheckResult -Name "Disk dirty-bit validation" -Result "FAIL" -Detail "Could not verify volume dirty bits: $_. Resolve the query failure before upgrading; no repair was attempted."
+}
+
 # --- 2.4 Pending reboot check -------------------------------------------------
 try {
-    $pendingReboot = Get-UpgradePendingRebootState
-    $pendingReasons = @($pendingReboot.Reasons)
+    $pendingReboot = Get-UpgradePendingRebootState -SkipPendingFileRenameCheck:$SkipPendingFileRenameCheck
+    $pendingReasons = @($pendingReboot.BlockingReasons)
+    $renameCheckStatus = if ($SkipPendingFileRenameCheck) { "Skipped" }
+        elseif ($pendingReboot.PendingFileRenameOperationsPresent) { "Failed" } else { "Passed" }
+    Set-UpgradeRegistryValue -Name "PendingFileRenameCheckStatus" -Value $renameCheckStatus
+    $bypassDetail = ""
+    if ($SkipPendingFileRenameCheck) {
+        $bypassDetail = "PendingFileRenameOperations gate BYPASSED explicitly with -SkipPendingFileRenameCheck; $($pendingReboot.Operations.Count) queued operation(s) retained unchanged. CBS and Windows Update reboot gates remain enabled."
+        foreach ($operation in $pendingReboot.Operations) {
+            Write-Log "Bypassed pending file operation: $($operation.Action) '$($operation.Source)' -> '$($operation.Destination)'" "WARN"
+        }
+    }
     if ($pendingReasons.Count -gt 0) {
-        Add-PreCheckResult -Name "No pending reboot" -Result "FAIL" -Detail ($pendingReasons -join "; ")
+        Add-PreCheckResult -Name "No pending reboot" -Result "FAIL" -Detail (($pendingReasons -join "; ") + " $bypassDetail")
+    } elseif ($SkipPendingFileRenameCheck) {
+        Add-PreCheckResult -Name "No pending reboot" -Result "WARN" -Detail $bypassDetail
     } else {
         Add-PreCheckResult -Name "No pending reboot" -Result "PASS"
     }
 } catch {
+    Set-UpgradeRegistryValue -Name "PendingFileRenameCheckStatus" -Value "Unknown"
     Add-PreCheckResult -Name "No pending reboot" -Result "FAIL" -Detail "Could not evaluate pending-reboot state: $_"
 }
 
@@ -878,7 +928,34 @@ try {
     Add-PreCheckResult -Name "RDS Session Host CAL license server check" -Result "WARN" -Detail "Could not evaluate RDS Session Host role: $_"
 }
 
-# --- Orphaned local user profiles (warning-only) ------------------------------
+# --- Profile inventory is independent of the orphan-account bypass ----------
+if ($SkipUserProfileCountCheck) {
+    Write-Log "-SkipUserProfileCountCheck is deprecated and has no effect: profile counts are warning-only. Inventory and the duration warning still run." "WARN"
+}
+try {
+    $profileInventory = Get-UpgradeUserProfileInventory
+    foreach ($countName in @("UserProfileCount", "SpecialProfileCount", "TotalProfileCount", "LoadedUserProfileCount")) {
+        Set-UpgradeRegistryValue -Name $countName -Value $profileInventory.$countName -Type DWord
+    }
+    Set-UpgradeRegistryValue -Name "UserProfileInventoryStatus" -Value "Collected"
+    $profileDetail = "Detected $($profileInventory.UserProfileCount) user profiles on the target server. Systems with a higher number of user profiles may experience increased upgrade time due to additional profile migration and processing activities during setup."
+    $profileDetail += " Loaded user profiles: $($profileInventory.LoadedUserProfileCount); special/system profiles: $($profileInventory.SpecialProfileCount); total registered profiles: $($profileInventory.TotalProfileCount) (Win32_UserProfile)."
+    try {
+        $inventoryPath = Join-Path $script:LogDir "UserProfiles_$($script:RunStamp).csv"
+        $profileInventory.Profiles | Export-Csv -LiteralPath $inventoryPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Set-UpgradeRegistryValue -Name "UserProfileInventoryPath" -Value $inventoryPath
+        $profileDetail += " Inventory: $inventoryPath."
+    } catch {
+        $profileDetail += " CSV could not be saved: $_."
+        Write-Log "Profile count was collected but its CSV could not be saved: $_" "WARN"
+    }
+    Add-PreCheckResult -Name "User profile inventory" -Result "WARN" -Detail $profileDetail
+} catch {
+    Set-UpgradeRegistryValue -Name "UserProfileInventoryStatus" -Value "Unavailable"
+    Add-PreCheckResult -Name "User profile inventory" -Result "WARN" -Detail "Profile count/inventory unavailable: $_. Assess migration-duration risk manually; an unknown count is not zero. This warning does not block the upgrade."
+}
+
+# --- Orphaned local user profiles (blocking unless explicitly bypassed) -------
 # "Orphaned" here means a profile registry entry under ProfileList whose SID
 # no longer resolves to any account (local or domain) - typically left behind
 # after a domain/local user account was deleted without also cleaning up
@@ -889,10 +966,14 @@ try {
 # with a REVIEW-FIRST cleanup script printed for a human to run at their own
 # discretion (removing profile registry data is not something to automate
 # unattended inside a pre-check).
+if ($SkipOrphanedProfileCheck) {
+    Set-UpgradeRegistryValue -Name "OrphanedProfileCheckStatus" -Value "Skipped"
+    Add-PreCheckResult -Name "Orphaned local user profiles" -Result "WARN" -Detail "BYPASSED explicitly with -SkipOrphanedProfileCheck. No SID resolution or cleanup was performed. Profile inventory and all other prechecks still apply."
+} else {
 try {
     $profileListPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
     $orphanedProfiles = New-Object System.Collections.Generic.List[object]
-    Get-ChildItem -Path $profileListPath -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -Path $profileListPath -ErrorAction Stop | ForEach-Object {
         $sidString = $_.PSChildName
         # Only evaluate real user-account SIDs (domain or local, both start
         # S-1-5-21-...) - built-in/service SIDs (SYSTEM, LOCAL SERVICE,
@@ -900,7 +981,7 @@ try {
         # what "orphaned account" means here; skip them entirely rather than
         # risk a false positive.
         if ($sidString -notmatch '^S-1-5-21-') { return }
-        $profilePath = (Get-ItemProperty -Path $_.PSPath -Name "ProfileImagePath" -ErrorAction SilentlyContinue).ProfileImagePath
+        $profilePath = (Get-ItemProperty -Path $_.PSPath -Name "ProfileImagePath" -ErrorAction Stop).ProfileImagePath
         try {
             $sidObj = New-Object System.Security.Principal.SecurityIdentifier($sidString)
             $null = $sidObj.Translate([System.Security.Principal.NTAccount])
@@ -910,6 +991,8 @@ try {
         }
     }
     if ($orphanedProfiles.Count -eq 0) {
+        Set-UpgradeRegistryValue -Name "OrphanedProfileCheckStatus" -Value "Passed"
+        Set-UpgradeRegistryValue -Name "OrphanedProfileCount" -Value 0 -Type DWord
         Add-PreCheckResult -Name "Orphaned local user profiles" -Result "PASS" -Detail "No orphaned profile SIDs found under ProfileList."
     } else {
         $summaryText = ($orphanedProfiles | ForEach-Object { "$($_.Sid) [$($_.ProfilePath)]" }) -join "; "
@@ -923,7 +1006,8 @@ try {
         # otherwise resolve the orphaned accounts) and then re-initiate the
         # upgrade from scratch; this check will PASS on the next attempt
         # once ProfileList no longer has any unresolved S-1-5-21-* entries.
-        Add-PreCheckResult -Name "Orphaned local user profiles" -Result "FAIL" -Detail "$($orphanedProfiles.Count) orphaned profile SID(s) found (registry entry exists but the owning account no longer resolves - typically a deleted user whose local profile was never cleaned up): $summaryText. BLOCKING - clean these up (see the cleanup options printed below) then re-initiate the upgrade."
+        Set-UpgradeRegistryValue -Name "OrphanedProfileCheckStatus" -Value "Failed"
+        Add-PreCheckResult -Name "Orphaned local user profiles" -Result "FAIL" -Detail "$($orphanedProfiles.Count) orphaned profile SID(s) found (registry entry exists but the owning account no longer resolves - typically a deleted user whose local profile was never cleaned up): $summaryText. BLOCKING - clean these up (see the cleanup options printed below), or explicitly accept the risk with -SkipOrphanedProfileCheck, then re-initiate the upgrade."
         Set-UpgradeRegistryValue -Name "OrphanedProfileCount" -Value $orphanedProfiles.Count -Type DWord
 
         # A ready-to-run cleanup script is GENERATED (never auto-executed) next
@@ -1381,7 +1465,9 @@ if ($removed -eq $orphans.Count) {
     # now blocking - a failure to even RUN the check (e.g. registry read
     # error) is uncertainty, not a confirmed orphaned-account problem, so it
     # shouldn't block the upgrade the same way an actual finding does.
+    Set-UpgradeRegistryValue -Name "OrphanedProfileCheckStatus" -Value "Unknown"
     Add-PreCheckResult -Name "Orphaned local user profiles" -Result "WARN" -Detail "Could not evaluate orphaned profiles: $_ - proceeding anyway (non-blocking); this is a check-execution failure, not a confirmed orphaned-account finding."
+}
 }
 
 # =============================================================================
@@ -1456,6 +1542,16 @@ try {
     # since C:\ProgramData logs get purged by Remove-UpgradeArtifacts.ps1
     # after -RetentionDays) and to compare pre/post-upgrade services state.
     Set-UpgradeRegistryValue -Name "BackupFolder" -Value $backupFolder
+    try {
+        $profileReport = Get-UpgradeRegistryValue -Name "UserProfileInventoryPath"
+        if ($profileReport -and (Test-Path -LiteralPath $profileReport)) {
+            $durableProfileReport = Join-Path $backupFolder "UserProfiles_PreUpgrade.csv"
+            Copy-Item -LiteralPath $profileReport -Destination $durableProfileReport -Force -ErrorAction Stop
+            Set-UpgradeRegistryValue -Name "UserProfileInventoryPath" -Value $durableProfileReport
+        }
+    } catch {
+        Write-Log "Could not preserve profile inventory in the backup folder: $_" "WARN"
+    }
 
     # --- 3.0 Pre-upgrade services snapshot (for post-upgrade comparison) ---
     # Captured now, before anything changes, so Update-UpgradeStatus.ps1's
@@ -1498,7 +1594,7 @@ try {
         Write-Log "Could not enable SeBackupPrivilege (non-blocking) - SAM/SECURITY hive save may fail with Access Denied; this is expected Windows behavior without it, even for a local Administrator." "WARN"
     }
 
-    foreach ($hive in @("HKLM\SYSTEM","HKLM\SOFTWARE","HKLM\SAM","HKLM\SECURITY")) {
+    foreach ($hive in @("HKLM\SYSTEM","HKLM\SOFTWARE","HKLM\SAM","HKLM\SECURITY","HKU\.DEFAULT")) {
         $destFile = Join-Path $regBackupDir ("{0}.hiv" -f ($hive -replace '\\','_'))
         try {
             & reg.exe save $hive $destFile /y 2>&1 | Out-Null
@@ -1754,28 +1850,17 @@ $bootEventTrigger.Subscription = @'
 $bootEventTrigger.Enabled = $true
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew
+$monitorSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
 Unregister-ScheduledTask -TaskName $script:TaskMonitor -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName $script:TaskMonitor -Action $action `
-    -Trigger @($periodicTrigger, $startupTrigger, $bootEventTrigger) -Principal $principal -Settings $settings | Out-Null
+    -Trigger @($periodicTrigger, $startupTrigger, $bootEventTrigger) -Principal $principal -Settings $monitorSettings | Out-Null
 Write-Log "Registered scheduled task '$script:TaskMonitor' (every 1 min, at startup, and on System events 12/6005). LastBootUpTime is the unique reboot signal; events 12/6005 are corroboration."
 
-# --- Register the event-triggered Safe OS watcher (Event ID 1074) -----------
+# --- Record restart requests without asserting a Setup phase ----------------
 try {
     Unregister-ScheduledTask -TaskName $script:TaskReboot -Confirm:$false -ErrorAction SilentlyContinue
-    $regCmds = @(
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Phase /t REG_DWORD /d 4 /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v PhaseName /t REG_SZ /d `"Safe OS Phase`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Status /t REG_SZ /d `"InProgress`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v Notes /t REG_SZ /d `"Reboot into Safe OS/WinPE detected via Event ID 1074 - unreachable until First Boot.`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ExpectedDisconnect /t REG_DWORD /d 1 /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v ProgressFreshness /t REG_SZ /d `"CarriedForward`" /f"
-        "reg.exe add `"HKLM\SOFTWARE\OSUpgradeAutomation`" /v LastUpdated /t REG_SZ /d `"%date% %time%`" /f"
-    )
-    # The first action is intentionally cmd/reg.exe for the narrow shutdown
-    # window. The second action publishes the same transition atomically to
-    # JSON and the durable history through the shared PowerShell contract.
-    $rebootAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument ("/c " + ($regCmds -join " && "))
     $rebootPublishAction = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorScript`" -RebootInitiated"
     $eventTrigger = New-CimInstance -CimClass $eventTriggerClass -ClientOnly
@@ -1783,8 +1868,8 @@ try {
 <QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name='User32'] and EventID=1074]]</Select></Query></QueryList>
 '@
     $eventTrigger.Enabled = $true
-    Register-ScheduledTask -TaskName $script:TaskReboot -Action @($rebootAction, $rebootPublishAction) -Trigger $eventTrigger -Principal $principal -Settings $settings | Out-Null
-    Write-Log "Registered event-triggered task '$script:TaskReboot' (Event 1074) to mark Safe OS and publish JSON before shutdown."
+    Register-ScheduledTask -TaskName $script:TaskReboot -Action $rebootPublishAction -Trigger $eventTrigger -Principal $principal -Settings $monitorSettings | Out-Null
+    Write-Log "Registered '$script:TaskReboot' (Event 1074) for restart evidence only. Safe OS is confirmed from Setup execution logs, never from a restart request alone."
 } catch {
     Write-Log "Could not register Safe OS event watcher (non-blocking, best-effort): $_" "WARN"
 }
@@ -1810,7 +1895,8 @@ if (-not $DisableAutoCleanup) {
 # =============================================================================
 # Setup starts at 0% on its local scale, which maps to the stable 25% overall
 # handoff boundary. The recurring monitor replaces that local value only with
-# Microsoft's MoSetup SetupProgress counter; if the counter is unavailable,
+# Microsoft's MoSetup SetupProgress counter within the current phase's range;
+# a Downlevel value of 100 is only 50% of this workflow. If unavailable,
 # the last verified value is carried forward with explicit freshness metadata.
 Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" -PercentComplete 0 `
     -PercentSource "Measured" -ProgressSource "StageBoundary.SetupLaunch" -ProgressFreshness "Milestone" `

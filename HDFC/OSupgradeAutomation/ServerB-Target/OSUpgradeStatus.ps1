@@ -9,7 +9,10 @@
 
       Stage 1 - Prechecks             0-10
       Stage 2 - Backup               10-25
-      Stage 3 - Windows Setup        25-95
+      Stage 3 - Downlevel            25-50
+                Safe OS             50-70
+                First Boot          70-85
+                Second Boot         85-95
       Post-upgrade validation        95-100
 
     These values measure workflow completion, not elapsed-time prediction.
@@ -33,12 +36,16 @@ function Get-UpgradeRegistryValue {
 }
 
 function Get-UpgradePendingRebootState {
+    param([switch]$SkipPendingFileRenameCheck)
+
     $reasons = @()
+    $blockingReasons = @()
     $operations = @()
     $cbsPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction Stop
     $updatePending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' -ErrorAction Stop
     if ($cbsPending) { $reasons += 'CBS RebootPending key present' }
     if ($updatePending) { $reasons += 'Windows Update RebootRequired key present' }
+    $blockingReasons += $reasons
     $sessionManager = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction Stop
     $entries = @($sessionManager.PendingFileRenameOperations)
     for ($entryIndex = 0; $entryIndex -lt $entries.Count; $entryIndex += 2) {
@@ -51,14 +58,59 @@ function Get-UpgradePendingRebootState {
             Action = $(if (-not $source) { 'InvalidEntry' } elseif ($destination) { 'RenameOrReplace' } else { 'Delete' })
         }
         $operations += $operation
-        $reasons += "PendingFileRenameOperations: $($operation.Action) '$source' -> '$destination'"
+        $reason = "PendingFileRenameOperations: $($operation.Action) '$source' -> '$destination'"
+        $reasons += $reason
+        if (-not $SkipPendingFileRenameCheck) { $blockingReasons += $reason }
     }
     [pscustomobject]@{
         RebootPending = ($reasons.Count -gt 0)
+        UpgradeBlocked = ($blockingReasons.Count -gt 0)
         CBSRebootPending = $cbsPending
         WindowsUpdateRebootRequired = $updatePending
+        PendingFileRenameOperationsPresent = ($operations.Count -gt 0)
+        PendingFileRenameCheckSkipped = [bool]$SkipPendingFileRenameCheck
         Operations = $operations
         Reasons = $reasons
+        BlockingReasons = $blockingReasons
+    }
+}
+
+function Get-UpgradeDiskDirtyState {
+    $volumes = @(Get-CimInstance -ClassName Win32_Volume -Filter "DriveType=3 AND FileSystem='NTFS'" -ErrorAction Stop)
+    if (-not ($volumes | Where-Object { $_.DriveLetter -eq $env:SystemDrive })) {
+        throw "Could not enumerate the system NTFS volume $env:SystemDrive for dirty-bit validation."
+    }
+    foreach ($volume in $volumes) {
+        $volumePath = if ($volume.DriveLetter) { $volume.DriveLetter } else { $volume.DeviceID }
+        if (-not $volumePath) { throw "An NTFS volume has neither a drive letter nor a volume GUID." }
+        $output = (& fsutil.exe dirty query $volumePath 2>&1 | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) { throw "fsutil dirty query $volumePath failed (exit $LASTEXITCODE): $output" }
+
+        # fsutil's text is localized; CIM supplies the same bit on non-English hosts.
+        if ($output -match '(?im)^\s*Volume .+ is (?<clean>not )?dirty\s*\.?\s*$') {
+            $isDirty = -not [bool]$Matches['clean']
+        } elseif ($null -ne $volume.DirtyBitSet) {
+            $isDirty = [bool]$volume.DirtyBitSet
+        } else {
+            throw "Cannot interpret the dirty-bit result for ${volumePath}: $output"
+        }
+        [pscustomobject]@{ Volume = $volumePath; IsDirty = $isDirty; Output = $output }
+    }
+}
+
+function Get-UpgradeUserProfileInventory {
+    $profiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+        Select-Object SID, LocalPath, Special, Loaded, LastUseTime)
+    if (@($profiles | Where-Object { -not $_.SID -or $null -eq $_.Special }).Count) {
+        throw "Win32_UserProfile returned incomplete SID/Special metadata; the profile count cannot be verified."
+    }
+    $users = @($profiles | Where-Object { -not $_.Special })
+    [pscustomobject]@{
+        UserProfileCount = $users.Count
+        SpecialProfileCount = @($profiles | Where-Object { $_.Special }).Count
+        TotalProfileCount = $profiles.Count
+        LoadedUserProfileCount = @($users | Where-Object { $_.Loaded }).Count
+        Profiles = $profiles
     }
 }
 
@@ -92,16 +144,31 @@ function ConvertTo-OverallUpgradePercent {
     if ($Phase -eq 7 -and $Status -in @("Completed", "CompletedWithWarnings")) { return 100 }
 
     $boundedStagePercent = [math]::Max(0, [math]::Min(100, $StagePercentComplete))
-    $range = switch ($StageNumber) {
+    $range = switch ($Phase) {
         1 { [pscustomobject]@{ Start = 0; End = 10 } }
         2 { [pscustomobject]@{ Start = 10; End = 25 } }
+        3 { [pscustomobject]@{ Start = 25; End = 50 } }
+        4 { [pscustomobject]@{ Start = 50; End = 70 } }
+        5 { [pscustomobject]@{ Start = 70; End = 85 } }
+        6 { [pscustomobject]@{ Start = 85; End = 95 } }
+        7 { [pscustomobject]@{ Start = 95; End = 99 } }
         default { [pscustomobject]@{ Start = 25; End = 95 } }
     }
     return [int][math]::Floor($range.Start + (($range.End - $range.Start) * ($boundedStagePercent / 100.0)))
 }
 
 function Get-UpgradeStatusSnapshot {
-    $registry = Get-ItemProperty -Path $script:RegRoot -ErrorAction SilentlyContinue
+    $mutex = New-Object System.Threading.Mutex($false, "Global\OSUpgradeAutomationStatus")
+    $lockTaken = $false
+    try {
+        try { $lockTaken = $mutex.WaitOne(3000) }
+        catch [System.Threading.AbandonedMutexException] { $lockTaken = $true }
+        if (-not $lockTaken) { throw "Target status writer is busy; retry the snapshot read." }
+        $registry = Get-ItemProperty -Path $script:RegRoot -ErrorAction Stop
+    } finally {
+        if ($lockTaken) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
     function Get-SnapshotValue {
         param([string]$Name)
         if (-not $registry) { return $null }
@@ -123,6 +190,7 @@ function Get-UpgradeStatusSnapshot {
         StageNumber                  = Get-SnapshotValue -Name "StageNumber"
         Stage                        = Get-SnapshotValue -Name "Stage"
         StagePercentComplete         = Get-SnapshotValue -Name "StagePercentComplete"
+        PhasePercentComplete         = Get-SnapshotValue -Name "PhasePercentComplete"
         OverallPercentComplete       = Get-SnapshotValue -Name "OverallPercentComplete"
         PercentComplete              = Get-SnapshotValue -Name "PercentComplete"
         PercentSource                = Get-SnapshotValue -Name "PercentSource"
@@ -138,6 +206,11 @@ function Get-UpgradeStatusSnapshot {
         RebootCount                  = Get-SnapshotValue -Name "RebootCount"
         LastObservedBootTimeUtc      = Get-SnapshotValue -Name "LastObservedBootTimeUtc"
         BootEvidence                 = Get-SnapshotValue -Name "BootEvidence"
+        RestartRequestedAtUtc        = Get-SnapshotValue -Name "RestartRequestedAtUtc"
+        UnexpectedRestartAtUtc       = Get-SnapshotValue -Name "UnexpectedRestartAtUtc"
+        SetupPhaseHistory            = @(if (Get-SnapshotValue -Name "SetupPhaseHistory") {
+            Get-SnapshotValue -Name "SetupPhaseHistory" | ConvertFrom-Json -ErrorAction Stop
+        })
         SourceBuild                  = Get-SnapshotValue -Name "SourceBuild"
         TargetBuild                  = Get-SnapshotValue -Name "TargetBuild"
         SourceOSCaption              = Get-SnapshotValue -Name "SourceOSCaption"
@@ -146,9 +219,13 @@ function Get-UpgradeStatusSnapshot {
         Notes                        = Get-SnapshotValue -Name "Notes"
         SetupLogTail                 = Get-SnapshotValue -Name "SetupLogTail"
         SetupTelemetryPercent        = Get-SnapshotValue -Name "SetupTelemetryPercent"
+        SetupTelemetryPhase          = Get-SnapshotValue -Name "SetupTelemetryPhase"
         SetupTelemetrySource         = Get-SnapshotValue -Name "SetupTelemetrySource"
         SetupProcessMissingSinceUtc  = Get-SnapshotValue -Name "SetupProcessMissingSinceUtc"
         SetupFailureDetectedAtUtc    = Get-SnapshotValue -Name "SetupFailureDetectedAtUtc"
+        MonitorLastError             = Get-SnapshotValue -Name "MonitorLastError"
+        VerifiedTargetBuild          = Get-SnapshotValue -Name "VerifiedTargetBuild"
+        CompletionEvidence           = Get-SnapshotValue -Name "CompletionEvidence"
         ServicesComparisonResult     = Get-SnapshotValue -Name "ServicesComparisonResult"
         ServicesComparisonReportPath = Get-SnapshotValue -Name "ServicesComparisonReportPath"
         ServicesAttentionCount       = Get-SnapshotValue -Name "ServicesAttentionCount"
@@ -156,6 +233,16 @@ function Get-UpgradeStatusSnapshot {
         LicenseRecommendation        = Get-SnapshotValue -Name "LicenseRecommendation"
         BackupFolder                 = Get-SnapshotValue -Name "BackupFolder"
         SystemStateBackupPath        = Get-SnapshotValue -Name "SystemStateBackupPath"
+        DirtyBitCheckStatus          = Get-SnapshotValue -Name "DirtyBitCheckStatus"
+        UserProfileInventoryStatus   = Get-SnapshotValue -Name "UserProfileInventoryStatus"
+        UserProfileCount             = Get-SnapshotValue -Name "UserProfileCount"
+        SpecialProfileCount          = Get-SnapshotValue -Name "SpecialProfileCount"
+        TotalProfileCount            = Get-SnapshotValue -Name "TotalProfileCount"
+        LoadedUserProfileCount       = Get-SnapshotValue -Name "LoadedUserProfileCount"
+        UserProfileInventoryPath     = Get-SnapshotValue -Name "UserProfileInventoryPath"
+        OrphanedProfileCheckStatus   = Get-SnapshotValue -Name "OrphanedProfileCheckStatus"
+        OrphanedProfileCount         = Get-SnapshotValue -Name "OrphanedProfileCount"
+        PendingFileRenameCheckStatus = Get-SnapshotValue -Name "PendingFileRenameCheckStatus"
     }
 }
 
@@ -205,7 +292,7 @@ function Set-Phase {
         [int]$Phase,
         [string]$PhaseName,
         [string]$Status = "InProgress",
-        [Alias("StagePercentComplete")][int]$PercentComplete = -1,
+        [Alias("StagePercentComplete", "PhasePercentComplete")][int]$PercentComplete = -1,
         [string]$Notes = "",
         [ValidateSet("Measured", "Estimated")][string]$PercentSource = "Measured",
         [string]$ProgressSource = "",
@@ -223,23 +310,30 @@ function Set-Phase {
         if (-not $lockTaken) { throw "Timed out waiting for the shared upgrade-status writer lock." }
 
         $stage = Get-UpgradeStageMetadata -Phase $Phase
-        $priorStageNumber = Get-UpgradeRegistryValue -Name "StageNumber"
-        $priorStagePercent = Get-UpgradeRegistryValue -Name "StagePercentComplete"
+        $priorPhase = [int](Get-UpgradeRegistryValue -Name "Phase" -Default 0)
+        $priorStatus = Get-UpgradeRegistryValue -Name "Status"
+        $terminalConflict = $priorStatus -in @("Completed", "CompletedWithWarnings", "Failed") -and
+            $Status -ne $priorStatus -and -not ($Phase -eq 99 -and $Status -eq "Failed")
+        if ($terminalConflict -or ($Status -eq "InProgress" -and $Phase -ge 3 -and $Phase -lt $priorPhase -and $priorPhase -le 7)) {
+            Write-Log "Ignoring late phase publication $Phase/$Status after $priorPhase/$priorStatus." "WARN"
+            return
+        }
+        $priorPhasePercent = Get-UpgradeRegistryValue -Name "PhasePercentComplete"
         $priorOverallPercent = [int](Get-UpgradeRegistryValue -Name "OverallPercentComplete" -Default 0)
-        $hasFreshPercent = $PercentComplete -ge 0
+        $hasFreshPercent = $PercentComplete -ge 0 -and $Status -ne "Failed"
 
         if ($hasFreshPercent) {
-            $stagePercent = [math]::Max(0, [math]::Min(100, $PercentComplete))
-            if ($null -ne $priorStagePercent -and [int]$priorStageNumber -eq $stage.Number) {
-                $stagePercent = [math]::Max($stagePercent, [int]$priorStagePercent)
+            $phasePercent = [math]::Max(0, [math]::Min(100, $PercentComplete))
+            if ($null -ne $priorPhasePercent -and $priorPhase -eq $Phase) {
+                $phasePercent = [math]::Max($phasePercent, [int]$priorPhasePercent)
             }
-        } elseif ($null -ne $priorStagePercent -and [int]$priorStageNumber -eq $stage.Number) {
-            $stagePercent = [int]$priorStagePercent
+        } elseif ($null -ne $priorPhasePercent -and ($priorPhase -eq $Phase -or $Status -eq "Failed")) {
+            $phasePercent = [int]$priorPhasePercent
             if ($ProgressFreshness -ne "Terminal") {
                 $ProgressFreshness = "CarriedForward"
             }
         } else {
-            $stagePercent = 0
+            $phasePercent = 0
             if ($ProgressFreshness -ne "Terminal") {
                 $ProgressFreshness = "Milestone"
             }
@@ -262,12 +356,18 @@ function Set-Phase {
         }
 
         $overallPercent = ConvertTo-OverallUpgradePercent -Phase $Phase -StageNumber $stage.Number `
-            -StagePercentComplete $stagePercent -Status $Status
+            -StagePercentComplete $phasePercent -Status $Status
+        if ($Status -eq "Failed") { $overallPercent = $priorOverallPercent }
         $overallPercent = [math]::Max($overallPercent, $priorOverallPercent)
         $overallPercent = [math]::Max(0, [math]::Min(100, $overallPercent))
+        $stagePercent = if ($stage.Number -lt 3) {
+            $phasePercent
+        } else {
+            [int][math]::Min(100, [math]::Max(0, [math]::Floor(100 * ($overallPercent - 25) / 70.0)))
+        }
 
         $nowUtc = [DateTimeOffset]::UtcNow.ToString("o")
-        $progressUpdatedAtUtc = if ($hasFreshPercent) {
+        $progressUpdatedAtUtc = if ($hasFreshPercent -or ($Status -ne "Failed" -and $overallPercent -gt $priorOverallPercent)) {
             $nowUtc
         } else {
             Get-UpgradeRegistryValue -Name "ProgressUpdatedAtUtc" -Default $nowUtc
@@ -287,8 +387,8 @@ function Set-Phase {
         Set-UpgradeRegistryValue -Name "Stage"                    -Value $stage.Name
         Set-UpgradeRegistryValue -Name "Phase"                    -Value $Phase -Type DWord
         Set-UpgradeRegistryValue -Name "PhaseName"                -Value $PhaseName
-        Set-UpgradeRegistryValue -Name "Status"                   -Value $Status
         Set-UpgradeRegistryValue -Name "StagePercentComplete"     -Value $stagePercent -Type DWord
+        Set-UpgradeRegistryValue -Name "PhasePercentComplete"     -Value $phasePercent -Type DWord
         Set-UpgradeRegistryValue -Name "OverallPercentComplete"   -Value $overallPercent -Type DWord
         Set-UpgradeRegistryValue -Name "PercentComplete"          -Value $overallPercent -Type DWord
         Set-UpgradeRegistryValue -Name "PercentSource"            -Value $PercentSource
@@ -300,8 +400,13 @@ function Set-Phase {
         Set-UpgradeRegistryValue -Name "StartTime"                -Value $startTime
         Set-UpgradeRegistryValue -Name "StartTimeUtc"             -Value $startTimeUtc
         Set-UpgradeRegistryValue -Name "LastUpdated"              -Value (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        Set-UpgradeRegistryValue -Name "ExpectedDisconnect"       -Value $(if ($Phase -eq 4) { 1 } else { 0 }) -Type DWord
+        if ($Phase -ge 5 -or $Status -ne "InProgress") {
+            Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+        }
         Set-UpgradeRegistryValue -Name "Notes"                    -Value $Notes
+        # Commit terminal status after its percentage/evidence, so a reset
+        # cannot leave Completed paired with the previous 95% publication.
+        Set-UpgradeRegistryValue -Name "Status"                   -Value $Status
 
         Write-StatusJson
 
@@ -326,7 +431,7 @@ function Set-Phase {
 
 function Update-UpgradeBootEvidence {
     try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop
         $bootTime = ([datetime]$os.LastBootUpTime).ToUniversalTime()
         $bootTimeUtc = $bootTime.ToString("o")
         $priorBootTimeUtc = Get-UpgradeRegistryValue -Name "LastObservedBootTimeUtc"

@@ -27,29 +27,34 @@
                    "WinRM connectivity RESTORED" and transparently resumes
                    Active Polling the moment Test-WSMan succeeds again after
                    First/Second Boot - no manual reconnection is ever needed.
-                c. While in either mode, still opportunistically tries the
-                   JSON status file over the admin share
-                   (\\ServerB\D$\upgrade_status.json) and a CIM/WMI registry
-                   read over DCOM/RPC - both are independent of WinRM, so the
-                   progress bar can keep advancing even while WinRM is down.
+                c. Prefers a bounded live WinRM registry/build/Setup-flags
+                   observation, refreshing a stale or missing status monitor
+                   without relaunching Setup. SMB JSON and bounded DCOM
+                   registry reads remain independent fallback channels.
                 d. If NONE of ping/WinRM/file/DCOM succeed, reports a
-                   transient "Safe OS / unreachable" state (the one genuine
-                   blind window - WinPE has no running Windows services at
-                   all for any channel to reach).
-                e. Renders a clean ASCII progress bar + phase/status/mode line.
+                   connectivity outage with an UNCONFIRMED phase. Safe OS
+                   execution is recovered from current-run Setup logs;
+                   network availability alone never establishes a phase.
+                e. Renders progress and warns when producer status is stale.
     Step 4  - Prints a clear success banner once Server B is back online,
               WinRM has reconnected (Active Polling confirmed - not just a
               ping), Status=Completed(/CompletedWithWarnings), and its live
-              OS build matches the expected target build. Prints a failure
+              OS build matches the expected target build and Setup/OOBE flags
+              are clear. Prints a failure
               banner on Failed/RolledBack, or a timeout warning if
-              -TimeoutMinutes elapses first.
+              -TimeoutMinutes elapses first. A reported completion that
+              cannot be verified within -FinalValidationTimeoutSeconds
+              ends with an explicit validation error, never assumed success.
 
 .PARAMETER TargetComputer
     Hostname or IP of Server B.
 
 .PARAMETER Credential
     Optional PSCredential for Server B (required for workgroup targets or
-    when Server A's current user isn't a local admin on Server B).
+    when Server A's current user isn't a local admin on Server B). When
+    supplied, all WinRM probes and PowerShell remoting calls explicitly use
+    Negotiate authentication. Without it, existing current-user authentication
+    behavior is retained.
 
 .PARAMETER UseSSL
     Skip the HTTP (5985) probe entirely and connect to WinRM over HTTPS
@@ -79,12 +84,22 @@
     C:\ProgramData\OSUpgradeAutomation location. Default: C:\Temp\OSUpgradeStaging
 
 .PARAMETER IsoFolder, MinFreeSpaceGB, BackupRoot, StatusJsonPath, RetentionDays,
-.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipSystemStateBackup,
+.PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipSystemStateBackup, SkipOrphanedProfileCheck,
 .PARAMETER MinVMwareToolsVersion, UseControlledReboot, MaxPatchAgeDays
     Passed straight through to Start-TargetUpgrade.ps1 on Server B - see that
     script's own help for details. -SkipSystemStateBackup omits backup task
     8 of 8 (the slow wbadmin system state backup); every other backup
     artifact is still produced.
+
+.PARAMETER SkipUserProfileCountCheck
+    Deprecated compatibility switch passed through to the target. Profile
+    counting is always warning-only; no bypass is needed. Inventory and the
+    duration warning still run when this switch is supplied.
+
+.PARAMETER SkipPendingFileRenameCheck
+    Pass through to the target: bypass only PendingFileRenameOperations.
+    Queued operations are still reported; CBS and Windows Update reboot
+    requirements remain blocking. No registry values are deleted.
 
 .PARAMETER PollIntervalSeconds
     Seconds between monitoring checks while WinRM/Active Polling is up.
@@ -101,6 +116,20 @@
 .PARAMETER TimeoutMinutes
     Overall monitoring timeout. Default: 180 (3 hours - in-place upgrades with
     multiple reboots commonly take 60-120 minutes; tune per environment).
+    The precheck/backup kickoff wait is separately capped at this duration.
+
+.PARAMETER StatusStaleWarningMinutes
+    Warn when target status publication stops advancing or cannot be read.
+    Default: 5. A connectivity gap is not proof of failure or Safe OS. The
+    target separately fails a stopped Setup process on the source OS after
+    a 10-minute recovery grace period.
+
+.PARAMETER FinalValidationTimeoutSeconds
+    Maximum final-verification wait after the target reports completion.
+    Default: 60 seconds, with an immediate check and subsequent five-second
+    retry delays. Shows one "Validating update..." message; retry details go
+    to the log. Unverified completion ends with an error and exit code 3,
+    never a successful fallback. The overall monitoring deadline still applies.
 
 .PARAMETER LocalStatusMirrorPath
     Optional path on Server A for an atomic mirror of Server B's latest real
@@ -151,12 +180,15 @@ param(
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
     [switch]$SkipSystemStateBackup,
+    [switch]$SkipOrphanedProfileCheck,
+    [switch]$SkipUserProfileCountCheck,
+    [switch]$SkipPendingFileRenameCheck,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
     [int]   $MaxPatchAgeDays       = 60,
 
     # --- Monitoring parameters -------------------------------------------------
-    [int]$PollIntervalSeconds = 15,
+    [ValidateRange(1,3600)][int]$PollIntervalSeconds = 15,
     # Used ONLY while Mode is Heartbeat or Offline (WinRM down) - a shorter
     # interval here increases the odds of a poll actually landing during a
     # brief window where the machine responds again (e.g. a short-lived
@@ -165,9 +197,11 @@ param(
     # seconds. Reverts to the normal $PollIntervalSeconds the instant Mode
     # is back to ActivePolling - no reason to poll aggressively once WinRM
     # is confirmed up and richer data is flowing normally.
-    [int]$FastPollIntervalSeconds = 5,
-    [int]$TimeoutMinutes      = 180,
-    [int]$PhaseStallWarningMinutes = 45,
+    [ValidateRange(1,3600)][int]$FastPollIntervalSeconds = 5,
+    [ValidateRange(1,10080)][int]$TimeoutMinutes = 180,
+    [ValidateRange(1,10080)][int]$PhaseStallWarningMinutes = 45,
+    [ValidateRange(1,10080)][int]$StatusStaleWarningMinutes = 5,
+    [ValidateRange(1,600)][int]$FinalValidationTimeoutSeconds = 60,
     [string]$LocalStatusMirrorPath = ""
 )
 
@@ -190,13 +224,15 @@ if (-not $LocalStatusMirrorPath) {
 $script:LocalStatusMirrorPath = $LocalStatusMirrorPath
 
 function Write-Log {
-    param([string]$Message, [ValidateSet("INFO","WARN","ERROR","SUCCESS")][string]$Level = "INFO")
+    param([string]$Message, [ValidateSet("INFO","WARN","ERROR","SUCCESS")][string]$Level = "INFO", [switch]$LogOnly)
     $line = "[{0}] [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level, $Message
-    switch ($Level) {
-        "ERROR"   { Write-Host $line -ForegroundColor Red }
-        "WARN"    { Write-Host $line -ForegroundColor Yellow }
-        "SUCCESS" { Write-Host $line -ForegroundColor Green }
-        default   { Write-Host $line }
+    if (-not $LogOnly) {
+        switch ($Level) {
+            "ERROR"   { Write-Host $line -ForegroundColor Red }
+            "WARN"    { Write-Host $line -ForegroundColor Yellow }
+            "SUCCESS" { Write-Host $line -ForegroundColor Green }
+            default   { Write-Host $line }
+        }
     }
     Add-Content -Path $script:LocalLogFile -Value $line -Encoding UTF8
 }
@@ -211,7 +247,7 @@ function ConvertTo-ProducerStatusRecord {
 
     $record = [ordered]@{}
     foreach ($property in $Status.PSObject.Properties) {
-        if ($property.Name -notin @("PingOk", "WinRmOk", "Mode", "Source", "Observer")) {
+        if ($property.Name -notin @("PingOk", "WinRmOk", "Mode", "Source", "Observer", "LiveState", "HealthWarning")) {
             $record[$property.Name] = $property.Value
         }
     }
@@ -310,6 +346,11 @@ function Write-LocalStatusMirror {
             $cacheState = "NoProducerSnapshot"
         }
 
+        $producerAgeSeconds = $null
+        $producerStamp = [DateTimeOffset]::MinValue
+        if ($mirror["StatusUpdatedAtUtc"] -and [DateTimeOffset]::TryParse($mirror["StatusUpdatedAtUtc"], [ref]$producerStamp)) {
+            $producerAgeSeconds = [int][math]::Max(0, [math]::Floor(($nowUtc - $producerStamp).TotalSeconds))
+        }
         $mirror["Observer"] = [ordered]@{
             ComputerName          = $env:COMPUTERNAME
             TargetComputer        = $TargetComputer
@@ -318,10 +359,13 @@ function Write-LocalStatusMirror {
             ProducerReachable     = ($null -ne $ProducerStatus)
             CacheState            = $cacheState
             CacheAgeSeconds       = $cacheAgeSeconds
+            ProducerStatusAgeSeconds = $producerAgeSeconds
             ConnectivityMode      = $(if ($ObservationStatus) { $ObservationStatus.Mode } else { "Initializing" })
             ConnectivitySource    = $(if ($ObservationStatus) { $ObservationStatus.Source } else { "ServerA" })
             PingOk                = $(if ($ObservationStatus) { $ObservationStatus.PingOk } else { $null })
             WinRmOk               = $(if ($ObservationStatus) { $ObservationStatus.WinRmOk } else { $null })
+            LiveState             = $(if ($ObservationStatus) { $ObservationStatus.LiveState } else { $null })
+            HealthWarning         = $(if ($ObservationStatus) { $ObservationStatus.HealthWarning } else { $null })
             ObservationError      = $(if ($ObservationError) { $ObservationError } else { $null })
         }
 
@@ -386,12 +430,18 @@ $script:WinRMProbeScript = {
         switch ($transport) {
             "Http" {
                 $p = @{ ComputerName = $cn; Port = 5985; ErrorAction = "Stop" }
-                if ($cred) { $p["Credential"] = $cred }
+                if ($cred) {
+                    $p["Credential"] = $cred
+                    $p["Authentication"] = "Negotiate"
+                }
                 Test-WSMan @p | Out-Null
             }
             "Https" {
                 $p = @{ ComputerName = $cn; UseSSL = $true; Port = 5986; ErrorAction = "Stop" }
-                if ($cred) { $p["Credential"] = $cred }
+                if ($cred) {
+                    $p["Credential"] = $cred
+                    $p["Authentication"] = "Negotiate"
+                }
                 Test-WSMan @p | Out-Null
             }
             "HttpsSkipCert" {
@@ -406,7 +456,10 @@ $script:WinRMProbeScript = {
                     SessionOption = (New-PSSessionOption -SkipCACheck -SkipCNCheck -SkipRevocationCheck)
                     ErrorAction   = "Stop"
                 }
-                if ($cred) { $p["Credential"] = $cred }
+                if ($cred) {
+                    $p["Credential"] = $cred
+                    $p["Authentication"] = "Negotiate"
+                }
                 $s = New-PSSession @p
                 Remove-PSSession -Session $s -ErrorAction SilentlyContinue
             }
@@ -482,7 +535,10 @@ function Get-WinRMSessionParams {
     so the resolved transport is applied consistently everywhere.
     #>
     $p = @{ ComputerName = $TargetComputer }
-    if ($Credential) { $p["Credential"] = $Credential }
+    if ($Credential) {
+        $p["Credential"] = $Credential
+        $p["Authentication"] = "Negotiate"
+    }
     switch ($script:WinRMTransport) {
         "Https" {
             $p["UseSSL"] = $true
@@ -590,7 +646,7 @@ $resumeExisting = $false
 try {
     $existing = Invoke-Command @sessionParams -ScriptBlock {
         $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\OSUpgradeAutomation" -ErrorAction SilentlyContinue |
-            Select-Object Phase, PhaseName, Status, PostUpgradeOSCaption, TargetOSCaption, TargetBuild, LastUpdated
+            Select-Object RunId, Phase, PhaseName, Status, PostUpgradeOSCaption, TargetOSCaption, TargetBuild, LastUpdated
         if ($reg) {
             # Status "InProgress" ALONE is not trustworthy - setup.exe can
             # self-cancel (e.g. a OneSettings network-timeout) and leave
@@ -631,9 +687,10 @@ try {
         }
         $reg
     } -ErrorAction Stop
-    if ($existing -and $existing.Status -eq "InProgress" -and [int]$existing.Phase -ge 1 -and $existing.LooksActive) {
+    if ($existing -and $existing.Status -eq "InProgress" -and [int]$existing.Phase -ge 1 -and
+        ($existing.LooksActive -or [int]$existing.Phase -ge 3)) {
         $resumeExisting = $true
-        Write-Log "Detected an upgrade already in progress on $TargetComputer (Phase=$($existing.Phase) '$($existing.PhaseName)', Status=InProgress, setup process running=$($existing.SetupIsRunning), setupact.log age=$([math]::Round($existing.PantherAgeMin,1)) min) - skipping re-stage/re-kickoff and resuming monitoring directly." "WARN"
+        Write-Log "Resuming unresolved upgrade on $TargetComputer (Phase=$($existing.Phase) '$($existing.PhaseName)', setup running=$($existing.SetupIsRunning)). Skipping re-stage/re-kickoff; the monitor will reconcile completion or interruption without launching Setup again." "WARN"
     } elseif ($existing -and $existing.Status -in @("Completed","CompletedWithWarnings")) {
         # A prior run already finished successfully (e.g. the LAST
         # orchestrator process hit -TimeoutMinutes and exited while the
@@ -654,7 +711,7 @@ try {
         # that live query itself failed.
         $liveOsText = if ($existing.LiveOSCaption) { "$($existing.LiveOSCaption) (build $($existing.LiveBuild))" } elseif ($existing.PostUpgradeOSCaption) { "$($existing.PostUpgradeOSCaption) (registry value, live re-check failed)" } else { "(could not be determined)" }
         Write-Log "====================================================================" "SUCCESS"
-        Write-Log " $TargetComputer IS ALREADY ON THE TARGET OS - NO UPGRADE ACTION TAKEN THIS RUN" "SUCCESS"
+        Write-Log " $TargetComputer HAS A PRIOR COMPLETION RECORD - NO UPGRADE ACTION TAKEN THIS RUN. Live verification follows." "INFO"
         Write-Log "====================================================================" "SUCCESS"
         Write-Log " Current OS (live check)   : $liveOsText" "SUCCESS"
         Write-Log " Prior run outcome         : Status=$($existing.Status) (Phase=$($existing.Phase) '$($existing.PhaseName)')" "SUCCESS"
@@ -715,7 +772,10 @@ function Read-RemoteStatusJsonViaWinRM {
     $job = Start-Job -ScriptBlock {
         param($cn, $credential, $path, $transport)
         $invokeParams = @{ ComputerName = $cn; ErrorAction = "Stop" }
-        if ($credential) { $invokeParams["Credential"] = $credential }
+        if ($credential) {
+            $invokeParams["Credential"] = $credential
+            $invokeParams["Authentication"] = "Negotiate"
+        }
         switch ($transport) {
             "Https" {
                 $invokeParams["UseSSL"] = $true
@@ -797,6 +857,9 @@ try {
         DisableAutoCleanup    = [bool]$DisableAutoCleanup
         SkipPatchCheckLab     = [bool]$SkipPatchCheckLab
         SkipSystemStateBackup = [bool]$SkipSystemStateBackup
+        SkipOrphanedProfileCheck = [bool]$SkipOrphanedProfileCheck
+        SkipUserProfileCountCheck = [bool]$SkipUserProfileCountCheck
+        SkipPendingFileRenameCheck = [bool]$SkipPendingFileRenameCheck
         MinVMwareToolsVersion = $MinVMwareToolsVersion
         UseControlledReboot   = [bool]$UseControlledReboot
         MaxPatchAgeDays       = $MaxPatchAgeDays
@@ -849,6 +912,10 @@ try {
     $driveLetter = ($StatusJsonPath -split ':')[0]
     $stage12UncPath = "\\$TargetComputer\$driveLetter`$\$(($StatusJsonPath -split ':', 2)[1].TrimStart('\'))"
     while ($remoteJob.State -eq 'Running') {
+        if (((Get-Date) - $stage12Start).TotalMinutes -ge $TimeoutMinutes) {
+            Write-Log "Kickoff exceeded $TimeoutMinutes minutes at '$stage12PhaseName' ($stage12Pct% overall). Kindly check the target and its logs; this is not a verified Setup failure." "ERROR"
+            throw "Precheck/backup/kickoff timed out. Last phase: $stage12PhaseName."
+        }
         $received = Receive-Job -Job $remoteJob -ErrorAction SilentlyContinue
         if ($received) { $allReceived += $received }
         if ($spinnerIdx % 3 -eq 0) {
@@ -916,7 +983,12 @@ try {
     # thing in $allReceived with a "Success" property - pick that one out.
     $remoteResult = $allReceived | Where-Object { $_.PSObject.Properties.Name -contains 'Success' } | Select-Object -Last 1
     if (-not $remoteResult) {
-        $remoteResult = [pscustomobject]@{ Success = $false; Error = "Job '$($remoteJob.Name)' ended in state '$($remoteJob.State)' without returning a result - check Server B's own logs (C:\ProgramData\OSUpgradeAutomation\Logs) for what happened." }
+        if ($script:LastProducerStatus -and [int]$script:LastProducerStatus.Phase -ge 3 -and $script:LastProducerStatus.Status -eq "InProgress") {
+            Write-Log "Kickoff connection ended after the target entered Setup. Switching to bounded monitoring to distinguish reboot, interruption, and completion; Setup will not be relaunched." "WARN"
+            $remoteResult = [pscustomobject]@{ Success = $true; Error = $null }
+        } else {
+            $remoteResult = [pscustomobject]@{ Success = $false; Error = "Job '$($remoteJob.Name)' ended in state '$($remoteJob.State)' without returning a result - check Server B's own logs (C:\ProgramData\OSUpgradeAutomation\Logs) for what happened." }
+        }
     }
 
     if (-not $remoteResult.Success) {
@@ -983,6 +1055,7 @@ try {
             Write-Log "   3. Re-run this exact command again - no other cleanup is needed:" "WARN"
             if ($reRunCredHint) { Write-Log "        $reRunCredHint" "WARN" }
             Write-Log "        $reRunCommand" "WARN"
+            Write-Log "   If only PendingFileRenameOperations persists after investigation, -SkipPendingFileRenameCheck can explicitly bypass that gate. It does NOT bypass CBS/Windows Update reboot requirements or clear the queue." "WARN"
         } elseif ($orphanedProfiles) {
             $orphanCleanupPath = Join-Path $RemoteStagingPath "Remove-OrphanedProfiles.ps1"
             Write-Log "ACTION REQUIRED:" "WARN"
@@ -1000,6 +1073,7 @@ try {
             Write-Log "   3. Re-run the OS upgrade with this exact command once cleanup is done:" "WARN"
             if ($reRunCredHint) { Write-Log "        $reRunCredHint" "WARN" }
             Write-Log "        $reRunCommand" "WARN"
+            Write-Log "      Alternatively, after accepting the migration risk, re-run with -SkipOrphanedProfileCheck. This bypasses only orphan SID resolution; profile inventory and other safety gates still run." "WARN"
             Write-Log "      Nothing was changed on $TargetComputer this run (no backup, no ISO" "WARN"
             Write-Log "      mount, no setup.exe) - it is safe to simply retry." "WARN"
         } else {
@@ -1008,7 +1082,7 @@ try {
             Write-Log "   Re-run command: $reRunCommand" "WARN"
         }
         Write-Log "====================================================================" "ERROR"
-        Write-Log "Full pre-check report: D:\UpgradeBackup\Logs\PreCheckReport_*.log (or C:\ProgramData\OSUpgradeAutomation\Logs if D: was unreachable) on $TargetComputer." "ERROR"
+        Write-Log "Full pre-check report: $BackupRoot\PreCheckReport_*.log (or C:\ProgramData\OSUpgradeAutomation\Logs if the backup drive was unreachable) on $TargetComputer." "ERROR"
 
         # Deliberately just falls through here (no throw/exit) - $upgradeKickoffOk
         # stays $false, the outer try's "finally" still cleans up the PSSession
@@ -1016,7 +1090,7 @@ try {
         # after the try/finally block performs the actual graceful stop.
     } else {
         $upgradeKickoffOk = $true
-        Write-Log "setup.exe launched successfully on $TargetComputer. $TargetComputer will now reboot multiple times - closing this session (expected)." "SUCCESS"
+        Write-Log "Setup-stage handoff received from $TargetComputer - closing the kickoff session. Monitoring will verify Setup liveness and completion independently; multiple reboots may follow."
     }
 } finally {
     if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
@@ -1028,6 +1102,246 @@ if (-not $upgradeKickoffOk) { return }
 # =============================================================================
 # SECTION 4 - MONITORING LOOP FUNCTIONS
 # =============================================================================
+
+function Get-RemoteUpgradeObservation {
+    param(
+        [string]$ComputerName,
+        [System.Management.Automation.PSCredential]$Cred,
+        [ValidateSet("Http","Https","HttpsSkipCert")][string]$Transport,
+        [int]$TimeoutSec = 15,
+        [ref]$ErrorDetail
+    )
+    $job = Start-Job -ScriptBlock {
+        param($cn, $credential, $transport)
+        $p = @{ ComputerName = $cn; ErrorAction = "Stop" }
+        if ($credential) {
+            $p["Credential"] = $credential
+            $p["Authentication"] = "Negotiate"
+        }
+        if ($transport -ne "Http") { $p["UseSSL"] = $true; $p["Port"] = 5986 }
+        $optionArgs = @{ OpenTimeout = 5000; OperationTimeout = 10000 }
+        if ($transport -eq "HttpsSkipCert") {
+            $optionArgs["SkipCACheck"] = $true
+            $optionArgs["SkipCNCheck"] = $true
+            $optionArgs["SkipRevocationCheck"] = $true
+        }
+        $p["SessionOption"] = New-PSSessionOption @optionArgs
+        Invoke-Command @p -ScriptBlock {
+            $ErrorActionPreference = "Stop"
+            $script:RegRoot = "HKLM:\SOFTWARE\OSUpgradeAutomation"
+            $basePath = "C:\ProgramData\OSUpgradeAutomation"
+            $helper = Join-Path $basePath "Scripts\OSUpgradeStatus.ps1"
+            if (-not (Test-Path -LiteralPath $helper)) { throw "Status helper is missing: $helper. Restore the staged monitoring files." }
+            . $helper
+            $record = Get-UpgradeStatusSnapshot
+            $version = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+            $setup = Get-ItemProperty "HKLM:\SYSTEM\Setup" -ErrorAction Stop
+            $live = [ordered]@{
+                CurrentBuild = $version.CurrentBuildNumber
+                SystemSetupInProgress = $setup.SystemSetupInProgress
+                OOBEInProgress = $setup.OOBEInProgress
+                SetupRunning = [bool](Get-Process -Name "setup", "setuphost", "setupprep" -ErrorAction SilentlyContinue)
+                LastBootUpTimeUtc = $null
+                MonitorState = $null
+                MonitorRecovery = $null
+                MonitorRecoveryError = $null
+                ProbeWarning = $null
+            }
+            try {
+                $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 5 -ErrorAction Stop
+                $live["LastBootUpTimeUtc"] = ([datetime]$os.LastBootUpTime).ToUniversalTime().ToString("o")
+            } catch {
+                $live["ProbeWarning"] = "Boot-time query failed: $($_.Exception.Message)"
+            }
+            if ($record.Status -eq "InProgress" -and [int]$record.Phase -ge 3 -and [int]$record.Phase -le 7) {
+                try {
+                    $ageSeconds = if ($record.StatusUpdatedAtUtc) {
+                        ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse($record.StatusUpdatedAtUtc)).TotalSeconds
+                    } else { [double]::PositiveInfinity }
+                    $newBoot = $live.LastBootUpTimeUtc -and $live.LastBootUpTimeUtc -ne $record.LastObservedBootTimeUtc
+                    $needsValidation = $record.TargetBuild -and $live.CurrentBuild -eq $record.TargetBuild -and
+                        $null -ne $live.SystemSetupInProgress -and $live.SystemSetupInProgress -eq 0
+                    $task = Get-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -ErrorAction SilentlyContinue
+                    $live["MonitorState"] = if ($task) { [string]$task.State } else { "Missing" }
+                    if (-not $task -or $ageSeconds -ge 120 -or $newBoot -or $needsValidation) {
+                        if (-not $task) {
+                            $monitorPath = Join-Path $basePath "Scripts\Update-UpgradeStatus.ps1"
+                            if (-not (Test-Path -LiteralPath $monitorPath)) { throw "Monitor script missing: $monitorPath" }
+                            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$monitorPath`""
+                            $timer = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+                                -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3)
+                            $startup = New-ScheduledTaskTrigger -AtStartup
+                            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+                            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew `
+                                -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+                            Register-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -Action $action `
+                                -Trigger @($timer, $startup) -Principal $principal -Settings $settings | Out-Null
+                            $live["MonitorRecovery"] = "Recreated missing status monitor (Setup was not relaunched)."
+                        }
+                        if ($task -and [string]$task.State -eq "Disabled") { throw "OSUpgradePhaseMonitor is disabled; enable the monitor task after reviewing policy." }
+                        if (-not $task -or [string]$task.State -ne "Running") {
+                            Start-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -ErrorAction Stop
+                            $live["MonitorRecovery"] += " Requested immediate status/validation refresh."
+                        }
+                    }
+                } catch {
+                    $live["MonitorRecoveryError"] = "Cannot refresh the target status monitor: $($_.Exception.Message)"
+                }
+            }
+            [pscustomobject]@{ ProducerStatus = [pscustomobject]$record; LiveState = [pscustomobject]$live }
+        }
+    } -ArgumentList $ComputerName, $Cred, $Transport
+    try {
+        if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+            $jobError = $null
+            $result = Receive-Job -Job $job -ErrorVariable jobError -ErrorAction SilentlyContinue
+            if ($jobError -and $ErrorDetail) { $ErrorDetail.Value = $jobError[0].ToString() }
+            return $result
+        }
+        if ($ErrorDetail) { $ErrorDetail.Value = "Live WinRM status/build probe timed out after ${TimeoutSec}s." }
+        return $null
+    } finally {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Add-UpgradeObservation {
+    param($Record, [bool]$PingOk, [bool]$WinRmOk, [string]$Source, $LiveState, [switch]$LogOnly)
+    if ($null -eq $Record -or $Record.Phase -notin @(1,2,3,4,5,6,7,99) -or
+        $Record.Status -notin @("InProgress", "Completed", "CompletedWithWarnings", "Failed")) { return $null }
+    if ($script:ExpectedRunId -and $Record.RunId -ne $script:ExpectedRunId) {
+        Write-Log "Rejected $Source status from a different run (expected $script:ExpectedRunId, received $($Record.RunId))." "WARN" -LogOnly:$LogOnly
+        return $null
+    }
+    if ($script:LastProducerStatus -and $Record.RunId -eq $script:LastProducerStatus.RunId -and
+        $null -ne $Record.Sequence -and [long]$Record.Sequence -lt [long]$script:LastProducerStatus.Sequence) {
+        Write-Log "Rejected older $Source status sequence $($Record.Sequence); last accepted=$($script:LastProducerStatus.Sequence)." "WARN" -LogOnly:$LogOnly
+        return $null
+    }
+    $Record | Add-Member -NotePropertyMembers @{
+        PingOk = $PingOk; WinRmOk = $WinRmOk; Source = $Source; LiveState = $LiveState
+        Mode = $(if ($WinRmOk) { "ActivePolling" } else { "Heartbeat" })
+    } -Force
+    return $Record
+}
+
+function Get-UpgradeHealthWarning {
+    param($Status, $LastProducer, [DateTimeOffset]$LastAdvanceAtUtc, [int]$StaleMinutes, [DateTimeOffset]$NowUtc = [DateTimeOffset]::UtcNow)
+    if ($Status.Status -in @("Completed", "CompletedWithWarnings", "Failed")) { return $null }
+    if ($Status.LiveState.MonitorRecoveryError) { return $Status.LiveState.MonitorRecoveryError }
+    if ($Status.MonitorLastError) { return "Target status monitor error: $($Status.MonitorLastError). Review the target monitor log; retry is pending." }
+    if ($Status.SetupProcessMissingSinceUtc -and $Status.Status -eq "InProgress") { return $Status.Notes }
+    $ageSeconds = ($NowUtc - $LastAdvanceAtUtc).TotalSeconds
+    if ($LastProducer.StatusUpdatedAtUtc) {
+        $stamp = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($LastProducer.StatusUpdatedAtUtc, [ref]$stamp)) {
+            $ageSeconds = [math]::Max($ageSeconds, ($NowUtc - $stamp).TotalSeconds)
+        } else { return "Target status timestamp is invalid; freshness cannot be verified. Check the target monitor." }
+    }
+    if ($ageSeconds -ge $StaleMinutes * 60) {
+        $buildContext = if ($LastProducer.TargetBuild -and $Status.LiveState.CurrentBuild -eq $LastProducer.TargetBuild) {
+            " The live OS already reports target build $($LastProducer.TargetBuild); Setup/validation completion still needs verification."
+        } else { "" }
+        return "ATTENTION: target status is stale/unavailable for $([math]::Round($ageSeconds / 60, 1)) min. Last confirmed phase='$($LastProducer.PhaseName)', overall=$($LastProducer.PercentComplete)%. Connectivity=$($Status.Mode).$buildContext Kindly check the target and OSUpgradePhaseMonitor; a reboot, failure, or telemetry outage is possible. Completion is NOT confirmed."
+    }
+    return $null
+}
+
+function Get-UpgradeCompletionCheck {
+    param($Status, [string]$TargetBuild)
+    $reason = if ($Status.Status -notin @("Completed", "CompletedWithWarnings") -or $Status.Mode -ne "ActivePolling") {
+        "A terminal target status and active WinRM are required."
+    } elseif (-not $TargetBuild) {
+        "Expected target build is missing."
+    } elseif (-not $Status.LiveState -or -not $Status.LiveState.CurrentBuild) {
+        "Live OS build/Setup flags could not be read; success cannot be independently confirmed."
+    } elseif ($Status.LiveState.CurrentBuild -ne $TargetBuild) {
+        "Live build $($Status.LiveState.CurrentBuild) does not match target $TargetBuild."
+    } elseif ($null -eq $Status.LiveState.SystemSetupInProgress -or $null -eq $Status.LiveState.OOBEInProgress) {
+        "Setup completion flags are missing; an unknown flag is not zero."
+    } elseif ($Status.LiveState.SystemSetupInProgress -ne 0 -or $Status.LiveState.OOBEInProgress -ne 0) {
+        "Target build is present but Windows Setup/OOBE is still active."
+    } else { $null }
+    [pscustomobject]@{ Confirmed = (-not $reason); Reason = $reason }
+}
+
+function Wait-UpgradeCompletion {
+    param(
+        $InitialStatus,
+        [string]$ComputerName,
+        [System.Management.Automation.PSCredential]$Cred,
+        [ValidateSet("Http","Https","HttpsSkipCert")][string]$Transport,
+        [string]$TargetBuild,
+        [ValidateRange(1,600)][int]$TimeoutSeconds = 60
+    )
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $candidate = $InitialStatus
+    $lastStatus = $InitialStatus
+    $lastReason = "Live completion has not been confirmed."
+    $lastLoggedReason = ""
+    $hasProbed = $false
+    Write-Log "Validating update for a few seconds on $ComputerName (up to $TimeoutSeconds seconds)..."
+    try {
+        while ($clock.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+            if ($candidate) {
+                $lastStatus = $candidate
+                if ($candidate.Status -eq "Failed") {
+                    Write-LocalStatusMirror -ProducerStatus $candidate -ObservationStatus $candidate
+                    return [pscustomobject]@{ Outcome = "Failed"; Status = $candidate; Error = $candidate.Notes }
+                }
+                $check = Get-UpgradeCompletionCheck -Status $candidate -TargetBuild $TargetBuild
+                if ($check.Confirmed) {
+                    Write-LocalStatusMirror -ProducerStatus $candidate -ObservationStatus $candidate
+                    return [pscustomobject]@{ Outcome = $candidate.Status; Status = $candidate; Error = $null }
+                }
+                $lastReason = $check.Reason
+            }
+            if ($lastReason -ne $lastLoggedReason) {
+                Write-Log "Final validation pending: $lastReason" "INFO" -LogOnly
+                $lastLoggedReason = $lastReason
+            }
+            $observation = [pscustomobject]@{
+                Mode = "Validating"; Source = "ServerA.FinalValidation"
+                PingOk = $candidate.PingOk; WinRmOk = $candidate.WinRmOk; LiveState = $candidate.LiveState
+            }
+            Write-LocalStatusMirror -ProducerStatus $candidate -ObservationStatus $observation -ObservationError $lastReason
+            Write-Progress -Activity "Monitoring OS upgrade on $ComputerName" `
+                -Status "Validating update... please wait (up to $TimeoutSeconds seconds)." -PercentComplete -1
+            if ($hasProbed) {
+                $delayMs = [int][math]::Min(5000, [math]::Max(0, ($TimeoutSeconds - $clock.Elapsed.TotalSeconds) * 1000))
+                if ($delayMs -gt 0) { Start-Sleep -Milliseconds $delayMs }
+            }
+            $remainingSeconds = $TimeoutSeconds - $clock.Elapsed.TotalSeconds
+            if ($remainingSeconds -lt 1) { break }
+            $probeError = $null
+            $remote = $null
+            try {
+                $remote = Get-RemoteUpgradeObservation -ComputerName $ComputerName -Cred $Cred -Transport $Transport `
+                    -TimeoutSec ([int][math]::Floor([math]::Min(15, $remainingSeconds))) -ErrorDetail ([ref]$probeError)
+            } catch {
+                $probeError = $_.Exception.Message
+            }
+            $candidate = Add-UpgradeObservation -Record $remote.ProducerStatus -PingOk ([bool]$lastStatus.PingOk) `
+                -WinRmOk ([bool]$remote) -Source "WinRM(FinalValidation)" -LiveState $remote.LiveState -LogOnly
+            if (-not $candidate) {
+                $lastReason = if ($probeError) { $probeError } else {
+                    "No valid current-run status returned by WinRM (missing, older, or mismatched run data)."
+                }
+            }
+            $hasProbed = $true
+        }
+    } finally {
+        $clock.Stop()
+    }
+    $message = "Post-upgrade validation could not be confirmed within $TimeoutSeconds seconds. Expected build=$TargetBuild; last target status=$($lastStatus.Status). $lastReason Review the target and orchestrator logs, then rerun monitoring. The OS upgrade itself may have succeeded; success is NOT being assumed."
+    $failedObservation = [pscustomobject]@{
+        Mode = "ValidationFailed"; Source = "ServerA.FinalValidation"; HealthWarning = $message
+        PingOk = $null; WinRmOk = $null
+    }
+    Write-LocalStatusMirror -ObservationStatus $failedObservation -ObservationError $message
+    return [pscustomobject]@{ Outcome = "ValidationFailed"; Status = $lastStatus; Error = $message }
+}
 
 function Test-RemoteWinRM {
     <#
@@ -1054,7 +1368,9 @@ function Get-RemoteStatusViaCimDcom {
     is down - matching the spec's "query via WMI/CIM/Registry" requirement
     as a channel distinct from PowerShell Remoting.
     #>
-    param([string]$ComputerName, [System.Management.Automation.PSCredential]$Cred, [ref]$ErrorDetail)
+    param([string]$ComputerName, [System.Management.Automation.PSCredential]$Cred, [ref]$ErrorDetail, [int]$TimeoutSec = 8)
+    $job = Start-Job -ScriptBlock {
+    param($ComputerName, $Cred)
     try {
         $cimOption = New-CimSessionOption -Protocol Dcom
         $cimParams = @{ ComputerName = $ComputerName; SessionOption = $cimOption; OperationTimeoutSec = 5; ErrorAction = "Stop" }
@@ -1065,11 +1381,11 @@ function Get-RemoteStatusViaCimDcom {
             $keyPath = "SOFTWARE\OSUpgradeAutomation"
 
             function Get-RegSZ($name) {
-                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
+                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetStringValue -OperationTimeoutSec 2 -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
                 if ($r.ReturnValue -eq 0) { return $r.sValue } else { return $null }
             }
             function Get-RegDWord($name) {
-                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
+                $r = Invoke-CimMethod -CimSession $cimSession -Namespace root\default -ClassName StdRegProv -MethodName GetDWORDValue -OperationTimeoutSec 2 -Arguments @{ hDefKey = $hDefKeyLocalMachine; sSubKeyName = $keyPath; sValueName = $name }
                 if ($r.ReturnValue -eq 0) { return $r.uValue } else { return $null }
             }
 
@@ -1084,6 +1400,7 @@ function Get-RemoteStatusViaCimDcom {
                 StageNumber                  = Get-RegDWord "StageNumber"
                 Stage                        = Get-RegSZ "Stage"
                 StagePercentComplete         = Get-RegDWord "StagePercentComplete"
+                PhasePercentComplete         = Get-RegDWord "PhasePercentComplete"
                 OverallPercentComplete       = Get-RegDWord "OverallPercentComplete"
                 PercentComplete              = Get-RegDWord "PercentComplete"
                 PercentSource                = Get-RegSZ "PercentSource"
@@ -1099,6 +1416,9 @@ function Get-RemoteStatusViaCimDcom {
                 RebootCount                  = Get-RegDWord "RebootCount"
                 LastObservedBootTimeUtc      = Get-RegSZ "LastObservedBootTimeUtc"
                 BootEvidence                 = Get-RegSZ "BootEvidence"
+                RestartRequestedAtUtc        = Get-RegSZ "RestartRequestedAtUtc"
+                UnexpectedRestartAtUtc       = Get-RegSZ "UnexpectedRestartAtUtc"
+                SetupPhaseHistory            = @(if (Get-RegSZ "SetupPhaseHistory") { Get-RegSZ "SetupPhaseHistory" | ConvertFrom-Json -ErrorAction Stop })
                 SourceBuild                  = Get-RegSZ "SourceBuild"
                 TargetBuild                  = Get-RegSZ "TargetBuild"
                 SourceOSCaption              = Get-RegSZ "SourceOSCaption"
@@ -1106,9 +1426,13 @@ function Get-RemoteStatusViaCimDcom {
                 Notes                        = Get-RegSZ "Notes"
                 SetupLogTail                 = Get-RegSZ "SetupLogTail"
                 SetupTelemetryPercent        = Get-RegDWord "SetupTelemetryPercent"
+                SetupTelemetryPhase          = Get-RegDWord "SetupTelemetryPhase"
                 SetupTelemetrySource         = Get-RegSZ "SetupTelemetrySource"
                 SetupProcessMissingSinceUtc  = Get-RegSZ "SetupProcessMissingSinceUtc"
                 SetupFailureDetectedAtUtc    = Get-RegSZ "SetupFailureDetectedAtUtc"
+                MonitorLastError             = Get-RegSZ "MonitorLastError"
+                VerifiedTargetBuild          = Get-RegSZ "VerifiedTargetBuild"
+                CompletionEvidence           = Get-RegSZ "CompletionEvidence"
                 PostUpgradeOSCaption         = Get-RegSZ "PostUpgradeOSCaption"
                 ServicesComparisonResult     = Get-RegSZ "ServicesComparisonResult"
                 ServicesComparisonReportPath = Get-RegSZ "ServicesComparisonReportPath"
@@ -1117,62 +1441,86 @@ function Get-RemoteStatusViaCimDcom {
                 LicenseRecommendation        = Get-RegSZ "LicenseRecommendation"
                 BackupFolder                 = Get-RegSZ "BackupFolder"
                 SystemStateBackupPath         = Get-RegSZ "SystemStateBackupPath"
+                DirtyBitCheckStatus          = Get-RegSZ "DirtyBitCheckStatus"
+                UserProfileInventoryStatus   = Get-RegSZ "UserProfileInventoryStatus"
+                UserProfileCount             = Get-RegDWord "UserProfileCount"
+                SpecialProfileCount          = Get-RegDWord "SpecialProfileCount"
+                TotalProfileCount            = Get-RegDWord "TotalProfileCount"
+                LoadedUserProfileCount       = Get-RegDWord "LoadedUserProfileCount"
+                UserProfileInventoryPath     = Get-RegSZ "UserProfileInventoryPath"
+                OrphanedProfileCheckStatus   = Get-RegSZ "OrphanedProfileCheckStatus"
+                OrphanedProfileCount         = Get-RegDWord "OrphanedProfileCount"
+                PendingFileRenameCheckStatus = Get-RegSZ "PendingFileRenameCheckStatus"
             }
             return [pscustomobject]$obj
         } finally {
             Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
         }
-    } catch {
-        if ($ErrorDetail) { $ErrorDetail.Value = $_.Exception.Message }
+    } catch { throw }
+    } -ArgumentList $ComputerName, $Cred
+    try {
+        if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+            $jobError = $null
+            $result = Receive-Job -Job $job -ErrorVariable jobError -ErrorAction SilentlyContinue
+            if ($jobError -and $ErrorDetail) { $ErrorDetail.Value = $jobError[0].ToString() }
+            return $result
+        }
+        if ($ErrorDetail) { $ErrorDetail.Value = "Entire DCOM status read timed out after ${TimeoutSec}s." }
         return $null
+    } finally {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
     }
 }
 
 function Get-UpgradeStatus {
     <#
-    Combines ping + explicit WinRM probe + file-read + DCOM/CIM fallback into
-    one status snapshot, and stamps it with a "Mode":
-      - "Offline"      : NONE of ping/WinRM/file-share/DCOM answered (Server
-                          B is genuinely down / mid-reboot / the one true
-                          WinPE blind window).
-      - "ActivePolling" : WinRM is confirmed reachable (Test-WSMan succeeded).
-      - "Heartbeat"     : some channel answered (ping, and/or file/DCOM) but
-                          WinRM does NOT - this is the expected state while
-                          Server B tears down networking to enter Safe
-                          OS/WinPE, and through First Boot until the WinRM
-                          service comes back up. Server A keeps polling on
-                          the same interval throughout - there is nothing to
-                          "resume" manually, it is automatic.
-    IMPORTANT: ping (ICMP) is treated as a best-effort AUXILIARY SIGNAL only,
-    never as a hard gate. Some environments block ICMP entirely via firewall
-    policy - in that case Test-Connection would ALWAYS fail even while
-    Server B is fully up and WinRM/SMB/DCOM-reachable. This function
-    therefore ALWAYS attempts WinRM/file-share/DCOM regardless of the ping
-    result, and only reports "Offline" when literally none of the four
-    channels (ping, WinRM, file, DCOM) answer - so an ICMP-blocked
-    environment still gets fully accurate Active/Heartbeat tracking, it
-    just never benefits from ping's cheap "definitely down" fast-path.
+    Prefer live WinRM registry/build evidence, then independent SMB and DCOM
+    fallbacks. A readable old file is not proof that its writer is alive.
+    ActivePolling means WinRM answered; Heartbeat means some other channel
+    answered; Offline means none answered. These are connectivity states,
+    never Setup phase determinations. ICMP is auxiliary, not a hard gate.
     #>
     param([string]$ComputerName, [System.Management.Automation.PSCredential]$Cred, [string]$JsonPath)
 
-    $pingOk  = Test-Connection -ComputerName $ComputerName -Count 1 -Quiet -ErrorAction SilentlyContinue
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    try { $pingOk = ($ping.Send($ComputerName, 1000).Status -eq "Success") }
+    catch { $pingOk = $false }
+    finally { $ping.Dispose() }
     $winRmOk = Test-RemoteWinRM -ComputerName $ComputerName -Cred $Cred -TimeoutSec 5
     $mode    = if ($winRmOk) { "ActivePolling" } else { "Heartbeat" }
+
+    $observation = $null
+    $liveError = $null
+    if ($winRmOk) {
+        $observation = Get-RemoteUpgradeObservation -ComputerName $ComputerName -Cred $Cred `
+            -Transport $script:WinRMTransport -ErrorDetail ([ref]$liveError)
+        $accepted = Add-UpgradeObservation -Record $observation.ProducerStatus -PingOk $pingOk -WinRmOk $winRmOk `
+            -Source "WinRM(LiveRegistry)" -LiveState $observation.LiveState
+        if ($accepted) {
+            $script:fileDcomDiagLogged = $false
+            return $accepted
+        }
+        if ($liveError) { Write-Log "Live status/build probe unavailable; trying other channels: $liveError" "WARN" }
+    }
 
     # Channel A - admin share JSON file (independent of WinRM; needs SMB/admin$ only).
     $driveLetter = ($JsonPath -split ':')[0]
     $uncPath = "\\$ComputerName\$driveLetter`$\$(($JsonPath -split ':', 2)[1].TrimStart('\'))"
     $fileErr = $null
-    $raw = Read-RemoteFileWithTimeout -Path $uncPath -TimeoutSec 5 -ErrorDetail ([ref]$fileErr)
+    $fileStatus = $null
+    $raw = Read-RemoteFileWithTimeout -Path $uncPath -TimeoutSec 2 -ErrorDetail ([ref]$fileErr)
     if ($raw) {
         try {
             $parsed = $raw | ConvertFrom-Json
-            $parsed | Add-Member -NotePropertyName PingOk  -NotePropertyValue $pingOk  -Force
-            $parsed | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $winRmOk -Force
-            $parsed | Add-Member -NotePropertyName Mode    -NotePropertyValue $mode    -Force
-            $parsed | Add-Member -NotePropertyName Source  -NotePropertyValue "File($uncPath)" -Force
-            $script:fileDcomDiagLogged = $false
-            return $parsed
+            $fileStatus = Add-UpgradeObservation -Record $parsed -PingOk $pingOk -WinRmOk $winRmOk `
+                -Source "File($uncPath)" -LiveState $observation.LiveState
+            $stamp = [DateTimeOffset]::MinValue
+            if ($fileStatus -and [DateTimeOffset]::TryParse($fileStatus.StatusUpdatedAtUtc, [ref]$stamp) -and
+                ([DateTimeOffset]::UtcNow - $stamp).TotalSeconds -lt 120) {
+                $script:fileDcomDiagLogged = $false
+                return $fileStatus
+            }
         } catch {
             Write-Log "Status file read but could not be parsed as JSON (transient write in progress?) - will retry next poll." "WARN"
         }
@@ -1181,14 +1529,13 @@ function Get-UpgradeStatus {
     # Channel B - CIM over DCOM/RPC (also independent of WinRM).
     $cimErr = $null
     $cimStatus = Get-RemoteStatusViaCimDcom -ComputerName $ComputerName -Cred $Cred -ErrorDetail ([ref]$cimErr)
-    if ($cimStatus) {
-        $cimStatus | Add-Member -NotePropertyName PingOk  -NotePropertyValue $pingOk  -Force
-        $cimStatus | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $winRmOk -Force
-        $cimStatus | Add-Member -NotePropertyName Mode    -NotePropertyValue $mode    -Force
-        $cimStatus | Add-Member -NotePropertyName Source  -NotePropertyValue "CIM(DCOM)" -Force
+    $accepted = Add-UpgradeObservation -Record $cimStatus -PingOk $pingOk -WinRmOk $winRmOk `
+        -Source "CIM(DCOM)" -LiveState $observation.LiveState
+    if ($accepted -and (-not $fileStatus -or [long]$accepted.Sequence -ge [long]$fileStatus.Sequence)) {
         $script:fileDcomDiagLogged = $false
-        return $cimStatus
+        return $accepted
     }
+    if ($fileStatus) { return $fileStatus }
 
     # Channel C - read the same atomic target JSON through WinRM. This keeps
     # detailed status available in hardened networks where 5985/5986 is open
@@ -1200,12 +1547,12 @@ function Get-UpgradeStatus {
         if ($winRmRaw) {
             try {
                 $parsed = $winRmRaw | ConvertFrom-Json
-                $parsed | Add-Member -NotePropertyName PingOk  -NotePropertyValue $pingOk  -Force
-                $parsed | Add-Member -NotePropertyName WinRmOk -NotePropertyValue $true    -Force
-                $parsed | Add-Member -NotePropertyName Mode    -NotePropertyValue $mode    -Force
-                $parsed | Add-Member -NotePropertyName Source  -NotePropertyValue "WinRM($JsonPath)" -Force
-                $script:fileDcomDiagLogged = $false
-                return $parsed
+                $accepted = Add-UpgradeObservation -Record $parsed -PingOk $pingOk -WinRmOk $winRmOk `
+                    -Source "WinRM($JsonPath)" -LiveState $observation.LiveState
+                if ($accepted) {
+                    $script:fileDcomDiagLogged = $false
+                    return $accepted
+                }
             } catch {
                 $winRmStatusErr = "Target JSON was read through WinRM but could not be parsed: $($_.Exception.Message)"
             }
@@ -1225,7 +1572,7 @@ function Get-UpgradeStatus {
             Write-Log "WinRM is up on $ComputerName but no status payload channel returned data. File-share reason: $(if ($fileErr) { $fileErr } else { 'no data/empty response' }) | DCOM reason: $(if ($cimErr) { $cimErr } else { 'no data/empty response' }) | WinRM JSON reason: $(if ($winRmStatusErr) { $winRmStatusErr } else { 'no data/empty response' }). Will keep retrying; this message won't repeat every poll." "WARN"
             $script:fileDcomDiagLogged = $true
         }
-        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "InProgress"; PhaseName = "Reachable via WinRM (no status payload yet)"; PercentComplete = $null; Notes = "WinRM confirmed up, but the target JSON could not be read through WinRM and no file-share or DCOM status source is reachable yet."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+        return [pscustomobject]@{ PingOk = $pingOk; WinRmOk = $true; Mode = $mode; Source = "WinRMOnly"; Status = "Unknown"; PhaseName = "WinRM reachable; Setup phase unconfirmed"; PercentComplete = $null; Notes = "No readable target status. Live probe: $liveError; SMB: $fileErr; DCOM: $cimErr; WinRM JSON: $winRmStatusErr"; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution"; LiveState = $observation.LiveState }
     }
 
     # WinRM is down too, but ping succeeded - typical during the Safe OS
@@ -1239,7 +1586,7 @@ function Get-UpgradeStatus {
         # sub-phase. Wording calls out Safe OS/WinPE by name so it's less
         # ambiguous to a customer watching the GUI bar than a bare
         # "heartbeat only" message.
-        return [pscustomobject]@{ PingOk = $true; WinRmOk = $false; Mode = "Heartbeat"; Source = "PingOnly"; Status = "InProgress"; PhaseName = "Safe OS/WinPE transition in progress (WinRM down - heartbeat via ping only)"; PercentComplete = $null; Notes = "Host responds to ping; WinRM is DOWN and no file/DCOM status source is reachable yet - normal during the Safe OS/WinPE reboot transition. No action needed."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+        return [pscustomobject]@{ PingOk = $true; WinRmOk = $false; Mode = "Heartbeat"; Source = "PingOnly"; Status = "Unknown"; PhaseName = "Reboot/network transition; Setup phase unconfirmed"; PercentComplete = $null; Notes = "Ping alone cannot distinguish Safe OS, normal boot, interrupted Setup, or rollback. Awaiting Setup/build evidence."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
     }
 
     # Nothing answered on ANY of the four channels. This is either a true
@@ -1249,7 +1596,7 @@ function Get-UpgradeStatus {
     # assume ping is a reliable "is it down" signal on its own. Stage is set
     # for the same reason as the PingOnly branch above - this can only ever
     # fire after setup.exe has already launched.
-    return [pscustomobject]@{ PingOk = $false; WinRmOk = $false; Mode = "Offline"; Source = "None"; Status = "Offline"; PhaseName = "Safe OS/WinPE transition or reboot in progress (unreachable on ping, WinRM, file-share, and DCOM)"; PercentComplete = $null; Notes = ""; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
+    return [pscustomobject]@{ PingOk = $false; WinRmOk = $false; Mode = "Offline"; Source = "None"; Status = "Unknown"; PhaseName = "Target unreachable; Setup phase unconfirmed"; PercentComplete = $null; Notes = "No target channel responded. A reboot, network outage, or failure is possible; retaining the last confirmed status."; TargetBuild = $null; Stage = "Stage 3/3: Windows Setup Execution" }
 }
 
 function Show-ProgressBar {
@@ -1319,6 +1666,13 @@ function Show-ProgressBar {
 Write-Log "Entering monitoring loop (poll every $PollIntervalSeconds sec, timeout $TimeoutMinutes min)..."
 Write-Log "Monitoring modes: ACTIVE (WinRM reachable - richest status) / HEARTBEAT (ping-only, WinRM down - expected during SafeOS/reboots) / OFFLINE (no ping response)."
 $startTime      = Get-Date
+$script:ExpectedRunId = if ($resumeExisting) { $existing.RunId } else { $script:LastProducerStatus.RunId }
+$lastProducerKey = $null
+$lastProducerAdvanceAtUtc = [DateTimeOffset]::UtcNow
+$lastHealthWarningAtUtc = [DateTimeOffset]::MinValue
+$lastHealthWarningKey = ""
+$lastRecoveryMessage = ""
+$reportedPhaseHistory = @{}
 # Tracks the last CONFIRMED real Phase reading (File/CIM-DCOM) - never the
 # synthetic WinRMOnly/Heartbeat/Offline fallback text ("Safe OS/WinPE
 # transition or reboot in progress...") is a GUESS, not a confirmed fact -
@@ -1349,7 +1703,7 @@ $lastMode       = ""
 $disconnectedSince = $null
 $targetBuildKnown = $null
 $finalOutcome   = "Timeout"
-$buildConfirmFailCount = 0
+$finalValidationError = $null
 # Phase-stall tracking: NEVER used to declare a failure or stop monitoring -
 # only to give EARLY, non-committal visibility if a single phase is taking
 # unusually long, so you're not left blind for the full $TimeoutMinutes
@@ -1388,7 +1742,7 @@ $outageObservedSinceLastPhase = $false
 while ($true) {
     $elapsedMin = (New-TimeSpan -Start $startTime -End (Get-Date)).TotalMinutes
     if ($elapsedMin -gt $TimeoutMinutes) {
-        Write-Log "Monitoring timeout ($TimeoutMinutes minutes) reached. The upgrade may still be legitimately in progress - re-run this script (it will simply resume monitoring) or check $TargetComputer manually." "WARN"
+        Write-Log "Monitoring timeout ($TimeoutMinutes minutes) reached. Last confirmed phase='$lastConfirmedPhaseName', overall=$lastKnownPercent%. Kindly check $TargetComputer and the target monitor logs. The upgrade outcome is UNVERIFIED; re-running resumes monitoring without launching Setup again." "WARN"
         $timeoutObservation = [pscustomobject]@{
             PingOk = $null; WinRmOk = $null; Mode = "MonitoringStopped"; Source = "ServerA.Timeout"
         }
@@ -1412,10 +1766,45 @@ while ($true) {
         continue
     }
 
+    $healthProducer = $script:LastProducerStatus
+    if ($null -ne $status.Phase) {
+        if (-not $script:ExpectedRunId -and $status.RunId) { $script:ExpectedRunId = $status.RunId }
+        $producerKey = "$($status.RunId)|$($status.Sequence)|$($status.StatusUpdatedAtUtc)"
+        if ($producerKey -ne $lastProducerKey) {
+            $lastProducerAdvanceAtUtc = [DateTimeOffset]::UtcNow
+            $lastProducerKey = $producerKey
+        }
+        $healthProducer = $status
+    }
+    $healthWarning = Get-UpgradeHealthWarning -Status $status -LastProducer $healthProducer `
+        -LastAdvanceAtUtc $lastProducerAdvanceAtUtc -StaleMinutes $StatusStaleWarningMinutes
+    $status | Add-Member -NotePropertyName HealthWarning -NotePropertyValue $healthWarning -Force
+    $healthKey = if ($status.SetupProcessMissingSinceUtc) { "MissingSetup|$($status.SetupProcessMissingSinceUtc)" }
+        elseif ($status.MonitorLastError) { "MonitorError|$($status.MonitorLastError)" }
+        elseif ($status.LiveState.MonitorRecoveryError) { $status.LiveState.MonitorRecoveryError }
+        else { "Stale|$($healthProducer.Phase)" }
+    if ($healthWarning -and ($healthKey -ne $lastHealthWarningKey -or
+        ([DateTimeOffset]::UtcNow - $lastHealthWarningAtUtc).TotalMinutes -ge $StatusStaleWarningMinutes)) {
+        Write-Log $healthWarning "WARN"
+        $lastHealthWarningAtUtc = [DateTimeOffset]::UtcNow
+        $lastHealthWarningKey = $healthKey
+    } elseif (-not $healthWarning) { $lastHealthWarningKey = "" }
+    if ($status.LiveState.MonitorRecovery -and $status.LiveState.MonitorRecovery -ne $lastRecoveryMessage) {
+        Write-Log $status.LiveState.MonitorRecovery "WARN"
+    }
+    $lastRecoveryMessage = $status.LiveState.MonitorRecovery
     if ($null -ne $status.Phase) {
         Write-LocalStatusMirror -ProducerStatus $status -ObservationStatus $status
+        foreach ($entry in @($status.SetupPhaseHistory)) {
+            if ($null -eq $entry) { continue }
+            $historyKey = "$($status.RunId)|$($entry.Phase)|$($entry.StartedAtUtc)"
+            if (-not $reportedPhaseHistory.ContainsKey($historyKey)) {
+                Write-Log "Confirmed Setup history: $($entry.PhaseName) began $($entry.StartedAtUtc) via $($entry.Source). Recovered from the target log; not necessarily observed live."
+                $reportedPhaseHistory[$historyKey] = $true
+            }
+        }
     } else {
-        Write-LocalStatusMirror -ObservationStatus $status
+        Write-LocalStatusMirror -ObservationStatus $status -ObservationError $status.Notes
     }
 
     if ($status.TargetBuild) { $targetBuildKnown = $status.TargetBuild }
@@ -1465,6 +1854,7 @@ while ($true) {
     # for why that guess has been directly observed to be wrong.
     $lastConfirmedForDisplay = if ($null -ne $lastConfirmedPhaseName) { $lastConfirmedPhaseName } else { "no phase confirmed yet" }
     $displayPhaseName = if ($null -ne $status.Phase) { $status.PhaseName } else { "$lastConfirmedForDisplay (connectivity gap - phase UNCONFIRMED; could be a Safe OS/WinPE reboot in progress, or just a transient interruption while still in this same phase - next real reading will confirm)" }
+    if ($healthWarning) { $displayPhaseName += " | ATTENTION: $healthWarning" }
     $progressFreshnessForDisplay = if ($null -ne $status.Phase -and $status.ProgressFreshness) { $status.ProgressFreshness } else { "CarriedForward" }
     $progressSourceForDisplay = if ($null -ne $status.Phase -and $status.ProgressSource) { $status.ProgressSource } else { "ServerA.CachedProducerStatus" }
     Show-ProgressBar -PercentComplete $pct -PhaseName $displayPhaseName -Status $status.Status `
@@ -1478,7 +1868,7 @@ while ($true) {
                 if ($lastMode -eq "ActivePolling") {
                     $disconnectedSince = Get-Date
                     $outageObservedSinceLastPhase = $true
-                    Write-Log "WinRM connectivity LOST on $TargetComputer - switching from Active Polling to Heartbeat monitoring. This is expected while $TargetComputer tears down networking to enter Safe OS / reboots." "WARN"
+                    Write-Log "WinRM connectivity LOST on $TargetComputer - switching to Heartbeat monitoring. A reboot/Setup transition, service outage, or failure is possible; the phase is not established by connectivity." "WARN"
                 } else {
                     Write-Log "$TargetComputer is reachable (Heartbeat mode via $($status.Source)) - WinRM not yet available."
                 }
@@ -1500,11 +1890,7 @@ while ($true) {
                     if ($disconnectedSince) {
                         $downSecs = [math]::Round(((Get-Date) - $disconnectedSince).TotalSeconds)
                         $downForText = if ($downSecs -lt 60) { "$downSecs sec" } else { "$([math]::Round($downSecs/60,1)) min" }
-                        $interpretation = if ($downSecs -lt 60) {
-                            " This was brief enough to most likely be a single transient network blip, NOT a genuine reboot (a real Safe OS/WinPE reboot typically renders every channel unreachable for several minutes, not seconds)."
-                        } else {
-                            " This duration is consistent with a genuine Safe OS/WinPE reboot transition."
-                        }
+                        $interpretation = " Outage duration alone does not identify Safe OS, a reboot, or failure. Checking live build, Setup flags, and current-run log evidence."
                     }
                     Write-Log "WinRM connectivity RESTORED on $TargetComputer after being unreachable for $downForText - resuming Active Polling (reading status via WinRM/CIM/file share).$interpretation" "SUCCESS"
                     $disconnectedSince = $null
@@ -1537,9 +1923,9 @@ while ($true) {
             $outageClause = if ($outageObservedSinceLastPhase) {
                 "A connectivity outage WAS observed in between (see the Offline/Heartbeat log lines above), consistent with the reboot(s) these phase(s) require."
             } else {
-                "No connectivity outage was observed at all in between - this means the ENTIRE reboot cycle for these phase(s) completed faster than even a single $PollIntervalSeconds-second poll could catch full unreachability (possible on a fast VM/host), not that anything was missed due to an error."
+                "No connectivity outage was sampled; phase execution must be established from Setup logs, not inferred from poll timing."
             }
-            Write-Log "NOTE: $($skippedNames -join ' and ') did not get an individual reading on this monitor between the last confirmed status and this one. This is EXPECTED, not an error - Safe OS runs entirely inside WinPE with zero network connectivity (no WinRM/SMB/DCOM to poll), and First Boot can finish faster than this script's poll interval on a fast upgrade. $outageClause $TargetComputer's own OSUpgradeProgress.log on the target has the full, gap-free timeline if you need exact timing for either phase." "INFO"
+            Write-Log "NOTE: $($skippedNames -join ' and ') had no live sample between these readings. $outageClause See the confirmed Setup history above when available; missing evidence is not a gap-free timeline or proof of failure." "INFO"
         }
         # Reset unconditionally on every real reading (not just when a skip
         # fires) - otherwise a stale "outage happened" flag from an earlier,
@@ -1578,7 +1964,7 @@ while ($true) {
             # of staying silent (silence here would look identical to
             # "nothing happened, still polling normally", when actually a
             # real gap+reconnect cycle just occurred and is worth surfacing).
-            Write-Log "$(if ($status.Stage) { "[$($status.Stage)] " })$TargetComputer reconnected and confirms it is STILL in '$($status.PhaseName)' - the connectivity gap did NOT correspond to a confirmed phase change (whatever caused it - a fast internal Setup network-stack operation, a transient VM/hypervisor blip, etc. - the machine never actually left this phase)." "INFO"
+            Write-Log "$(if ($status.Stage) { "[$($status.Stage)] " })$TargetComputer reconnected. Latest published phase remains '$($status.PhaseName)'; this may be cached until the target monitor refreshes. Live build=$($status.LiveState.CurrentBuild). Absence of a new sample does not prove that Setup stayed in this phase." "INFO"
         } elseif ($status.Status -eq "InProgress") {
             # Escalating, NON-FATAL stall notice - fires at 1x, 2x, 3x... the
             # threshold while still sitting in the SAME phase. Purely
@@ -1610,83 +1996,15 @@ while ($true) {
     # "automatically reconnects and resumes reading the status log" before
     # confirming completion - a Heartbeat-only ping is not sufficient proof
     # the server has finished booting into a fully usable state.
-    if ($status.Status -in @("Completed","CompletedWithWarnings") -and $status.Mode -eq "ActivePolling") {
-        $buildConfirmed = $true
-        if ($targetBuildKnown) {
-            try {
-                # NOTE: Get-CimInstance throws "A parameter cannot be found
-                # that matches parameter name 'Credential'" if -Credential is
-                # passed but resolves to $null (i.e. whenever this script was
-                # run without -Credential, using the caller's own current
-                # session/integrated auth) - unlike most other -Credential
-                # parameters across PowerShell, CIM cmdlets do NOT silently
-                # accept a null credential. Every other CIM/WinRM call in
-                # this script already guards against this via conditional
-                # splatting - this one didn't, which is exactly why the
-                # build re-confirmation kept failing (and retrying, per the
-                # bounded-retry fix below) on every run made without
-                # -Credential. Fixed by splatting conditionally like the rest.
-                # This call uses the WSMan transport, so it must honour the
-                # same HTTP/HTTPS resolution as every other WinRM call -
-                # -ComputerName alone would always target 5985.
-                $cimCheckParams  = @{ ClassName = "Win32_OperatingSystem"; ErrorAction = "Stop" }
-                $cimCheckSession = $null
-                if ($script:WinRMTransport -in @("Https","HttpsSkipCert")) {
-                    $cimOptArgs = @{ UseSsl = $true }
-                    if ($script:WinRMTransport -eq "HttpsSkipCert") {
-                        $cimOptArgs["SkipCACheck"]         = $true
-                        $cimOptArgs["SkipCNCheck"]         = $true
-                        $cimOptArgs["SkipRevocationCheck"] = $true
-                    }
-                    $cimSessParams = @{
-                        ComputerName  = $TargetComputer
-                        Port          = 5986
-                        SessionOption = (New-CimSessionOption @cimOptArgs)
-                        ErrorAction   = "Stop"
-                    }
-                    if ($Credential) { $cimSessParams["Credential"] = $Credential }
-                    $cimCheckSession = New-CimSession @cimSessParams
-                    $cimCheckParams["CimSession"] = $cimCheckSession
-                } else {
-                    $cimCheckParams["ComputerName"] = $TargetComputer
-                    if ($Credential) { $cimCheckParams["Credential"] = $Credential }
-                }
-                try {
-                    $osCheck = Get-CimInstance @cimCheckParams
-                } finally {
-                    if ($cimCheckSession) { Remove-CimSession -CimSession $cimCheckSession -ErrorAction SilentlyContinue }
-                }
-                $buildConfirmed = ($osCheck.BuildNumber -eq $targetBuildKnown)
-                if (-not $buildConfirmed) {
-                    Write-Log "Status=$($status.Status) but live build ($($osCheck.BuildNumber)) does not yet match expected target build ($targetBuildKnown) - continuing to monitor." "WARN"
-                }
-            } catch {
-                # WinRM/CIM not reachable yet even though Test-WSMan just
-                # succeeded (race during service startup) - treat as
-                # not-yet-confirmed and keep polling rather than failing.
-                # This used to fail SILENTLY (no log line), which made the
-                # console look permanently "stuck" at 100% with no visible
-                # explanation whenever CIM kept failing (e.g. a genuine
-                # DCOM/WMI firewall or double-hop issue distinct from plain
-                # WinRM). Now logged, and bounded: after a few minutes of
-                # failing this independent re-check, fall back to trusting
-                # Server B's own already-build-verified status (
-                # Update-UpgradeStatus.ps1 only ever reaches Phase 7 after
-                # confirming currentBuild -eq targetBuild locally) rather
-                # than looping forever.
-                $buildConfirmed = $false
-                $buildConfirmFailCount++
-                Write-Log "Could not independently re-confirm live build via CIM (attempt $buildConfirmFailCount, non-fatal, will retry): $_" "WARN"
-                if ($buildConfirmFailCount -ge 8) {
-                    Write-Log "CIM build re-confirmation failed $buildConfirmFailCount times ($([math]::Round($buildConfirmFailCount * $PollIntervalSeconds / 60,1)) min) - accepting $TargetComputer's own already-verified Status=$($status.Status) without further independent re-check." "WARN"
-                    $buildConfirmed = $true
-                }
-            }
-        }
-        if ($buildConfirmed) {
-            $finalOutcome = $status.Status
-            break
-        }
+    if ($status.Status -in @("Completed","CompletedWithWarnings")) {
+        $remainingMonitorSeconds = [math]::Max(1, [math]::Floor(($TimeoutMinutes * 60) - ((Get-Date) - $startTime).TotalSeconds))
+        $validationResult = Wait-UpgradeCompletion -InitialStatus $status -ComputerName $TargetComputer -Cred $Credential `
+            -Transport $script:WinRMTransport -TargetBuild $targetBuildKnown `
+            -TimeoutSeconds ([int][math]::Min($FinalValidationTimeoutSeconds, $remainingMonitorSeconds))
+        $status = $validationResult.Status
+        $finalOutcome = $validationResult.Outcome
+        $finalValidationError = $validationResult.Error
+        break
     }
 
     # Poll faster while disconnected (Heartbeat/Offline) - see
@@ -1703,7 +2021,7 @@ $totalMinutes = [math]::Round((New-TimeSpan -Start $startTime -End (Get-Date)).T
 # Update-UpgradeStatus.ps1's post-upgrade validation (Phase 7) and travel via
 # whichever channel (file share / CIM-DCOM) last answered.
 $summaryOsCaption      = if ($status.PostUpgradeOSCaption) { $status.PostUpgradeOSCaption } else { "(not reported)" }
-$summaryBuild          = if ($targetBuildKnown) { $targetBuildKnown } elseif ($status.TargetBuild) { $status.TargetBuild } else { "(not reported)" }
+$summaryBuild          = if ($status.LiveState.CurrentBuild) { $status.LiveState.CurrentBuild } elseif ($status.VerifiedTargetBuild) { $status.VerifiedTargetBuild } else { "(live build unavailable; expected $targetBuildKnown)" }
 $summaryServicesResult = if ($status.ServicesComparisonResult) { $status.ServicesComparisonResult } else { "NotAvailable" }
 $summaryServicesPath   = if ($status.ServicesComparisonReportPath) { $status.ServicesComparisonReportPath } else { "(not available)" }
 # Customer-facing wording is deliberately calibrated to not cause alarm over
@@ -1723,6 +2041,9 @@ $summaryServicesLine = switch ($summaryServicesResult) {
 # note, not something that should have blocked (or now be silently omitted
 # from) an otherwise-successful upgrade.
 $summaryLicenseLine = if ($status.LicenseRecommendation) { $status.LicenseRecommendation } else { "Not reported (verify manually: slmgr /dlv)." }
+$summaryProfileLine = if ($null -ne $status.UserProfileCount -and $null -ne $status.TotalProfileCount) {
+    "$($status.UserProfileCount) user / $($status.TotalProfileCount) total incl. system; inventory=$($status.UserProfileInventoryStatus)"
+} else { "Unavailable/not reported; assess profile-related migration duration manually." }
 
 function Write-FinalSummary {
     param([string]$UpgradeStatus)
@@ -1732,6 +2053,10 @@ function Write-FinalSummary {
     Write-Log " Build                     : $summaryBuild"
     Write-Log " Post-upgrade services     : $summaryServicesLine"
     Write-Log " Licensing/Activation      : $summaryLicenseLine"
+    Write-Log " User profiles (precheck)  : $summaryProfileLine"
+    Write-Log " Orphan-profile check      : $(if ($status.OrphanedProfileCheckStatus) { $status.OrphanedProfileCheckStatus } else { 'Not reported' })"
+    Write-Log " Disk dirty-bit check      : $(if ($status.DirtyBitCheckStatus) { $status.DirtyBitCheckStatus } else { 'Not reported' })"
+    Write-Log " Pending-file-rename gate  : $(if ($status.PendingFileRenameCheckStatus) { $status.PendingFileRenameCheckStatus } else { 'Not reported' })"
     Write-Log " Monitoring duration       : $totalMinutes minute(s)."
     Write-Log "===================================================================="
 }
@@ -1753,13 +2078,13 @@ switch ($finalOutcome) {
         # reliable, not more. Instead: just tell the customer plainly that
         # this is expected, so a still-settling console doesn't look like a
         # contradiction of the "Success" verdict just printed.
-        Write-Log "Note: the target may still show brief post-completion housekeeping for a few minutes (Group Policy Client processing, one more reboot) - this is normal first-logon Windows behavior, not a sign the upgrade itself is incomplete. Windows Setup's own /PostOOBE hook (Microsoft's own definition of 'upgrade finished') plus a local build-number re-check are what this Success verdict is based on." "INFO"
+        Write-Log "Completion was validated on the target and independently checked through live build/Setup flags. Evidence=$($status.CompletionEvidence). Brief first-logon housekeeping may still follow." "INFO"
         exit 0
     }
     "CompletedWithWarnings" {
         Write-FinalSummary -UpgradeStatus "Success (with warnings - review notes below before closing the change)"
         Write-Log " Notes: $($status.Notes)" "WARN"
-        Write-Log "Note: the target may still show brief post-completion housekeeping for a few minutes (Group Policy Client processing, one more reboot) - this is normal first-logon Windows behavior, not a sign the upgrade itself is incomplete. Windows Setup's own /PostOOBE hook (Microsoft's own definition of 'upgrade finished') plus a local build-number re-check are what this Success verdict is based on." "INFO"
+        Write-Log "Completion was validated on the target and independently checked through live build/Setup flags. Evidence=$($status.CompletionEvidence). Brief first-logon housekeeping may still follow." "INFO"
         exit 0
     }
     "Failed" {
@@ -1767,6 +2092,11 @@ switch ($finalOutcome) {
         Write-Log " Failed at phase           : $($status.PhaseName) (Notes: $($status.Notes))" "ERROR"
         Write-Log " Review D:\UpgradeBackup\<run>\OSUpgradeProgress.log and Logs\ (incl. SetupDiagResults.xml if present), plus C:\ProgramData\OSUpgradeAutomation\Logs, on $TargetComputer." "ERROR"
         exit 1
+    }
+    "ValidationFailed" {
+        Write-FinalSummary -UpgradeStatus "ERROR - post-upgrade validation unconfirmed"
+        Write-Log $finalValidationError "ERROR"
+        exit 3
     }
     default {
         Write-Log "Monitoring ended without a terminal status (timeout). Re-run this script to resume monitoring $TargetComputer." "WARN"

@@ -20,11 +20,10 @@
 
     HONEST LIMITATION (Safe OS / Phase 4): the machine boots into a temporary
     WinPE-like environment to apply the new image. No script or scheduled task
-    can execute there. The event-triggered 'OSUpgradeRebootWatcher' task marks
-    Phase 4 when restart initiation is observed (Event ID 1074). Numeric
-    progress and its timestamp remain at the last verified SetupProgress
-    sample until normal Windows services return. Server A's local mirror
-    remains readable and marks its producer snapshot as carried forward.
+    normally runs there in this solution. Event 1074 records a restart request,
+    not proof of Safe OS. Current-run Panther execution events recover Safe OS
+    and short First Boot phases retrospectively when Windows services return.
+    Numeric progress is phase-scoped; Downlevel 100 is not Setup completion.
 #>
 
 [CmdletBinding()]
@@ -61,28 +60,20 @@ function Write-Log {
 # Windows Setup progress telemetry
 # =============================================================================
 function Get-MoSetupVolatileProgress {
-    <#
-    Official Microsoft-documented registry key (Microsoft Learn: "Windows 10
-    upgrade issues troubleshooting" - confirmed via docs search, not just a
-    community claim): HKLM:\SYSTEM\Setup\mosetup\Volatile\SetupProgress - a
-    REG_BINARY value in the range 0-100, present ONLY while Setup's engine is
-    actively running. Per Microsoft: "Progress is tracked in the registry
-    during the upgrade process using this key" - it spans ALL FOUR phases
-    (Downlevel/SafeOS/First boot/Second boot) as ONE continuous, cumulative
-    0-100 arc reaching 100% precisely at the end of Second Boot/OOBE - unlike
-    ChildCompletion or the setupact.log regex scan, which are scoped/
-    heuristic per-phase signals. This is the sole numeric source used by this
-    status engine.
-    #>
+    # Setup can reach 100 before the first reboot; never use it as completion proof.
     try {
         $val = (Get-ItemProperty "HKLM:\SYSTEM\Setup\mosetup\Volatile" -Name "SetupProgress" -ErrorAction SilentlyContinue).SetupProgress
         if ($null -eq $val) { return $null }
-        # REG_BINARY comes back as a byte[] in PowerShell - the documented
-        # value is a single byte 0-100; be defensive about representation.
-        $n = if ($val -is [byte[]]) { [int]$val[0] } else { [int]$val }
+        $n = if ($val -is [byte[]]) {
+            if ($val.Length -eq 1) { [int]$val[0] }
+            elseif ($val.Length -eq 4) { [BitConverter]::ToUInt32($val, 0) }
+            else { throw "Unexpected SetupProgress binary length: $($val.Length)." }
+        } else { [int]$val }
         if ($n -ge 0 -and $n -le 100) { return $n }
+        Write-Log "Ignoring out-of-range SetupProgress value: $n." "WARN"
         return $null
     } catch {
+        Write-Log "Could not read SetupProgress; retaining the previous percentage: $_" "WARN"
         return $null
     }
 }
@@ -92,6 +83,7 @@ function Get-SetupProgressPercent {
     Returns only Microsoft's documented MoSetup SetupProgress value. The
     ChildCompletion value and arbitrary percentage text in setupact.log are
     scoped implementation details and are not safe end-to-end counters.
+    Even MoSetup is mapped only within the independently verified phase.
     When SetupProgress is absent, the caller carries the last verified value
     and marks it stale instead of manufacturing a replacement percentage.
     #>
@@ -114,6 +106,69 @@ function Get-SetupLogTail {
     }
 }
 
+function Get-SetupPhaseEvidence {
+    param([string[]]$Paths, [DateTimeOffset]$StartedAtUtc)
+    $phaseNames = @{ 3 = "Downlevel Phase"; 4 = "Safe OS Phase"; 5 = "First Boot Phase"; 6 = "Second Boot (OOBE) Phase" }
+    foreach ($path in $Paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        # Match execution starts only, never queued/planned operations or arbitrary phase text.
+        $matchesInFile = Select-String -LiteralPath $path -Pattern '\bSP\s+(Executing phase \[|OPERATIONTRACK ExecuteOperations: Start execution phase )' -ErrorAction Stop
+        foreach ($matchInFile in $matchesInFile) {
+            if ($matchInFile.Line -notmatch '^(?<stamp>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),.*?\bSP\s+(?:Executing phase \[(?<name>[^\]]+)\]|OPERATIONTRACK ExecuteOperations: Start execution phase (?<name>[^\r\n]+))\s*$') { continue }
+            $stamp = $Matches['stamp']
+            $phase = switch -Regex ($Matches['name'].Trim()) {
+                '^Downlevel$' { 3 }
+                '^Safe OS$' { 4 }
+                '^(Pre|Post) (SysPrep|First Boot)$' { 5 }
+                '^(Pre|Post) OOBE( Boot)?$' { 6 }
+                default { 0 }
+            }
+            if (-not $phase) { continue }
+            $localTime = [datetime]::ParseExact($stamp, 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
+            $eventUtc = ([DateTimeOffset]$localTime).ToUniversalTime()
+            if ($eventUtc -lt $StartedAtUtc.AddSeconds(-1) -or $eventUtc -gt [DateTimeOffset]::UtcNow.AddMinutes(1)) { continue }
+            [pscustomobject]@{
+                Phase = $phase
+                PhaseName = $phaseNames[$phase]
+                StartedAtUtc = $eventUtc.ToString("o")
+                Source = "WindowsSetup.ExecutionLog"
+                Path = $path
+                Evidence = $matchInFile.Line.Trim()
+            }
+        }
+    }
+}
+
+function Update-SetupPhaseHistory {
+    $launchTime = Get-UpgradeRegistryValue -Name "SetupLaunchTimeUtc"
+    if (-not $launchTime) { return @() }
+    $paths = @(
+        "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log",
+        (Join-Path $env:WINDIR "Panther\setupact.log")
+    )
+    $historyJson = Get-UpgradeRegistryValue -Name "SetupPhaseHistory" -Default "[]"
+    $history = @($historyJson | ConvertFrom-Json -ErrorAction Stop)
+    $signature = (@(foreach ($path in $paths) {
+        if (Test-Path -LiteralPath $path) {
+            $file = Get-Item -LiteralPath $path -ErrorAction Stop
+            "$path|$($file.Length)|$($file.LastWriteTimeUtc.Ticks)"
+        }
+    }) -join ";")
+    if ($signature -eq (Get-UpgradeRegistryValue -Name "SetupLogScanSignature")) { return $history }
+    $events = @(Get-SetupPhaseEvidence -Paths $paths -StartedAtUtc ([DateTimeOffset]::Parse($launchTime)))
+    $combined = @(@($history) + @($events) | Group-Object Phase | ForEach-Object {
+        $_.Group | Sort-Object StartedAtUtc | Select-Object -First 1
+    } | Sort-Object Phase)
+    foreach ($entry in $combined) {
+        if (-not ($history | Where-Object { $_.Phase -eq $entry.Phase })) {
+            Write-Log "Setup log confirms $($entry.PhaseName) started at $($entry.StartedAtUtc) (recovered evidence, not a claim of live visibility)."
+        }
+    }
+    Set-UpgradeRegistryValue -Name "SetupPhaseHistory" -Value (ConvertTo-Json -InputObject $combined -Depth 4 -Compress)
+    Set-UpgradeRegistryValue -Name "SetupLogScanSignature" -Value $signature
+    return $combined
+}
+
 if (-not (Test-Path $script:StatusHelper)) {
     throw "Required shared status helper not found: $script:StatusHelper"
 }
@@ -126,18 +181,22 @@ if (-not (Test-Path $script:StatusHelper)) {
 # =============================================================================
 function Invoke-PostUpgradeValidation {
     Set-Phase -Phase 7 -PhaseName "Post-Upgrade Validation" -Status "InProgress" `
-        -PercentComplete 100 -PercentSource "Measured" -ProgressSource "StageBoundary.Validation" -ProgressFreshness "Milestone" `
+        -PercentComplete 0 -PercentSource "Measured" -ProgressSource "StageBoundary.Validation" -ProgressFreshness "Milestone" `
         -Notes "Windows Setup completed; validating build, edition, activation, services, and retained configuration."
     Write-Log "Running post-upgrade validation..."
     $issues = @()
 
-    try {
-        $osNow = Get-CimInstance Win32_OperatingSystem
-        $buildNow = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuildNumber
-        if ($targetBuild -and $buildNow -ne $targetBuild) {
-            $issues += "Build mismatch: expected $targetBuild, found $buildNow."
-        }
+    $osNow = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec 10 -ErrorAction Stop
+    $buildNow = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop).CurrentBuildNumber
+    if (-not $targetBuild -or $buildNow -ne $targetBuild -or $osNow.BuildNumber -ne $targetBuild) {
+        Set-Phase -Phase 7 -PhaseName "Post-Upgrade Validation" -Status "Failed" `
+            -ProgressSource "PostUpgradeValidation.Build" -ProgressFreshness "Terminal" `
+            -Notes "Cannot confirm upgrade: expected build '$targetBuild', registry build '$buildNow', live OS build '$($osNow.BuildNumber)'. Review Setup logs; a PostOOBE marker alone does not prove success."
+        return
+    }
+    Set-UpgradeRegistryValue -Name "VerifiedTargetBuild" -Value $buildNow
 
+    try {
         # Edition retained? (Standard->Standard / Datacenter->Datacenter expected)
         $sourceEdition = Get-UpgradeRegistryValue -Name "SourceEditionId"
         $editionNow = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name EditionID -ErrorAction SilentlyContinue).EditionID
@@ -164,7 +223,7 @@ function Invoke-PostUpgradeValidation {
         # upgrade didn't cause - just needs the standard post-upgrade
         # activation step, same as any OS version change would).
         $preLicenseStatus = Get-UpgradeRegistryValue -Name "PreUpgradeLicenseStatus" -Default "Unknown"
-        $lic = Get-CimInstance SoftwareLicensingProduct -ErrorAction SilentlyContinue |
+        $lic = Get-CimInstance SoftwareLicensingProduct -OperationTimeoutSec 10 -ErrorAction Stop |
             Where-Object { $_.PartialProductKey -and $_.LicenseStatus -eq 1 }
         $postLicensed = [bool]$lic
         $licenseRecommendation =
@@ -319,174 +378,172 @@ function Invoke-PostUpgradeValidation {
 }
 
 # =============================================================================
-# Main
+# Main (one writer invocation at a time, including direct Setup hook calls)
 # =============================================================================
-$currentBuild = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuildNumber
-$sourceBuild  = Get-UpgradeRegistryValue -Name "SourceBuild"
-$targetBuild  = Get-UpgradeRegistryValue -Name "TargetBuild"
-$lastPhase    = [int](Get-UpgradeRegistryValue -Name "Phase" -Default 0)
-$lastStatus   = Get-UpgradeRegistryValue -Name "Status" -Default ""
-$bootChanged  = Update-UpgradeBootEvidence
+function Invoke-UpgradeStatusUpdate {
+    $currentBuild = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop).CurrentBuildNumber
+    $sourceBuild = Get-UpgradeRegistryValue -Name "SourceBuild"
+    $targetBuild = Get-UpgradeRegistryValue -Name "TargetBuild"
+    $lastPhase = [int](Get-UpgradeRegistryValue -Name "Phase" -Default 0)
+    $lastStatus = Get-UpgradeRegistryValue -Name "Status" -Default ""
+    $lastPhaseName = Get-UpgradeRegistryValue -Name "PhaseName" -Default "Downlevel Phase"
+    if ($lastPhase -lt 3) { return }
 
-Write-Log "Poll: currentBuild=$currentBuild sourceBuild=$sourceBuild targetBuild=$targetBuild lastPhase=$lastPhase lastStatus=$lastStatus bootChanged=$bootChanged"
-
-if ($RebootInitiated) {
-    Set-Phase -Phase 4 -PhaseName "Safe OS Phase (reboot initiated)" -Status "InProgress" `
-        -ProgressSource "EventLog.User32.1074" -ProgressFreshness "CarriedForward" `
-        -Notes "Windows restart initiation detected through System event 1074. The last verified SetupProgress value is retained during the WinPE telemetry outage."
-    return
-}
-
-# Terminal states - stop evaluating, unregister the recurring monitor/watcher.
-if ($lastStatus -in @("Completed","CompletedWithWarnings","Failed") -and -not (Test-Path $script:MarkerRB)) {
-    Write-Log "Already in terminal state '$lastStatus' - unregistering monitor/watcher tasks."
-    Unregister-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -Confirm:$false -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName "OSUpgradeRebootWatcher" -Confirm:$false -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName "OSUpgradeSetupLaunch" -Confirm:$false -ErrorAction SilentlyContinue
-    return
-}
-
-# --- Rollback detection (setuprollback.cmd fired) -----------------------------
-if (Test-Path $script:MarkerRB) {
-    $setupDiagNote = ""
-    try {
-        $sdResults = Join-Path $env:WINDIR "Logs\SetupDiag\SetupDiagResults.xml"
-        if (Test-Path $sdResults) {
-            Copy-Item -Path $sdResults -Destination (Join-Path $script:LogDir "SetupDiagResults.xml") -Force -ErrorAction SilentlyContinue
-            $setupDiagNote = " SetupDiag results copied to $script:LogDir\SetupDiagResults.xml."
+    if ($lastStatus -in @("Completed", "CompletedWithWarnings", "Failed") -and
+        (-not (Test-Path $script:MarkerRB) -or ($lastStatus -eq "Failed" -and $lastPhase -eq 99))) {
+        foreach ($taskName in @("OSUpgradePhaseMonitor", "OSUpgradeRebootWatcher", "OSUpgradeSetupLaunch")) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         }
-    } catch {
-        Write-Log "Could not copy SetupDiag results (non-blocking): $_" "WARN"
+        return
     }
-    Set-Phase -Phase 99 -PhaseName "Rolled Back" -Status "Failed" `
-        -ProgressSource "WindowsSetup.PostRollback" -ProgressFreshness "Terminal" `
-        -Notes "setup.exe invoked /PostRollback - upgrade failed and system reverted to source OS.$setupDiagNote"
-    Unregister-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -Confirm:$false -ErrorAction SilentlyContinue
-    Unregister-ScheduledTask -TaskName "OSUpgradeSetupLaunch" -Confirm:$false -ErrorAction SilentlyContinue
-    return
-}
-
-# --- OOBE-complete short-circuit (build-number-independent) ------------------
-# BUG FIX (2026-08-26, real TestVM2 run): setupcomplete.cmd's /PostOOBE hook
-# firing is an ABSOLUTE, unambiguous signal that Windows Setup has fully
-# finished - regardless of what currentBuild vs. sourceBuild/targetBuild
-# comparison says. Checked here, BEFORE the build-number branches below,
-# because that comparison silently breaks when SourceBuild equals
-# TargetBuild (e.g. a same-version test upgrade, or any genuine same-build
-# refresh install): $currentBuild -eq $sourceBuild is then ALWAYS true, even
-# long after the real upgrade finished, permanently trapping execution in
-# the "still on old build" branch below (which returns) and never reaching
-# the OOBE-marker check that already exists further down for the normal
-# (differing-build) case. Section 1b already guarantees this marker is
-# removed at the start of every fresh run, so its presence here can only
-# mean THIS run's setupcomplete.cmd genuinely fired.
-if ((Test-Path $script:MarkerOOBE) -and $lastStatus -notin @("Completed", "CompletedWithWarnings", "Failed")) {
-    if ($lastPhase -lt 7) {
-        Set-Phase -Phase 6 -PhaseName "Second Boot (OOBE) Phase" -Status "InProgress" `
-            -PercentComplete 100 -PercentSource "Measured" -ProgressSource "WindowsSetup.PostOOBE" -ProgressFreshness "Milestone" `
-            -Notes "PostOOBE hook fired; finalizing configuration/cleanup."
-    } else {
-        Write-Log "Resuming interrupted post-upgrade validation from Phase $lastPhase."
-    }
-    Invoke-PostUpgradeValidation
-    return
-}
-
-# --- Still on the OLD build: Downlevel or Safe OS (blind window) -------------
-if ($currentBuild -eq $sourceBuild) {
-    $btPresent = Test-Path "$env:SystemDrive\`$WINDOWS.~BT"
-    $setupProc = Get-Process -Name "setuphost","setupprep","setup" -ErrorAction SilentlyContinue
-
-    if ($setupProc) {
-        Remove-ItemProperty -Path $script:RegRoot -Name "SetupProcessMissingSinceUtc" -ErrorAction SilentlyContinue
-        $logPath = "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log"
-        $logTail = Get-SetupLogTail -Path $logPath
-        if ($logTail) { Set-UpgradeRegistryValue -Name "SetupLogTail" -Value $logTail }
-        $result = Get-SetupProgressPercent
-        if ($null -ne $result) {
-            Set-UpgradeRegistryValue -Name "SetupTelemetryPercent" -Value $result.Percent -Type DWord
-            Set-UpgradeRegistryValue -Name "SetupTelemetrySource" -Value "MoSetup.SetupProgress"
-            Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" `
-                -PercentComplete $result.Percent -PercentSource "Measured" -ProgressSource "MoSetup.SetupProgress" -ProgressFreshness "Live" `
-                -Notes "Windows Setup is actively running on the source OS; progress is from MoSetup SetupProgress."
-        } else {
-            Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" `
-                -ProgressSource "MoSetup.SetupProgress" -ProgressFreshness "CarriedForward" `
-                -Notes "Windows Setup is running, but MoSetup SetupProgress is currently unavailable; retaining the last verified value."
-        }
-    } elseif ($lastPhase -eq 4 -or [bool][int](Get-UpgradeRegistryValue -Name "ExpectedDisconnect" -Default 0)) {
-        Set-Phase -Phase 4 -PhaseName "Safe OS Phase (pending/boot transition)" -Status "InProgress" `
-            -ProgressSource "EventLog.User32.1074" -ProgressFreshness "CarriedForward" `
-            -Notes "A restart was explicitly observed; retaining the last verified SetupProgress value while SafeOS/WinPE is unreachable."
-    } else {
-        $nowUtc = [DateTimeOffset]::UtcNow
-        $missingSinceUtc = Get-UpgradeRegistryValue -Name "SetupProcessMissingSinceUtc"
-        if (-not $missingSinceUtc) {
-            $missingSinceUtc = $nowUtc.ToString("o")
-            Set-UpgradeRegistryValue -Name "SetupProcessMissingSinceUtc" -Value $missingSinceUtc
-        }
+    if (Test-Path $script:MarkerRB) {
         try {
-            $missingMinutes = ($nowUtc - [DateTimeOffset]::Parse($missingSinceUtc)).TotalMinutes
-        } catch {
-            $missingMinutes = 0
-            Set-UpgradeRegistryValue -Name "SetupProcessMissingSinceUtc" -Value $nowUtc.ToString("o")
+            $lastExecuted = Update-SetupPhaseHistory | Sort-Object Phase | Select-Object -Last 1
+            if ($lastExecuted -and [int]$lastExecuted.Phase -gt $lastPhase -and $lastPhase -lt 7) {
+                $lastPhaseName = $lastExecuted.PhaseName
+            }
+        } catch { Write-Log "Could not recover the last executed phase before rollback: $_" "WARN" }
+        try {
+            $setupDiagPath = Join-Path $env:WINDIR "Logs\SetupDiag\SetupDiagResults.xml"
+            if (Test-Path $setupDiagPath) {
+                Copy-Item -LiteralPath $setupDiagPath -Destination (Join-Path $script:LogDir "SetupDiagResults.xml") -Force -ErrorAction Stop
+            }
+        } catch { Write-Log "Could not preserve SetupDiag results: $_" "WARN" }
+        Set-Phase -Phase 99 -PhaseName "Rolled Back" -Status "Failed" `
+            -ProgressSource "WindowsSetup.PostRollback" -ProgressFreshness "Terminal" `
+            -Notes "Windows Setup invoked /PostRollback. Upgrade failed after '$lastPhaseName'. Review Panther logs and Windows\Logs\SetupDiag\SetupDiagResults.xml."
+        foreach ($taskName in @("OSUpgradePhaseMonitor", "OSUpgradeRebootWatcher", "OSUpgradeSetupLaunch")) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
         }
+        return
+    }
+    if ($RebootInitiated) {
+        if (Get-UpgradeRegistryValue -Name "SetupLaunchTimeUtc") {
+            Set-UpgradeRegistryValue -Name "RestartRequestedAtUtc" -Value ([DateTimeOffset]::UtcNow.ToString("o"))
+            Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 1 -Type DWord
+            Set-Phase -Phase $lastPhase -PhaseName $lastPhaseName -ProgressFreshness "CarriedForward" `
+                -Notes "Event 1074 records a restart request. Safe OS is not confirmed; waiting for current-run Setup execution evidence."
+        }
+        return
+    }
 
-        if ($missingMinutes -ge 10) {
-            $taskInfo = Get-ScheduledTaskInfo -TaskName "OSUpgradeSetupLaunch" -ErrorAction SilentlyContinue
-            $taskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { "unavailable" }
-            $artifactNote = if ($btPresent) { "Windows setup artifacts exist." } else { "Windows setup artifacts were not created." }
-            Set-UpgradeRegistryValue -Name "SetupFailureDetectedAtUtc" -Value $nowUtc.ToString("o")
-            Set-Phase -Phase 3 -PhaseName "Windows Setup Stopped Before Reboot" -Status "Failed" `
-                -ProgressSource "SetupProcessLiveness" -ProgressFreshness "Terminal" `
-                -Notes "No Windows Setup process or Event 1074 reboot evidence was observed for $([math]::Round($missingMinutes, 1)) minutes. $artifactNote Scheduled task LastTaskResult=$taskResult. Review Panther setupact.log/setuperr.log."
-            Unregister-ScheduledTask -TaskName "OSUpgradeRebootWatcher" -Confirm:$false -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName "OSUpgradeSetupLaunch" -Confirm:$false -ErrorAction SilentlyContinue
-            Unregister-ScheduledTask -TaskName "OSUpgradePhaseMonitor" -Confirm:$false -ErrorAction SilentlyContinue
-        } else {
-            Set-Phase -Phase 3 -PhaseName "Downlevel Phase" -Status "InProgress" `
-                -ProgressSource "SetupProcessLiveness" -ProgressFreshness "CarriedForward" `
-                -Notes "Windows Setup is temporarily not resident and no restart event has been observed; waiting up to 10 minutes before declaring a stopped Setup process."
+    $bootChanged = Update-UpgradeBootEvidence
+    if ($bootChanged) {
+        Set-UpgradeRegistryValue -Name "ExpectedDisconnect" -Value 0 -Type DWord
+        $bootTime = [DateTimeOffset]::Parse((Get-UpgradeRegistryValue -Name "LastObservedBootTimeUtc"))
+        $unexpectedRestart = Get-WinEvent -FilterHashtable @{
+            LogName = "System"; ProviderName = "Microsoft-Windows-Kernel-Power"; Id = 41
+            StartTime = $bootTime.LocalDateTime.AddMinutes(-2)
+        } -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($unexpectedRestart) {
+            Set-UpgradeRegistryValue -Name "UnexpectedRestartAtUtc" -Value $bootTime.ToString("o")
+            Write-Log "Unexpected restart detected during '$lastPhaseName'; checking Setup liveness and the live OS build." "WARN"
         }
     }
-    return
+    Write-Log "Poll: build=$currentBuild source=$sourceBuild target=$targetBuild phase=$lastPhase status=$lastStatus bootChanged=$bootChanged"
+    if (-not $sourceBuild -or -not $targetBuild) { throw "SourceBuild/TargetBuild metadata is missing; cannot safely classify or complete this upgrade." }
+
+    $phaseHistory = @()
+    try { $phaseHistory = @(Update-SetupPhaseHistory) }
+    catch { Write-Log "Could not recover Setup phase history: $_" "WARN" }
+    $setupState = Get-ItemProperty "HKLM:\SYSTEM\Setup" -ErrorAction Stop
+    $setupProc = @(Get-Process -Name "setuphost", "setupprep", "setup" -ErrorAction SilentlyContinue)
+    $oobeMarkerExists = Test-Path $script:MarkerOOBE
+    $setupFinished = ($null -ne $setupState.SystemSetupInProgress -and $setupState.SystemSetupInProgress -eq 0 -and
+        $null -ne $setupState.OOBEInProgress -and $setupState.OOBEInProgress -eq 0 -and $setupProc.Count -eq 0)
+
+    if ($oobeMarkerExists -or ($currentBuild -eq $targetBuild -and $currentBuild -ne $sourceBuild -and $setupFinished)) {
+        $completionSource = if ($oobeMarkerExists) { "WindowsSetup.PostOOBE" } else { "LiveOS.SetupFlagsClear" }
+        Set-UpgradeRegistryValue -Name "CompletionEvidence" -Value $completionSource
+        if ($lastPhase -lt 7) {
+            Set-Phase -Phase 6 -PhaseName "Second Boot (OOBE) Phase" -PercentComplete 100 `
+                -ProgressSource $completionSource -ProgressFreshness "Milestone" `
+                -Notes "Setup completion evidence=$completionSource; validating the actual target build next."
+        }
+        # Always resume Phase 7, including the missing-hook path after interrupted validation.
+        Invoke-PostUpgradeValidation
+        return
+    }
+
+    if ($currentBuild -eq $targetBuild -and $currentBuild -ne $sourceBuild) {
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupProcessMissingSinceUtc" -ErrorAction SilentlyContinue
+        $phase = if ($setupState.OOBEInProgress -eq 1 -or ($phaseHistory | Where-Object { $_.Phase -eq 6 })) { 6 } else { 5 }
+        $phase = [math]::Max($phase, $lastPhase)
+        $phaseName = switch ($phase) { 5 { "First Boot Phase" } 6 { "Second Boot (OOBE) Phase" } default { "Post-Upgrade Validation" } }
+        $note = "Target build is running; SystemSetupInProgress=$($setupState.SystemSetupInProgress), OOBEInProgress=$($setupState.OOBEInProgress). Waiting for Setup completion before validation."
+    } elseif ($currentBuild -eq $sourceBuild) {
+        $phase = $lastPhase
+        $phaseName = $lastPhaseName
+        if (-not $setupProc.Count) {
+            $nowUtc = [DateTimeOffset]::UtcNow
+            $missingSinceUtc = Get-UpgradeRegistryValue -Name "SetupProcessMissingSinceUtc"
+            if (-not $missingSinceUtc) {
+                $missingSinceUtc = $nowUtc.ToString("o")
+                Set-UpgradeRegistryValue -Name "SetupProcessMissingSinceUtc" -Value $missingSinceUtc
+                Write-Log "No Setup process on source build after '$lastPhaseName'. Checking for recovery for up to 10 minutes; an earlier restart request does not suppress this check." "WARN"
+            }
+            $missingMinutes = ($nowUtc - [DateTimeOffset]::Parse($missingSinceUtc)).TotalMinutes
+            if ($missingMinutes -ge 10) {
+                $lastExecuted = $phaseHistory | Sort-Object Phase | Select-Object -Last 1
+                if ($lastExecuted -and [int]$lastExecuted.Phase -gt $phase -and $phase -lt 7) {
+                    $phase = [int]$lastExecuted.Phase
+                    $phaseName = $lastExecuted.PhaseName
+                }
+                $taskInfo = Get-ScheduledTaskInfo -TaskName "OSUpgradeSetupLaunch" -ErrorAction SilentlyContinue
+                $taskResult = if ($taskInfo) { $taskInfo.LastTaskResult } else { "unavailable" }
+                Set-UpgradeRegistryValue -Name "SetupFailureDetectedAtUtc" -Value $nowUtc.ToString("o")
+                Set-Phase -Phase $phase -PhaseName $phaseName -Status "Failed" `
+                    -ProgressSource "SetupProcessLiveness" -ProgressFreshness "Terminal" `
+                    -Notes "Setup stopped/interrupted after last confirmed phase '$phaseName': still on source build $sourceBuild with no Setup process for $([math]::Round($missingMinutes, 1)) minutes. Reboots=$(Get-UpgradeRegistryValue -Name 'RebootCount' -Default 0); unexpected restart=$(Get-UpgradeRegistryValue -Name 'UnexpectedRestartAtUtc'); task result=$taskResult. Kindly check Panther setupact.log/setuperr.log and SetupDiag for the exact failing operation before retrying."
+                return
+            }
+            Set-Phase -Phase $phase -PhaseName $phaseName -ProgressSource "SetupProcessLiveness" -ProgressFreshness "CarriedForward" `
+                -Notes "ATTENTION: no Setup process on source build $sourceBuild for $([math]::Round($missingMinutes, 1)) min after '$lastPhaseName'. Checking for recovery; failure will be reported after 10 minutes. Review the target if it was reset."
+            return
+        }
+        Remove-ItemProperty -Path $script:RegRoot -Name "SetupProcessMissingSinceUtc" -ErrorAction SilentlyContinue
+        $note = "Windows Setup is running on source build $sourceBuild. The MoSetup counter is scoped to Downlevel, not overall upgrade completion."
+    } else {
+        Set-Phase -Phase $lastPhase -PhaseName $lastPhaseName -Status "Failed" `
+            -ProgressSource "LiveOS.Build" -ProgressFreshness "Terminal" `
+            -Notes "Unexpected live build $currentBuild (source=$sourceBuild, target=$targetBuild). Cannot confirm upgrade state; investigate manually."
+        return
+    }
+
+    $logPath = if ($currentBuild -eq $sourceBuild) { "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log" } else { Join-Path $env:WINDIR "Panther\setupact.log" }
+    $logTail = Get-SetupLogTail -Path $logPath
+    if ($logTail) { Set-UpgradeRegistryValue -Name "SetupLogTail" -Value $logTail }
+    $result = Get-SetupProgressPercent
+    $phaseArgs = @{ Phase = $phase; PhaseName = $phaseName; Notes = $note; ProgressSource = "MoSetup.SetupProgress.PhaseScoped"; ProgressFreshness = "CarriedForward" }
+    if ($null -ne $result -and $phase -lt 7) {
+        Set-UpgradeRegistryValue -Name "SetupTelemetryPercent" -Value $result.Percent -Type DWord
+        Set-UpgradeRegistryValue -Name "SetupTelemetryPhase" -Value $phase -Type DWord
+        Set-UpgradeRegistryValue -Name "SetupTelemetrySource" -Value "MoSetup.SetupProgress"
+        $phaseArgs["PercentComplete"] = $result.Percent
+        $phaseArgs["ProgressFreshness"] = "Live"
+    } elseif ($phase -ne $lastPhase) {
+        $phaseArgs["ProgressSource"] = "LiveOS.PhaseBoundary"
+    }
+    Set-Phase @phaseArgs
 }
 
-# --- Now on the NEW build: First Boot / OOBE / Post-Upgrade Validation -------
-if ($currentBuild -eq $targetBuild) {
-    $setupInProgress  = (Get-ItemProperty "HKLM:\SYSTEM\Setup" -Name "SystemSetupInProgress" -ErrorAction SilentlyContinue).SystemSetupInProgress
-    $oobeMarkerExists = Test-Path $script:MarkerOOBE
-
-    if ($setupInProgress -eq 1 -and -not $oobeMarkerExists) {
-        Remove-ItemProperty -Path $script:RegRoot -Name "SetupProcessMissingSinceUtc" -ErrorAction SilentlyContinue
-        $logPath = Join-Path $env:WINDIR "Panther\setupact.log"
-        $logTail = Get-SetupLogTail -Path $logPath
-        if ($logTail) { Set-UpgradeRegistryValue -Name "SetupLogTail" -Value $logTail }
-        $result = Get-SetupProgressPercent
-        if ($null -ne $result) {
-            Set-UpgradeRegistryValue -Name "SetupTelemetryPercent" -Value $result.Percent -Type DWord
-            Set-UpgradeRegistryValue -Name "SetupTelemetrySource" -Value "MoSetup.SetupProgress"
-            Set-Phase -Phase 5 -PhaseName "First Boot Phase" -Status "InProgress" `
-                -PercentComplete $result.Percent -PercentSource "Measured" -ProgressSource "MoSetup.SetupProgress" -ProgressFreshness "Live" `
-                -Notes "New OS booted; migrating roles/settings (SystemSetupInProgress=1)."
-        } else {
-            Set-Phase -Phase 5 -PhaseName "First Boot Phase" -Status "InProgress" `
-                -ProgressSource "MoSetup.SetupProgress" -ProgressFreshness "CarriedForward" `
-                -Notes "New OS booted and Setup is active, but MoSetup SetupProgress is unavailable; retaining the last verified value."
-        }
-    } elseif ($oobeMarkerExists -and $lastPhase -lt 7) {
-        Set-Phase -Phase 6 -PhaseName "Second Boot (OOBE) Phase" -Status "InProgress" `
-            -PercentComplete 100 -PercentSource "Measured" -ProgressSource "WindowsSetup.PostOOBE" -ProgressFreshness "Milestone" `
-            -Notes "PostOOBE hook fired; finalizing configuration/cleanup."
-        Invoke-PostUpgradeValidation
-    } elseif ($setupInProgress -eq 0 -and -not $oobeMarkerExists) {
-        # Setup finished per OS state but our hook never fired (media/switches differ) -
-        # fall back to treating this as OOBE-complete so validation still runs.
-        Set-Phase -Phase 6 -PhaseName "Second Boot (OOBE) Phase" -Status "InProgress" `
-            -PercentComplete 100 -PercentSource "Measured" -ProgressSource "SystemSetupInProgress" -ProgressFreshness "Milestone" `
-            -Notes "SystemSetupInProgress=0 but PostOOBE marker is missing; proceeding to validation using local OS state."
-        Invoke-PostUpgradeValidation
-    } else {
-        Write-Log "On target build, current phase $lastPhase unchanged - waiting."
+$monitorMutex = New-Object System.Threading.Mutex($false, "Global\OSUpgradeAutomationMonitor")
+$monitorLockTaken = $false
+try {
+    try { $monitorLockTaken = $monitorMutex.WaitOne(1000) }
+    catch [System.Threading.AbandonedMutexException] { $monitorLockTaken = $true }
+    if (-not $monitorLockTaken) {
+        Write-Log "Another monitor/hook invocation is active; the recurring task will retry." "WARN"
+        return
     }
+    Remove-ItemProperty -Path $script:RegRoot -Name "MonitorLastError" -ErrorAction SilentlyContinue
+    Invoke-UpgradeStatusUpdate
+} catch {
+    Write-Log "Status monitor failed and will retry on its next trigger: $_" "ERROR"
+    Set-UpgradeRegistryValue -Name "MonitorLastError" -Value $_.Exception.Message
+    Write-StatusJson
+    throw
+} finally {
+    if ($monitorLockTaken) { $monitorMutex.ReleaseMutex() }
+    $monitorMutex.Dispose()
 }
