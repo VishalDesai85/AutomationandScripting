@@ -1,6 +1,6 @@
 # OS Upgrade Automation — Project Context & Session Notes
 
-_Last updated: 2026-10-08 (profile counting reverted to warning-only; removed the >25 blocking threshold while retaining inventory and other safety checks)._
+_Last updated: 2026-10-08 (repairing rc4 monitoring regressions: passive JSON-first reads, mutex-free readers, flat phase history, boot/sequence reconciliation, and resilient atomic publication)._
 
 > **How to use this file**: In a new chat session, tell me to "read
 > `PROJECT-NOTES.md` in OSUpgradeAutomation1 and continue" - that gives me
@@ -13,7 +13,67 @@ _Last updated: 2026-10-08 (profile counting reverted to warning-only; removed th
 > ask me to refresh it.
 
 ## What this solution does
-### Latest Change: Profile Counts Are Warning-Only
+### Latest Fix: October 8 Monitoring Regression
+
+The supplied testVM1 console run completed at 16:29:16 on build 20348, with a
+pre-existing activation warning. Its monitoring errors were real and must not
+be dismissed as ordinary reboots:
+
+- **Reader mutex denial:** the new live reader opened
+  `Global\OSUpgradeAutomationStatus`, which could be owned by a SYSTEM
+  publisher and deny the remoting user access. Readers now consume published
+  JSON (with a reported registry fallback), do not load target writer code,
+  and never open its mutex. Writer serialization is retained.
+- **Empty/nested phase history:** Windows PowerShell 5.1 preserves the JSON
+  array returned by `ConvertFrom-Json` as one pipeline object. Wrapping that
+  again with `@(...)` produced `[[]]` and progressively nested history. This
+  caused the blank "Confirmed Setup history" line and lost phase records.
+  The shared normalizer explicitly enumerates arrays/remoting lists, rejects
+  malformed records, and keeps a flat list of actual execution evidence.
+  Damaged persisted history triggers a log rescan even when signatures match.
+- **Sequence rewind after boot:** the log rejected sequence 54 against cached
+  56 after the new OS was up. The publisher now reconciles the applied OS's
+  registry counter/high-water with the existing same-run JSON before writing.
+  Readers also accept a lower counter when a newer boot is confirmed, while
+  rejecting earlier-boot snapshots even if those carry a larger counter.
+  Unrelated run IDs remain rejected. A new kickoff clears the prior-run
+  cache and returns its actual RunId for monitoring.
+- **Atomic mirror replacement:** Server A and B now share the same temporary
+  file/atomic-replace helper, with an explicit null backup filename and bounded
+  retries for file-sharing/create races. The previous `Move-Item -Force`
+  overwrite fallback is removed; errors retain the last good file and remain
+  visible rather than deleting/replacing it non-atomically.
+- **Unnecessary remote load:** normal monitoring prefers fresh SMB JSON.
+  A missing/stale file triggers at most one WinRM status/OS-state request
+  before the DCOM fallback. It no longer queries CIM boot time or Task Scheduler
+  on every poll. Status-task refresh requires a stale nonterminal publication
+  and is throttled to once a minute; it never relaunches Setup. Repeated
+  payload-read errors stay in the log without repeating every console poll.
+- **Precheck load:** status reads use `PollIntervalSeconds` (15 seconds by
+  default), instead of every three spinner ticks. SMB has five seconds and
+  WinRM JSON reads fifteen, including job startup. The spinner still updates.
+  A probe timeout is described as an observation, not proof that the network
+  disconnected or the upgrade failed.
+- **Setup-log load:** growing Panther logs are not fully rescanned during
+  ordinary Downlevel polling. Evidence is recovered after a boot/new-build
+  observation, or during stopped-process/rollback diagnosis. Safe OS remains
+  a retrospective confirmation when no Windows services can report it live.
+
+Regression evidence: the empty-history failure was reproduced before the
+fix. Added tests cover repeated serialization, legacy/remoting collections,
+reader mutex denial, the 56-to-54 counter scenario, boot-aware ordering,
+healthy polling without extra remote payload calls, rate-limited recovery,
+and a real Windows file-sharing conflict during atomic replacement. Existing
+readiness, Negotiate, warning-only profiles, and completion tests remain.
+These tests do not certify customer networking or execute a live upgrade.
+
+Retest from a fresh/restored disposable pre-upgrade VM using the complete
+matching companion set. Do not replace target scripts while Setup is running.
+The attached run already upgraded the target; rerunning the orchestrator there
+resumes verification instead of restaging scripts. Use a new release/tag for
+these fixes rather than moving rc-4.
+
+### Previous Change: Profile Counts Are Warning-Only
 
 - Removed the user-profile-count blocking gate, including the limit of 25.
   Successful inventory now always reports a non-blocking warning with the
@@ -167,8 +227,9 @@ or that the Downlevel MoSetup counter is a cumulative end-to-end percentage.
   `Observer`, alongside `HealthWarning` and live OS evidence. Payload reads are
   bounded; the whole DCOM read is capped at eight seconds and the live WinRM
   probe at fifteen. The poll interval is additional sleep, not an exact sample rate.
-- Live WinRM registry/build/Setup-flags observations take precedence over stale
-  SMB data. An outdated/missing status monitor is refreshed or recreated from
+- WinRM status/build/Setup-flags observations can supersede stale SMB data.
+  Fresh SMB JSON is preferred after the later October 8 regression fix.
+  An outdated/missing status monitor is refreshed or recreated from
   its already-staged script, without relaunching Setup. Monitor tasks have a
   ten-minute execution limit; a mutex also serializes direct hook invocations.
   Unresolved Setup state resumes monitoring even when no Setup process exists;
@@ -317,7 +378,7 @@ during the genuine WinPE blind window:
 - **`Start-RemoteUpgradeOrchestrator.ps1`** (Server A) - a status reader with
   bounded status-task recovery (never a replacement percentage writer).
   Polls Server B with `-PollIntervalSeconds` sleep (default 15s) via
-  live WinRM registry/build observations, then file share/CIM/DCOM/WinRM JSON
+  fresh SMB JSON, then bounded WinRM status/build observations and CIM/DCOM
   (connectivity-only observations when no status payload is readable).
   It renders `Write-Progress`, logs
   phase transitions, and prints a final summary banner (Status/Server OS/

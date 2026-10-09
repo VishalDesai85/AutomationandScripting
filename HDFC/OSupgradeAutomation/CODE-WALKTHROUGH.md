@@ -12,7 +12,7 @@ There are seven runtime files:
 |---|---|---|---|
 | `ServerA-Orchestrator/Start-RemoteUpgradeOrchestrator.ps1` | Server A | Interactive operator process | Validates connectivity, copies files, starts target work, and monitors it |
 | `ServerB-Target/Start-TargetUpgrade.ps1` | Server B | Initially a WinRM-hosted PowerShell process | Runs prechecks and backups, creates durable state, registers tasks, and hands Windows Setup to Task Scheduler |
-| `ServerB-Target/OSUpgradeStatus.ps1` | Server B | Dot-sourced by both target PowerShell processes | Owns the registry/JSON schema, weighted progress, mutex, atomic writes, and reboot evidence |
+| `ServerB-Target/OSUpgradeStatus.ps1` | Server B; pure JSON/history helpers also loaded on A | Dot-sourced shared functions | Owns registry/JSON schema, weighted progress, writer mutex, atomic writes, phase-history normalization, and reboot evidence |
 | `ServerB-Target/Update-UpgradeStatus.ps1` | Server B | SYSTEM scheduled task or hook-launched PowerShell | Determines the current Setup phase and performs final validation |
 | `ServerB-Target/setupcomplete.cmd` | Server B | Windows Setup PostOOBE context | Marks successful OOBE completion and immediately invokes the status engine |
 | `ServerB-Target/setuprollback.cmd` | Server B | Windows Setup PostRollback context | Marks rollback and immediately invokes the status engine |
@@ -82,6 +82,19 @@ The default target JSON is `D:\upgrade_status.json`. The orchestrator can read
 it through `\\ServerB\D$\upgrade_status.json` without using WinRM. Every write
 uses a process-unique temporary file and atomic replacement while a named
 cross-process mutex serializes the two target writers.
+Readers do not open that writer mutex: a global mutex created under SYSTEM's
+default ACL can deny access to an otherwise authorized WinRM administrator.
+The WinRM reader uses published JSON, or a reported read-only registry
+fallback, without dot-sourcing or executing target writer code.
+
+`Write-UpgradeJsonFile` is shared by the target publisher and Server A mirror.
+It uses an explicit null backup filename for `File.Replace` and retries brief
+I/O replacement conflicts. It never falls back to `Move-Item -Force` over an
+existing file or deletes the last good status before replacing it.
+After an OS hive migration, the target publisher reconciles its sequence and
+high-water percentage against the existing JSON for the same `RunId`.
+An old run's JSON cannot seed a new run. This avoids the observed post-boot
+54-vs-56 sequence rejection loop.
 
 Server A also maintains an atomic local mirror, by default under
 `C:\ProgramData\OSUpgradeAutomation\OrchestratorLogs`. Producer fields remain
@@ -282,9 +295,15 @@ structured result:
 ```
 
 While that job runs, the orchestrator drains output with `Receive-Job`, polls
-the status JSON approximately every three seconds, refreshes the Server A
+the status JSON at most once per `PollIntervalSeconds`, refreshes the Server A
 mirror, and displays a spinner plus the current overall percentage. The
 percentage is sticky during a transient failed or partial JSON read.
+The default payload-read interval is 15 seconds, not every three spinner ticks.
+SMB gets a five-second budget and
+the separate WinRM JSON fallback gets fifteen seconds including job startup.
+The console spinner still refreshes between reads. Starting a new upgrade
+clears the old producer cache; the target handoff returns the new `RunId`,
+so a previously recovered mirror cannot pin the new monitor to an old run.
 
 After completion, the script selects the one received object containing a
 `Success` property. A missing result is converted into an explicit failure.
@@ -305,15 +324,23 @@ failure code.
 
 1. ICMP ping.
 2. A bounded WinRM probe using the previously selected transport.
-3. When WinRM is up, a bounded live registry/build/Setup-flags read on the target.
-4. JSON through the drive's administrative share.
+3. Fresh atomic JSON through the drive's administrative share.
+4. One WinRM read of published status and OS build/Setup flags when SMB status
+   is absent or stale (fifteen-second whole-call cap).
 5. Registry values through CIM with a DCOM session (eight-second whole-read cap).
-6. WinRM JSON fallback if the live helper could not be used.
 
-Live WinRM status takes precedence over a stale SMB file. A stale file does
-not suppress a newer DCOM sequence. Different run IDs and older sequences are
-rejected. The live probe also requests the target status task when publication
-is stale, a new boot is observed, or the target build is ready for validation.
+Healthy SMB polling does not start an extra remote PowerShell payload session,
+query CIM boot time, or inspect Task Scheduler on every poll. A stale file
+does not suppress usable WinRM/DCOM status. Different run IDs, older-boot
+snapshots, and older same-boot sequences are rejected. A confirmed newer
+`LastObservedBootTimeUtc` allows a migrated registry's lower sequence until the
+publisher reconciles it. The producer's overall high-water is preserved.
+
+The WinRM reader is passive by default. The caller explicitly requests task
+recovery only after a nonterminal publication is at least two minutes stale,
+and throttles those requests to at most once per minute. Normal final
+verification also reads passively. Repeated payload-read failures remain in
+the log but are not repeatedly printed as new console warnings.
 If the task was lost during upgrade, it recreates only the status monitor from
 the already-staged script. It never relaunches Setup. Missing scripts, disabled
 tasks, and repair errors are surfaced rather than treated as success.
@@ -322,7 +349,7 @@ Modes mean:
 
 | Mode | Exact meaning |
 |---|---|
-| `ActivePolling` | WinRM answered, regardless of ping |
+| `ActivePolling` | WinRM endpoint answered, regardless of ping; a usable payload is still independently required |
 | `Heartbeat` | WinRM did not answer, but ping or another channel did |
 | `Offline` | Ping, WinRM, SMB status, and DCOM status all failed |
 
@@ -725,10 +752,16 @@ When MoSetup is absent, callers preserve the last sample and mark it
 and `OPERATIONTRACK ExecuteOperations: Start execution phase ...` events from
 the current run, using `SetupLaunchTimeUtc` to reject old attempts. Queued
 operations and `Add phase` lines are not execution evidence. Both Panther log
-locations are inspected. File length/write-time signatures avoid rescanning
+locations are inspected after boot/target-build observations or while
+investigating a stopped/rolled-back upgrade. The large growing log is not
+repeatedly scanned during normal Downlevel polling. File length/write-time signatures avoid rescanning
 unchanged logs; the earliest confirmed start per phase is persisted in
 `SetupPhaseHistory`. Safe OS can be recovered retrospectively even though this
 solution has no monitor running inside WinPE.
+Windows PowerShell 5.1's non-enumerated `ConvertFrom-Json` arrays are explicitly
+normalized, including legacy nested arrays/remoting lists. Empty history is
+`[]`, not `[[]]`. Invalid records are reported and never printed as blank
+phases; damaged cached history forces a fresh evidence scan.
 
 ### 5.3 Post-upgrade validation
 

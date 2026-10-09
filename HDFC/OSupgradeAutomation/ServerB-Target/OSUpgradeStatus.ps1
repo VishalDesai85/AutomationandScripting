@@ -35,6 +35,53 @@ function Get-UpgradeRegistryValue {
     return $Default
 }
 
+function ConvertFrom-UpgradePhaseHistory {
+    param([object]$History)
+    if ($History -is [string]) {
+        if ([string]::IsNullOrWhiteSpace($History)) { return }
+        $History = ConvertFrom-Json -InputObject $History -ErrorAction Stop
+    }
+    foreach ($entry in $History) {
+        if ($entry -is [System.Collections.IList]) {
+            ConvertFrom-UpgradePhaseHistory -History $entry
+        } elseif ($null -ne $entry) {
+            $stamp = [DateTimeOffset]::MinValue
+            if ($entry.Phase -notin @(3,4,5,6) -or -not $entry.PhaseName -or -not $entry.Source -or
+                -not [DateTimeOffset]::TryParse([string]$entry.StartedAtUtc, [ref]$stamp)) {
+                Write-Log "Ignoring an invalid Setup phase-history entry; it is not execution evidence." "WARN"
+                continue
+            }
+            $entry
+        }
+    }
+}
+
+function Write-UpgradeJsonFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Json)
+    $temporaryPath = "{0}.{1}.{2}.tmp" -f $Path, $PID, ([guid]::NewGuid().ToString("N"))
+    try {
+        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($temporaryPath, $Json, $utf8WithoutBom)
+        for ($attempt = 0; $attempt -lt 4; $attempt++) {
+            try {
+                if ([System.IO.File]::Exists($Path)) {
+                    [System.IO.File]::Replace($temporaryPath, $Path, [NullString]::Value, $true)
+                } else {
+                    [System.IO.File]::Move($temporaryPath, $Path)
+                }
+                return
+            } catch [System.IO.IOException] {
+                if ($attempt -eq 3) { throw }
+                # A concurrent reader may briefly deny replacement, or another writer
+                # may have created the destination after the existence check.
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } finally {
+        if ([System.IO.File]::Exists($temporaryPath)) { [System.IO.File]::Delete($temporaryPath) }
+    }
+}
+
 function Get-UpgradePendingRebootState {
     param([switch]$SkipPendingFileRenameCheck)
 
@@ -158,17 +205,9 @@ function ConvertTo-OverallUpgradePercent {
 }
 
 function Get-UpgradeStatusSnapshot {
-    $mutex = New-Object System.Threading.Mutex($false, "Global\OSUpgradeAutomationStatus")
-    $lockTaken = $false
-    try {
-        try { $lockTaken = $mutex.WaitOne(3000) }
-        catch [System.Threading.AbandonedMutexException] { $lockTaken = $true }
-        if (-not $lockTaken) { throw "Target status writer is busy; retry the snapshot read." }
-        $registry = Get-ItemProperty -Path $script:RegRoot -ErrorAction Stop
-    } finally {
-        if ($lockTaken) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
-    }
+    # Set-Phase owns the writer lock. Readers must not open a mutex created
+    # under SYSTEM's default ACL; remoting administrators may lack access.
+    $registry = Get-ItemProperty -Path $script:RegRoot -ErrorAction Stop
     function Get-SnapshotValue {
         param([string]$Name)
         if (-not $registry) { return $null }
@@ -208,9 +247,7 @@ function Get-UpgradeStatusSnapshot {
         BootEvidence                 = Get-SnapshotValue -Name "BootEvidence"
         RestartRequestedAtUtc        = Get-SnapshotValue -Name "RestartRequestedAtUtc"
         UnexpectedRestartAtUtc       = Get-SnapshotValue -Name "UnexpectedRestartAtUtc"
-        SetupPhaseHistory            = @(if (Get-SnapshotValue -Name "SetupPhaseHistory") {
-            Get-SnapshotValue -Name "SetupPhaseHistory" | ConvertFrom-Json -ErrorAction Stop
-        })
+        SetupPhaseHistory            = @(ConvertFrom-UpgradePhaseHistory -History (Get-SnapshotValue -Name "SetupPhaseHistory"))
         SourceBuild                  = Get-SnapshotValue -Name "SourceBuild"
         TargetBuild                  = Get-SnapshotValue -Name "TargetBuild"
         SourceOSCaption              = Get-SnapshotValue -Name "SourceOSCaption"
@@ -259,19 +296,7 @@ function Write-StatusJson {
         }
 
         $json = $statusObject | ConvertTo-Json -Depth 6
-        $temporaryPath = "{0}.{1}.{2}.tmp" -f $script:StatusJson, $PID, ([guid]::NewGuid().ToString("N"))
-        $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8WithoutBom)
-
-        if ([System.IO.File]::Exists($script:StatusJson)) {
-            try {
-                [System.IO.File]::Replace($temporaryPath, $script:StatusJson, $null, $true)
-            } catch {
-                Move-Item -Path $temporaryPath -Destination $script:StatusJson -Force
-            }
-        } else {
-            [System.IO.File]::Move($temporaryPath, $script:StatusJson)
-        }
+        Write-UpgradeJsonFile -Path $script:StatusJson -Json $json
 
         $backupFolder = Get-UpgradeRegistryValue -Name "BackupFolder"
         if ($backupFolder -and (Test-Path $backupFolder)) {
@@ -280,10 +305,6 @@ function Write-StatusJson {
         }
     } catch {
         Write-Log "Non-blocking: failed to write status JSON to $script:StatusJson : $_" "WARN"
-    } finally {
-        if ($temporaryPath -and (Test-Path $temporaryPath)) {
-            Remove-Item -Path $temporaryPath -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 
@@ -310,16 +331,34 @@ function Set-Phase {
         if (-not $lockTaken) { throw "Timed out waiting for the shared upgrade-status writer lock." }
 
         $stage = Get-UpgradeStageMetadata -Phase $Phase
+        $runId = Get-UpgradeRegistryValue -Name "RunId"
+        if (-not $runId) { $runId = [guid]::NewGuid().ToString() }
+        $priorSequence = [int](Get-UpgradeRegistryValue -Name "Sequence" -Default 0)
         $priorPhase = [int](Get-UpgradeRegistryValue -Name "Phase" -Default 0)
         $priorStatus = Get-UpgradeRegistryValue -Name "Status"
+        $priorPhasePercent = Get-UpgradeRegistryValue -Name "PhasePercentComplete"
+        $priorOverallPercent = [int](Get-UpgradeRegistryValue -Name "OverallPercentComplete" -Default 0)
+        if ($script:StatusJson -and [System.IO.File]::Exists($script:StatusJson)) {
+            try {
+                $published = [System.IO.File]::ReadAllText($script:StatusJson) | ConvertFrom-Json -ErrorAction Stop
+                if ($published.RunId -eq $runId -and $published.Sequence -gt $priorSequence) {
+                    Write-Log "Reconciling migrated registry sequence $priorSequence with published sequence $($published.Sequence) for the same run."
+                    $priorSequence = [int]$published.Sequence
+                    $priorPhase = [int]$published.Phase
+                    $priorStatus = $published.Status
+                    $priorPhasePercent = $published.PhasePercentComplete
+                    $priorOverallPercent = [math]::Max($priorOverallPercent, [int]$published.PercentComplete)
+                }
+            } catch {
+                Write-Log "Could not reconcile the existing status JSON before publication: $_" "WARN"
+            }
+        }
         $terminalConflict = $priorStatus -in @("Completed", "CompletedWithWarnings", "Failed") -and
             $Status -ne $priorStatus -and -not ($Phase -eq 99 -and $Status -eq "Failed")
         if ($terminalConflict -or ($Status -eq "InProgress" -and $Phase -ge 3 -and $Phase -lt $priorPhase -and $priorPhase -le 7)) {
             Write-Log "Ignoring late phase publication $Phase/$Status after $priorPhase/$priorStatus." "WARN"
             return
         }
-        $priorPhasePercent = Get-UpgradeRegistryValue -Name "PhasePercentComplete"
-        $priorOverallPercent = [int](Get-UpgradeRegistryValue -Name "OverallPercentComplete" -Default 0)
         $hasFreshPercent = $PercentComplete -ge 0 -and $Status -ne "Failed"
 
         if ($hasFreshPercent) {
@@ -372,13 +411,11 @@ function Set-Phase {
         } else {
             Get-UpgradeRegistryValue -Name "ProgressUpdatedAtUtc" -Default $nowUtc
         }
-        $runId = Get-UpgradeRegistryValue -Name "RunId"
-        if (-not $runId) { $runId = [guid]::NewGuid().ToString() }
         $startTimeUtc = Get-UpgradeRegistryValue -Name "StartTimeUtc"
         if (-not $startTimeUtc) { $startTimeUtc = $nowUtc }
         $startTime = Get-UpgradeRegistryValue -Name "StartTime"
         if (-not $startTime) { $startTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
-        $sequence = 1 + [int](Get-UpgradeRegistryValue -Name "Sequence" -Default 0)
+        $sequence = 1 + $priorSequence
 
         Set-UpgradeRegistryValue -Name "SchemaVersion"            -Value 2 -Type DWord
         Set-UpgradeRegistryValue -Name "RunId"                    -Value $runId

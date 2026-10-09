@@ -147,14 +147,17 @@ function Update-SetupPhaseHistory {
         (Join-Path $env:WINDIR "Panther\setupact.log")
     )
     $historyJson = Get-UpgradeRegistryValue -Name "SetupPhaseHistory" -Default "[]"
-    $history = @($historyJson | ConvertFrom-Json -ErrorAction Stop)
+    $history = @(ConvertFrom-UpgradePhaseHistory -History $historyJson)
     $signature = (@(foreach ($path in $paths) {
         if (Test-Path -LiteralPath $path) {
             $file = Get-Item -LiteralPath $path -ErrorAction Stop
             "$path|$($file.Length)|$($file.LastWriteTimeUtc.Ticks)"
         }
     }) -join ";")
-    if ($signature -eq (Get-UpgradeRegistryValue -Name "SetupLogScanSignature")) { return $history }
+    $normalizedHistoryJson = ConvertTo-Json -InputObject $history -Depth 4 -Compress
+    if ($signature -eq (Get-UpgradeRegistryValue -Name "SetupLogScanSignature") -and $historyJson -eq $normalizedHistoryJson) {
+        return $history
+    }
     $events = @(Get-SetupPhaseEvidence -Paths $paths -StartedAtUtc ([DateTimeOffset]::Parse($launchTime)))
     $combined = @(@($history) + @($events) | Group-Object Phase | ForEach-Object {
         $_.Group | Sort-Object StartedAtUtc | Select-Object -First 1
@@ -444,7 +447,13 @@ function Invoke-UpgradeStatusUpdate {
     if (-not $sourceBuild -or -not $targetBuild) { throw "SourceBuild/TargetBuild metadata is missing; cannot safely classify or complete this upgrade." }
 
     $phaseHistory = @()
-    try { $phaseHistory = @(Update-SetupPhaseHistory) }
+    try {
+        if ($bootChanged -or $currentBuild -ne $sourceBuild -or $lastPhase -ge 5) {
+            $phaseHistory = @(Update-SetupPhaseHistory)
+        } else {
+            $phaseHistory = @(ConvertFrom-UpgradePhaseHistory -History (Get-UpgradeRegistryValue -Name "SetupPhaseHistory"))
+        }
+    }
     catch { Write-Log "Could not recover Setup phase history: $_" "WARN" }
     $setupState = Get-ItemProperty "HKLM:\SYSTEM\Setup" -ErrorAction Stop
     $setupProc = @(Get-Process -Name "setuphost", "setupprep", "setup" -ErrorAction SilentlyContinue)
@@ -484,6 +493,8 @@ function Invoke-UpgradeStatusUpdate {
             }
             $missingMinutes = ($nowUtc - [DateTimeOffset]::Parse($missingSinceUtc)).TotalMinutes
             if ($missingMinutes -ge 10) {
+                try { $phaseHistory = @(Update-SetupPhaseHistory) }
+                catch { Write-Log "Could not recover Setup history while investigating a stopped process: $_" "WARN" }
                 $lastExecuted = $phaseHistory | Sort-Object Phase | Select-Object -Last 1
                 if ($lastExecuted -and [int]$lastExecuted.Phase -gt $phase -and $phase -lt 7) {
                     $phase = [int]$lastExecuted.Phase

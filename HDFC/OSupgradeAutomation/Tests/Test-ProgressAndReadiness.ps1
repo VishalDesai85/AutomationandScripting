@@ -34,6 +34,10 @@ function New-TestMutex {
     return $mutex
 }
 
+foreach ($name in @('ConvertFrom-UpgradePhaseHistory','Write-UpgradeJsonFile')) {
+    . (Get-TestFunction $syntaxTrees['OSUpgradeStatus.ps1'] $name)
+}
+
 & {
     $tree = $syntaxTrees['Start-RemoteUpgradeOrchestrator.ps1']
     $initialization = $tree.EndBlock.Statements | Where-Object {
@@ -143,6 +147,8 @@ function New-TestMutex {
     $stage12StagePct = $null
     $stage12PhaseName = $null
     $stage12ReadWarningLogged = $false
+    $PollIntervalSeconds = 15
+    $existing = $null
     $allReceived = @()
     foreach ($sample in @(
         @{ Raw = $null; Expected = $null; Text = 'Awaiting target status' },
@@ -153,6 +159,7 @@ function New-TestMutex {
     )) {
         $fixture.WinRM = $sample.Raw
         $spinnerIdx = 0
+        $stage12LastReadAt = [datetime]::MinValue
         $remoteJob = [pscustomobject]@{ State = 'Running' }
         . ([scriptblock]::Create($loop.Extent.Text))
         Assert-Condition ($fixture.Displayed -eq $sample.Expected) 'Wrong banner percentage'
@@ -162,6 +169,7 @@ function New-TestMutex {
     $previousReads = $fixture.Reads
     $fixture.SMB = '{"Phase":2,"PercentComplete":25,"PhaseName":"Backup"}'
     $spinnerIdx = 0
+    $stage12LastReadAt = [datetime]::MinValue
     $remoteJob = [pscustomobject]@{ State = 'Running' }
     . ([scriptblock]::Create($loop.Extent.Text))
     Assert-Condition ($fixture.Reads -eq $previousReads -and $fixture.Displayed -eq 25) 'SMB success should not use fallback'
@@ -408,7 +416,7 @@ function New-TestMutex {
     $priorPercent = $state.PercentComplete
     Set-Phase -Phase 99 -PhaseName 'Rolled Back' -Status Failed -PercentComplete 0 -ProgressFreshness Terminal
     Assert-Condition ($state.PercentComplete -eq $priorPercent -and $state.Status -eq 'Failed') 'Rollback must retain real achieved progress, not reset or advance it'
-    $state['SetupPhaseHistory'] = '[{"Phase":4,"PhaseName":"Safe OS Phase","StartedAtUtc":"2026-01-01T10:00:00Z"}]'
+    $state['SetupPhaseHistory'] = '[{"Phase":4,"PhaseName":"Safe OS Phase","StartedAtUtc":"2026-01-01T10:00:00Z","Source":"WindowsSetup.ExecutionLog"}]'
     $state['UserProfileCount'] = 12
     $state['TotalProfileCount'] = 15
     $state['UserProfileCountLimit'] = 25
@@ -438,7 +446,7 @@ function New-TestMutex {
     }
     . (Get-TestFunction $syntaxTrees['Update-UpgradeStatus.ps1'] 'Invoke-UpgradeStatusUpdate')
     $state = @{}
-    $fixture = @{ Build = '17763'; Processes = @('setuphost'); Setup = 0; OOBE = 0; Marker = ''; BootChanged = $false; Unexpected = $false; Validation = 0; History = @() }
+    $fixture = @{ Build = '17763'; Processes = @('setuphost'); Setup = 0; OOBE = 0; Marker = ''; BootChanged = $false; Unexpected = $false; Validation = 0; History = @(); HistoryScans = 0 }
     $script:MarkerRB = 'C:\OfflineTest\rollback.marker'
     $script:MarkerOOBE = 'C:\OfflineTest\postoobe.marker'
     $script:RegRoot = 'HKLM:\SOFTWARE\OfflineUpgradeTest'
@@ -456,7 +464,7 @@ function New-TestMutex {
         throw "Unexpected registry query: $Path"
     }
     function Update-UpgradeBootEvidence { return $fixture.BootChanged }
-    function Update-SetupPhaseHistory { return $fixture.History }
+    function Update-SetupPhaseHistory { $fixture.HistoryScans++; return $fixture.History }
     function Get-WinEvent { param($FilterHashtable, $MaxEvents, $ErrorAction) if ($fixture.Unexpected) { [pscustomobject]@{ Id = 41 } } }
     function Get-Process { param($Name, $ErrorAction) return $fixture.Processes }
     function Get-SetupProgressPercent { [pscustomobject]@{ Percent = 100; Source = 'MoSetupRegistry' } }
@@ -478,6 +486,7 @@ function New-TestMutex {
     Reset-MonitorFixture
     Invoke-UpgradeStatusUpdate
     Assert-Condition ($state.Phase -eq 3 -and $state.PercentComplete -eq 50) 'Downlevel 100 must not produce overall 95'
+    Assert-Condition ($fixture.HistoryScans -eq 0) 'Normal Downlevel polling must not scan the growing setup log'
 
     $fixture.Processes = @()
     $fixture.BootChanged = $true
@@ -722,11 +731,12 @@ function New-TestMutex {
     $helperPath = Join-Path $projectRoot 'ServerB-Target\OSUpgradeStatus.ps1'
     $bootTime = [datetime]'2026-01-01 10:00:00'
     $fixture = @{
-        Invoke = $null; Starts = 0; Registers = 0; TaskState = 'Ready'; MissingScript = $false
+        Invoke = $null; Starts = 0; Registers = 0; TaskState = 'Ready'; MissingScript = $false; TaskReads = 0
         CurrentBuild = '17763'; Setup = 0; Processes = @('setuphost'); Removed = 0
-        Settings = $null
+        Settings = $null; FailJson = $false
         Registry = [pscustomobject]@{
             RunId = 'test-run'; Sequence = 1; Phase = 3; Status = 'InProgress'
+            StatusJsonPath = 'D:\upgrade_status.json'
             SourceBuild = '17763'; TargetBuild = '20348'
             LastObservedBootTimeUtc = $bootTime.ToUniversalTime().ToString('o')
             StatusUpdatedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
@@ -750,12 +760,17 @@ function New-TestMutex {
         throw "Unexpected registry read: $Path"
     }
     function Get-Process { param($Name, $ErrorAction) return $fixture.Processes }
+    function Get-Content {
+        param($LiteralPath, [switch]$Raw, $ErrorAction)
+        if ($fixture.FailJson) { throw 'Status JSON temporarily unavailable' }
+        return ($fixture.Registry | ConvertTo-Json -Depth 6)
+    }
     function Get-CimInstance {
         [CmdletBinding()]
         param($ClassName, $OperationTimeoutSec)
-        return [pscustomobject]@{ LastBootUpTime = $bootTime }
+        throw 'Routine status reads must not query CIM'
     }
-    function Get-ScheduledTask { param($TaskName, $ErrorAction) if ($fixture.TaskState) { return [pscustomobject]@{ State = $fixture.TaskState } } }
+    function Get-ScheduledTask { param($TaskName, $ErrorAction) $fixture.TaskReads++; if ($fixture.TaskState) { return [pscustomobject]@{ State = $fixture.TaskState } } }
     function New-ScheduledTaskAction { param($Execute, $Argument) Assert-Condition ($Argument -like '*Update-UpgradeStatus.ps1*') 'Recovery must launch only the status monitor'; return 'action' }
     function New-ScheduledTaskTrigger { param([switch]$Once, $At, $RepetitionInterval, $RepetitionDuration, [switch]$AtStartup) return 'trigger' }
     function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) return 'principal' }
@@ -771,10 +786,10 @@ function New-TestMutex {
         return [pscustomobject]$PSBoundParameters
     }
     function Invoke-Command {
-        param($ComputerName, $Credential, $Authentication, [switch]$UseSSL, $Port, $SessionOption, $ScriptBlock, $ErrorAction)
+        param($ComputerName, $Credential, $Authentication, [switch]$UseSSL, $Port, $SessionOption, $ScriptBlock, [object[]]$ArgumentList, $ErrorAction)
         $fixture.Invoke = $PSBoundParameters
         if ($Credential -and $Authentication -ne 'Negotiate') { throw 'Explicit credentials require Negotiate' }
-        & $ScriptBlock
+        & $ScriptBlock @ArgumentList
     }
     function Start-Job { param($ScriptBlock, [object[]]$ArgumentList) [pscustomobject]@{ Output = (& $ScriptBlock @ArgumentList) } }
     function Wait-Job { param($Job, $Timeout) return $Job }
@@ -796,20 +811,28 @@ function New-TestMutex {
       }
     }
     Assert-Condition ($fixture.Starts -eq 0 -and $fixture.Registers -eq 0) 'Healthy source-OS monitor must not be needlessly repaired'
+    Assert-Condition ($fixture.TaskReads -eq 0) 'Passive observations must not query Task Scheduler on every poll'
+    $fixture.FailJson = $true
+    $fallback = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http
+    Assert-Condition ($fallback.ProducerStatus.RunId -eq 'test-run' -and $fallback.LiveState.ProbeWarning -like '*registry fallback*') 'A missing JSON file must permit an explicitly reported read-only registry fallback without a writer mutex'
+    Assert-Condition ($fixture.TaskReads -eq 0) 'Registry fallback must not start target task recovery by itself'
+    $fixture.FailJson = $false
     $fixture.CurrentBuild = '20348'; $fixture.Processes = @()
     $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http
+    Assert-Condition ($fixture.Starts -eq 0 -and $fixture.TaskReads -eq 0) 'A target-build read alone must not start recovery work'
+    $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http -RefreshMonitor
     Assert-Condition ($fixture.Starts -eq 1 -and $observation.LiveState.MonitorRecovery -like '*immediate*') 'Target build with stale Downlevel status must trigger validation refresh'
     $fixture.TaskState = 'Running'
-    Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http | Out-Null
+    Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http -RefreshMonitor | Out-Null
     Assert-Condition ($fixture.Starts -eq 1) 'Do not create overlapping validation runs'
     $fixture.TaskState = $null
-    $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http
+    $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http -RefreshMonitor
     Assert-Condition ($fixture.Registers -eq 1 -and $fixture.Starts -eq 2) 'Lost monitor task must be recreated and started'
     Assert-Condition ($fixture.Settings.ExecutionTimeLimit.TotalMinutes -eq 10) 'Recovered monitor must have a bounded execution time'
     $fixture.MissingScript = $true
-    $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http
+    $observation = Get-RemoteUpgradeObservation -ComputerName 'mock-target' -Transport Http -RefreshMonitor
     Assert-Condition ($observation.LiveState.MonitorRecoveryError -like '*Monitor script missing*' -and $fixture.Starts -eq 2) 'Failed recovery must be explicit, not success-shaped'
-    Assert-Condition ($fixture.Removed -eq 10) 'Every live observation must clean up its job'
+    Assert-Condition ($fixture.Removed -eq 12) 'Every live observation must clean up its job'
     'PASS: live registry/build probing, HTTP/HTTPS identity, missing monitor repair, and no Setup relaunch (mocked)'
 }
 
@@ -852,7 +875,7 @@ function New-TestMutex {
         return $ping
     }
     function Test-RemoteWinRM { param($ComputerName, $Cred, $TimeoutSec) return $fixture.WinRM }
-    function Get-RemoteUpgradeObservation { param($ComputerName, $Cred, $Transport, $ErrorDetail) return $fixture.Observation }
+    function Get-RemoteUpgradeObservation { param($ComputerName, $Cred, $Transport, $JsonPath, $ErrorDetail, [switch]$RefreshMonitor) return $fixture.Observation }
     function Read-RemoteFileWithTimeout { param($Path, $TimeoutSec, $ErrorDetail) $fixture.FileReads++; return $fixture.File }
     function Get-RemoteStatusViaCimDcom { param($ComputerName, $Cred, $ErrorDetail) $fixture.DcomReads++; return $fixture.DCOM }
     function Read-RemoteStatusJsonViaWinRM { param($ComputerName, $Cred, $JsonPath, $Transport, $ErrorDetail) return $null }
@@ -861,7 +884,7 @@ function New-TestMutex {
     $fixture.Observation = [pscustomobject]@{ ProducerStatus = $fresh; LiveState = [pscustomobject]@{ CurrentBuild = '20348'; SystemSetupInProgress = 0; OOBEInProgress = 0 } }
     $fixture.File = '{"RunId":"test-run","Sequence":10,"Phase":3,"Status":"InProgress","PercentComplete":95,"StatusUpdatedAtUtc":"2026-01-01T00:00:00Z"}'
     $status = Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json'
-    Assert-Condition ($status.PercentComplete -eq 100 -and $status.Source -eq 'WinRM(LiveRegistry)' -and $fixture.FileReads -eq 0 -and $fixture.DcomReads -eq 0) 'Stale SMB at 95 must not shadow live completion or delay WinRM-only status'
+    Assert-Condition ($status.PercentComplete -eq 100 -and $status.Source -eq 'WinRM(Status)' -and $fixture.FileReads -eq 1 -and $fixture.DcomReads -eq 0) 'Stale SMB at 95 must not shadow live completion or delay WinRM-only status'
     $fixture.Observation = $null; $fixture.DCOM = $fresh
     $status = Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json'
     Assert-Condition ($status.Source -eq 'CIM(DCOM)' -and $status.Sequence -eq 12) 'Newer DCOM state must win over stale SMB when live WinRM read fails'
@@ -1270,6 +1293,212 @@ function Write-Log { param($Message, $Level) Write-Output "$Level : $Message" }
         if ([IO.File]::Exists($script:LocalLogFile)) { [IO.File]::Delete($script:LocalLogFile) }
     }
     'PASS: real log writer keeps retry diagnostics on disk without console noise'
+}
+
+& {
+    . (Get-TestFunction $syntaxTrees['OSUpgradeStatus.ps1'] 'Get-UpgradeStatusSnapshot')
+    $fixture = @{ History = '[]'; DenyMutex = $false }
+    function Get-ItemProperty { param($Path, $ErrorAction) [pscustomobject]@{ SetupPhaseHistory = $fixture.History; Status = 'InProgress' } }
+    function New-Object {
+        param($TypeName, $ArgumentList)
+        if ($fixture.DenyMutex) { throw [UnauthorizedAccessException]::new("Access to the path 'Global\OSUpgradeAutomationStatus' is denied.") }
+        New-TestMutex
+    }
+    function Write-Log { param($Message, $Level) }
+    $empty = Get-UpgradeStatusSnapshot
+    Assert-Condition ($empty.SetupPhaseHistory.Count -eq 0) 'An empty phase history must serialize as [], not [[]] or a blank phase event'
+    $fixture.History = '[[],[{"Phase":4,"PhaseName":"Safe OS Phase","StartedAtUtc":"2026-10-08T10:00:00Z","Source":"WindowsSetup.ExecutionLog"}]]'
+    $record = Get-UpgradeStatusSnapshot
+    Assert-Condition ($record.SetupPhaseHistory.Count -eq 1 -and $record.SetupPhaseHistory[0].Phase -is [int]) 'Legacy nested histories must become a flat list of actual phase records'
+    $fixture.DenyMutex = $true
+    $record = Get-UpgradeStatusSnapshot
+    Assert-Condition ($record.Status -eq 'InProgress') 'Reading a status snapshot must not open a SYSTEM-owned writer mutex'
+    'PASS: reported blank/nested phase history and reader mutex denial regressions'
+}
+
+& {
+    . (Get-TestFunction $syntaxTrees['Update-UpgradeStatus.ps1'] 'Update-SetupPhaseHistory')
+    $state = @{ SetupLaunchTimeUtc = '2026-10-08T09:00:00Z'; SetupPhaseHistory = '[]' }
+    $fixture = @{ Revision = 1; Scans = 0; Messages = @() }
+    function Get-UpgradeRegistryValue { param($Name, $Default) if ($state.ContainsKey($Name)) { $state[$Name] } else { $Default } }
+    function Set-UpgradeRegistryValue { param($Name, $Value, $Type) $state[$Name] = $Value }
+    function Test-Path { param($LiteralPath) return $true }
+    function Get-Item { param($LiteralPath, $ErrorAction) [pscustomobject]@{ Length = $fixture.Revision; LastWriteTimeUtc = [datetime]'2026-10-08T10:00:00Z' } }
+    function Write-Log { param($Message, $Level) $fixture.Messages += $Message }
+    function Get-SetupPhaseEvidence {
+        param($Paths, $StartedAtUtc)
+        $fixture.Scans++
+        foreach ($phase in @(3,4,5,6)) {
+            [pscustomobject]@{
+                Phase = $phase; PhaseName = "Phase $phase"; StartedAtUtc = "2026-10-08T10:0${phase}:00Z"
+                Source = 'WindowsSetup.ExecutionLog'; Path = 'test-setupact.log'; Evidence = "Execution phase $phase"
+            }
+        }
+    }
+    for ($poll = 0; $poll -lt 8; $poll++) {
+        if ($poll % 2 -eq 0) { $fixture.Revision++ }
+        $history = @(Update-SetupPhaseHistory)
+        Assert-Condition (($history.Phase -join ',') -eq '3,4,5,6') 'Repeated JSON round trips corrupted the Setup phase list'
+        $saved = $state.SetupPhaseHistory | ConvertFrom-Json
+        Assert-Condition ($saved.Count -eq 4 -and $saved[0].Phase -is [int]) 'Persisted phase history must be a flat array, not nested arrays'
+    }
+    Assert-Condition ($fixture.Scans -eq 4) 'Unchanged setup logs must not be rescanned'
+    Assert-Condition (@($fixture.Messages | Where-Object { $_ -like 'Setup log confirms*' }).Count -eq 4) 'Each real phase must be reported once, never a blank placeholder'
+    $state.SetupPhaseHistory = '[[],["damaged legacy entry"]]'
+    $history = @(Update-SetupPhaseHistory)
+    Assert-Condition (($history.Phase -join ',') -eq '3,4,5,6' -and $fixture.Scans -eq 5) 'Damaged cached history must trigger evidence recovery even if log signatures have not changed'
+    $nested = [Collections.ArrayList]::new()
+    [void]$nested.Add([Collections.ArrayList]@($history))
+    $normalized = @(ConvertFrom-UpgradePhaseHistory -History $nested)
+    Assert-Condition (($normalized.Phase -join ',') -eq '3,4,5,6' -and $normalized[0].Phase -is [int]) 'Remoting ArrayList wrappers must also normalize correctly'
+    'PASS: phase-history persistence across repeated polls, legacy repair, and remoting collection normalization'
+}
+
+& {
+    foreach ($name in @('Get-UpgradeStageMetadata','ConvertTo-OverallUpgradePercent','Set-Phase')) {
+        . (Get-TestFunction $syntaxTrees['OSUpgradeStatus.ps1'] $name)
+    }
+    . (Get-TestFunction $syntaxTrees['Start-RemoteUpgradeOrchestrator.ps1'] 'Add-UpgradeObservation')
+    $state = @{}
+    $fixture = @{ Messages = @() }
+    function Get-UpgradeRegistryValue { param($Name, $Default) if ($state.ContainsKey($Name)) { $state[$Name] } else { $Default } }
+    function Set-UpgradeRegistryValue { param($Name, $Value, $Type) $state[$Name] = $Value }
+    function New-Object { param($TypeName, $ArgumentList) New-TestMutex }
+    function Write-StatusJson {}
+    function Write-Log { param($Message, $Level, [switch]$LogOnly) $fixture.Messages += $Message }
+    $previousJsonPath = $script:StatusJson
+    $script:StatusJson = Join-Path ([IO.Path]::GetTempPath()) ('UpgradeSequence_' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $published = [pscustomobject]@{
+            RunId = 'current-run'; Sequence = 56; Phase = 3; Status = 'InProgress'
+            PercentComplete = 47; PhasePercentComplete = 88
+        }
+        [IO.File]::WriteAllText($script:StatusJson, ($published | ConvertTo-Json))
+        foreach ($targetPhase in @(3,5,7)) {
+            $state.Clear()
+            $state.RunId = 'current-run'; $state.Sequence = 54; $state.Phase = 3; $state.Status = 'InProgress'
+            $state.OverallPercentComplete = 45; $state.PhasePercentComplete = 80
+            $newStatus = if ($targetPhase -eq 7) { 'Completed' } else { 'InProgress' }
+            $phasePercent = if ($targetPhase -eq 7) { 100 } else { -1 }
+            Set-Phase -Phase $targetPhase -PhaseName "Phase $targetPhase" -Status $newStatus -PercentComplete $phasePercent
+            Assert-Condition ($state.Sequence -eq 57 -and $state.OverallPercentComplete -ge 47) 'Applied-OS registry rewind must not regress sequence or achieved progress'
+            if ($targetPhase -eq 7) { Assert-Condition ($state.Status -eq 'Completed' -and $state.PercentComplete -eq 100) 'Migrated sequence must not prevent completion publication' }
+        }
+        $state.Clear()
+        $state.RunId = 'new-run'; $state.Sequence = 1
+        Set-Phase -Phase 1 -PhaseName Prechecks -PercentComplete 0
+        Assert-Condition ($state.Sequence -eq 2 -and $state.PercentComplete -eq 0) 'A different run must not inherit an old run sequence or percentage'
+
+        $script:ExpectedRunId = 'current-run'
+        $script:LastProducerStatus = @{ RunId = 'current-run'; Sequence = 56; LastObservedBootTimeUtc = '2026-10-08T09:00:00Z' }
+        $record = [pscustomobject]@{
+            RunId = 'current-run'; Sequence = 54; Phase = 5; Status = 'InProgress'
+            LastObservedBootTimeUtc = '2026-10-08T10:00:00Z'
+        }
+        Assert-Condition ($null -ne (Add-UpgradeObservation -Record $record -Source 'new-boot')) 'A confirmed new boot must not be rejected solely for a migrated sequence'
+        $script:LastProducerStatus = @{ RunId = 'current-run'; Sequence = 54; LastObservedBootTimeUtc = '2026-10-08T10:00:00Z' }
+        $record.Sequence = 56; $record.LastObservedBootTimeUtc = '2026-10-08T09:00:00Z'
+        Assert-Condition ($null -eq (Add-UpgradeObservation -Record $record -Source 'old-file')) 'An older-boot snapshot must not replace a new-boot reading even with a higher sequence'
+        $record.Sequence = 53; $record.LastObservedBootTimeUtc = '2026-10-08T10:00:00Z'
+        Assert-Condition ($null -eq (Add-UpgradeObservation -Record $record -Source 'same-boot-stale')) 'Genuinely stale same-boot sequences must still be rejected'
+        'PASS: reproduced 56-to-54 registry rewind, durable publisher reconciliation, and boot-aware stale-reader rejection'
+    } finally {
+        if ([IO.File]::Exists($script:StatusJson)) { [IO.File]::Delete($script:StatusJson) }
+        $script:StatusJson = $previousJsonPath
+        $script:ExpectedRunId = $null; $script:LastProducerStatus = $null
+    }
+}
+
+& {
+    foreach ($name in @('Get-UpgradeStatus','Add-UpgradeObservation')) {
+        . (Get-TestFunction $syntaxTrees['Start-RemoteUpgradeOrchestrator.ps1'] $name)
+    }
+    $fixture = @{ Raw = $null; LiveReads = 0; RefreshRequests = 0; DcomReads = 0; FailLive = $false; Warnings = 0 }
+    $record = [pscustomobject]@{
+        RunId = 'passive-run'; Sequence = 10; Phase = 3; PhaseName = 'Downlevel Phase'; Status = 'InProgress'
+        PercentComplete = 47; StatusUpdatedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    $fixture.Raw = $record | ConvertTo-Json
+    $script:ExpectedRunId = 'passive-run'; $script:LastProducerStatus = $null
+    $script:LastMonitorRefreshAtUtc = [DateTimeOffset]::MinValue; $script:WinRMTransport = 'Http'
+    $script:LiveReadFailureLogged = $false
+    function New-Object {
+        param($TypeName)
+        $ping = [pscustomobject]@{}
+        $ping | Add-Member ScriptMethod Send { param($ComputerName, $Timeout) [pscustomobject]@{ Status = 'TimedOut' } }
+        $ping | Add-Member ScriptMethod Dispose {}
+        return $ping
+    }
+    function Test-RemoteWinRM { param($ComputerName, $Cred, $TimeoutSec) return $true }
+    function Read-RemoteFileWithTimeout { param($Path, $TimeoutSec, $ErrorDetail) Assert-Condition ($TimeoutSec -ge 5) 'SMB deadline must allow process startup'; return $fixture.Raw }
+    function Get-RemoteUpgradeObservation {
+        param($ComputerName, $Cred, $Transport, $JsonPath, [switch]$RefreshMonitor, [ref]$ErrorDetail)
+        $fixture.LiveReads++
+        if ($RefreshMonitor) { $fixture.RefreshRequests++ }
+        if ($fixture.FailLive) { $ErrorDetail.Value = 'WSMan could not launch a host process'; return $null }
+        [pscustomobject]@{ ProducerStatus = $record; LiveState = [pscustomobject]@{ CurrentBuild = '17763' } }
+    }
+    function Get-RemoteStatusViaCimDcom { param($ComputerName, $Cred, $ErrorDetail) $fixture.DcomReads++; return $null }
+    function Write-Log { param($Message, $Level, [switch]$LogOnly) if ($Level -eq 'WARN' -and -not $LogOnly) { $fixture.Warnings++ } }
+    for ($poll = 0; $poll -lt 10; $poll++) {
+        $status = Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json'
+        Assert-Condition ($status.Source -like 'File(*' -and $status.PercentComplete -eq 47) 'Fresh published status should use the passive file reader'
+    }
+    Assert-Condition ($fixture.LiveReads -eq 0 -and $fixture.DcomReads -eq 0 -and $fixture.RefreshRequests -eq 0) 'Healthy SMB polling must not open extra target shells or query/repair tasks'
+    $fixture.Raw = $null; $script:LastProducerStatus = $record
+    Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json' | Out-Null
+    Assert-Condition ($fixture.LiveReads -eq 1 -and $fixture.RefreshRequests -eq 0) 'Blocked SMB must need only one WinRM read, with no task repair while status is fresh'
+    $record.StatusUpdatedAtUtc = [DateTimeOffset]::UtcNow.AddMinutes(-3).ToString('o')
+    for ($poll = 0; $poll -lt 3; $poll++) { Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json' | Out-Null }
+    Assert-Condition ($fixture.RefreshRequests -eq 1) 'Stale-monitor refresh must be rate-limited, not started every poll'
+    $fixture.FailLive = $true
+    $fixture.Raw = $record | ConvertTo-Json
+    for ($poll = 0; $poll -lt 3; $poll++) { Get-UpgradeStatus -ComputerName 'mock-target' -JsonPath 'D:\upgrade_status.json' | Out-Null }
+    Assert-Condition ($fixture.Warnings -eq 1) 'Repeated WinRM payload failures must remain logged without repeating console warnings'
+    $script:ExpectedRunId = $null; $script:LastProducerStatus = $null
+    'PASS: reduced remote work on healthy polls, single WinRM fallback, throttled recovery, and non-spamming diagnostics'
+}
+
+& {
+    $helperPath = Join-Path $projectRoot 'ServerB-Target\OSUpgradeStatus.ps1'
+    $prefix = Join-Path ([IO.Path]::GetTempPath()) ('UpgradeAtomic_' + [guid]::NewGuid().ToString('N'))
+    $path = "$prefix.json"
+    $retrySignal = "$prefix.retry"
+    $job = $null
+    $reader = $null
+    try {
+        Write-UpgradeJsonFile -Path $path -Json '{"Sequence":1}'
+        $reader = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $job = Start-Job -ScriptBlock {
+            param($helperPath, $path, $retrySignal)
+            $ErrorActionPreference = 'Stop'
+            . $helperPath
+            function Start-Sleep {
+                param($Milliseconds)
+                [IO.File]::WriteAllText($retrySignal, 'replacement retry')
+                Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+            }
+            Write-UpgradeJsonFile -Path $path -Json '{"Sequence":2}'
+            'published'
+        } -ArgumentList $helperPath, $path, $retrySignal
+        $deadline = [datetime]::UtcNow.AddSeconds(15)
+        while (-not [IO.File]::Exists($retrySignal) -and [datetime]::UtcNow -lt $deadline -and $job.State -eq 'Running') {
+            Start-Sleep -Milliseconds 10
+        }
+        $reader.Dispose(); $reader = $null
+        Assert-Condition ([IO.File]::Exists($retrySignal)) 'The real open-reader replacement conflict was not retried'
+        if (-not (Wait-Job -Job $job -Timeout 10)) { throw 'Atomic publication did not finish after the reader released its handle' }
+        $result = Receive-Job -Job $job -ErrorAction Stop
+        Assert-Condition ($result -eq 'published' -and (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).Sequence -eq 2) 'Atomic replace failed to recover without deleting the existing status'
+        Assert-Condition (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($path)) -Filter ([IO.Path]::GetFileName($path) + '.*.tmp')).Count -eq 0) 'Atomic writer leaked a temporary file'
+        'PASS: real Windows file-sharing conflict retries and preserves atomic JSON replacement without Move-Item overwrite fallback'
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        foreach ($temporaryFile in @($path, $retrySignal)) {
+            if ([IO.File]::Exists($temporaryFile)) { [IO.File]::Delete($temporaryFile) }
+        }
+    }
 }
 
 "PASS: all $($syntaxTrees.Count) PowerShell files parse; no upgrades, network calls or registry writes performed"
