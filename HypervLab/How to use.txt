@@ -1,0 +1,37 @@
+Hyper-V lab automation: quick checklist
+
+Read README.md before running the scripts. Use Windows PowerShell 5.1.
+Review the domain, DNS, network, storage, and virtual-switch defaults.
+
+1. Prepare an unattended parent INSIDE a standalone reference VM:
+   - Follow Prepare-HyperVLabTemplate.README.md.
+   - Run .\Prepare-HyperVLabTemplate.ps1 as Administrator.
+   - Review the answer file, then run the printed Sysprep command yourself.
+   - After shutdown, preserve and test the VHDX. Do not boot or modify a parent
+     after differencing children depend on it.
+
+2. Deploy ON THE HYPER-V HOST in Administrator PowerShell:
+   - Keep Manage-HyperVLab.ps1, New-HyperVLab-Configured.ps1, and
+     Remove-HyperVLabNodes.ps1 in the same folder.
+   - Change to that folder.
+   - Run .\Manage-HyperVLab.ps1 -WhatIf and choose 1 to preview creation.
+   - Run .\Manage-HyperVLab.ps1 and choose 1 to create/configure nodes.
+   - Enter the template local Administrator credential and a separate AD
+     credential. Review and confirm the deployment plan.
+
+3. Advanced settings or interrupted deployments:
+   - Invoke .\New-HyperVLab-Configured.ps1 directly.
+   - To resume, use -ConfigureExistingVMName and -ExistingOUName.
+   - Do not select create again to resume; it allocates another batch.
+   - Follow README.md for computer-qualified credentials and activation-only
+     recovery; do not repeat networking/domain setup just to retry activation.
+
+4. Cleanup:
+   - Run the menu and choose 2. Preview first and verify exact VM identities.
+   - Cleanup is destructive. Read the modes and safeguards in README.md.
+
+Unattended templates avoid repeated OOBE work but do not eliminate credential,
+resource-selection, or confirmation prompts. This is a controlled-lab workflow:
+guest firewall profiles and IPv6 bindings are disabled.
+
+Never commit generated answer files, passwords, Windows media, or virtual disks.

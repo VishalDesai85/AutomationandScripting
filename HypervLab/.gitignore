@@ -1,0 +1,11 @@
+/Old/
+
+# Generated answer files contain recoverable credentials.
+*[Uu]nattend*.xml
+
+# Keep Windows media and virtual disks outside source control.
+*.iso
+*.vhd
+*.vhdx
+*.avhd
+*.avhdx
