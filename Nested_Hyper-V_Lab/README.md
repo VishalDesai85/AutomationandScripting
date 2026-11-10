@@ -1,8 +1,12 @@
-# Hyper-V lab automation with unattended templates
+# Nested Hyper-V Lab Preparation for Failover Clustering and S2D
 
-Create repeatable Hyper-V lab deployments from a generalized Windows parent
-image, configure the guests through PowerShell Direct, and clean up disposable
-nodes through one menu.
+Prepare domain-joined Windows Server VMs with nested virtualization enabled as
+the foundation for a Hyper-V, Failover Clustering, and Storage Spaces Direct
+(S2D) lab. The scripts provision the lab nodes, configure the guests through
+PowerShell Direct, and clean up disposable nodes through one menu.
+
+Installing Hyper-V inside the guest nodes, creating a failover cluster, and
+enabling S2D are subsequent steps; this package does not automate them.
 
 **Prepare an unattended parent image first.** This avoids completing Windows
 OOBE separately on every new VM and lets the configured deployment continue
@@ -14,6 +18,33 @@ interactive; this is not a completely non-interactive installer.
 > and IPv6 bindings, and enables nested-virtualization settings. Cleanup can
 > permanently remove selected VMs, disks, and matching directory/DNS objects.
 > Review the defaults and safeguards before running anything.
+
+## Automation boundary and next steps
+
+The package automates the preparation phase:
+
+- Generation 2 VM creation, resource selection, nested-virtualization exposure,
+  and optional blank data disks.
+- Unattended first boot from a prepared parent, guest networking, time zone,
+  domain join, name/OU verification, and eligible AVMA activation.
+- Explicit recovery and guarded cleanup of disposable lab nodes.
+
+After provisioning succeeds, you still need to:
+
+1. Install the Hyper-V and Failover Clustering roles/features inside the
+   intended guest nodes.
+2. Verify Windows Server edition/licensing, resource sizing, networking, and
+   storage requirements for your intended S2D lab.
+3. Run cluster validation, create the failover cluster, and configure quorum.
+4. Enable S2D and create the required storage volumes and clustered workloads.
+
+Select suitable data-disk counts and capacities during provisioning; the
+default is no additional data disks. **Leave disks intended for S2D pooling
+empty, unpartitioned, and unformatted.** Do not prepare them as ordinary
+standalone data volumes first. Provisioning success does not certify that all
+clustering or S2D prerequisites have been met. Follow Microsoft's
+[Storage Spaces Direct deployment guide](https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/deploy-storage-spaces-direct)
+for those later steps.
 
 ## Files and where to run them
 
@@ -33,11 +64,11 @@ The configured provisioner does not require another provisioning script.
 
 ### 1. Download and review
 
-Clone the repository, or download its ZIP and open the `HypervLab` folder:
+Clone the repository, or download its ZIP and open the `Nested_Hyper-V_Lab` folder:
 
 ```powershell
 git clone https://github.com/VishalDesai85/AutomationandScripting.git
-Set-Location .\AutomationandScripting\HypervLab
+Set-Location .\AutomationandScripting\Nested_Hyper-V_Lab
 ```
 
 Use **Windows PowerShell 5.1 as Administrator** on the Hyper-V host. Hyper-V
@@ -65,6 +96,9 @@ from an elevated Windows PowerShell window:
 Set-Location C:\HyperVLab
 .\Prepare-HyperVLabTemplate.ps1
 ```
+
+`C:\HyperVLab` is an example working directory inside the reference VM; it does
+not need to match the repository folder name.
 
 Enter a lab-specific local Administrator password. Review the generated
 `C:\HyperVLab\Unattend.xml`, then run the Sysprep command printed by the helper.
@@ -478,7 +512,9 @@ their names/folders. If starting fails, some new VMs may already be running.
 - Install the Hyper-V role **inside** each new guest when ready; the script
   exposes virtualization extensions but does not install that guest role.
   The configured workflow handles guest naming, networking, DNS, and domain
-  join. Data disks start blank; initialize/partition/format them in the guests.
+  join. Data disks start blank. Leave disks intended for S2D pooling
+  unpartitioned and unformatted; only initialize standalone disks that are not
+  intended for the S2D pool.
 - Disabling host time synchronization does not disable Windows Time inside
   the guest; domain-joined guests can use AD time synchronization.
 - Allow enough RAM for the host, `MylabAD01`, and existing VMs. Dynamic and

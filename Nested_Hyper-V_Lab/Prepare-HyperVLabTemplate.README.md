@@ -1,4 +1,4 @@
-# Creating an unattended Hyper-V lab parent image
+# Creating an unattended Windows parent for the nested Hyper-V lab
 
 This guide explains how to build a generalized Windows parent VHDX that can
 complete its first boot without stopping at the **Hi there** OOBE screen.
@@ -7,6 +7,11 @@ connect through PowerShell Direct and configure the guest.
 
 `Prepare-HyperVLabTemplate.ps1` creates and validates the Sysprep answer file.
 It does **not** run Sysprep or modify an existing parent VHDX.
+
+The deployed children provide a foundation for installing nested Hyper-V,
+building a failover cluster, and configuring Storage Spaces Direct (S2D).
+Those roles, cluster creation, and S2D configuration are not performed by the
+template helper or the configured provisioner.
 
 Preparing an unattended parent once reduces repeated per-VM setup: after you
 choose resources and enter credentials on the host, deployed children can
@@ -309,6 +314,21 @@ as `LicenseStatus 1`. The script does not convert evaluation images or change
 the host's license. Use a properly licensed, non-evaluation template for AVMA.
 See [Automatic VM activation (AVMA)](./README.md#automatic-vm-activation-avma)
 for the compatibility table, key selection, verification and failure behavior.
+
+## Continue with Hyper-V, Failover Clustering, and S2D
+
+After guest provisioning and verification finish, install the required
+Hyper-V and Failover Clustering roles/features inside the intended nodes,
+validate the cluster configuration, create the cluster and quorum, then
+configure S2D and its storage volumes. These are separate lab-building steps,
+not part of the scripts' unattended preparation workflow.
+
+Choose the required data disks during VM provisioning and leave those intended
+for S2D pooling empty, unpartitioned, and unformatted. See the
+[automation boundary and next steps](./README.md#automation-boundary-and-next-steps)
+and Microsoft's
+[Storage Spaces Direct deployment guide](https://learn.microsoft.com/en-us/windows-server/storage/storage-spaces/deploy-storage-spaces-direct)
+before configuring the storage pool.
 
 ## Recovering VMs already stopped at OOBE
 

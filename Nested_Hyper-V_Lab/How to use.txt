@@ -1,7 +1,9 @@
-Hyper-V lab automation: quick checklist
+Nested Hyper-V lab preparation for Failover Clustering and S2D
 
 Read README.md before running the scripts. Use Windows PowerShell 5.1.
 Review the domain, DNS, network, storage, and virtual-switch defaults.
+This package prepares the guest nodes; it does not install their Hyper-V or
+Failover Clustering roles, create the cluster, or enable Storage Spaces Direct.
 
 1. Prepare an unattended parent INSIDE a standalone reference VM:
    - Follow Prepare-HyperVLabTemplate.README.md.
@@ -26,7 +28,13 @@ Review the domain, DNS, network, storage, and virtual-switch defaults.
    - Follow README.md for computer-qualified credentials and activation-only
      recovery; do not repeat networking/domain setup just to retry activation.
 
-4. Cleanup:
+4. Continue building the lab after provisioning succeeds:
+   - Install Hyper-V and Failover Clustering inside the intended guest nodes.
+   - Verify prerequisites, validate/create the cluster, and configure quorum.
+   - Enable S2D and create volumes as separate, subsequent steps.
+   - Leave disks intended for S2D pooling unpartitioned and unformatted.
+
+5. Cleanup:
    - Run the menu and choose 2. Preview first and verify exact VM identities.
    - Cleanup is destructive. Read the modes and safeguards in README.md.
 
