@@ -26,7 +26,8 @@ The package automates the preparation phase:
 - Generation 2 VM creation, resource selection, nested-virtualization exposure,
   and optional blank data disks.
 - Unattended first boot from a prepared parent, guest networking, time zone,
-  domain join, name/OU verification, and eligible AVMA activation.
+  guest hypervisor startup validation/repair, domain join, name/OU verification,
+  and eligible AVMA activation.
 - Explicit recovery and guarded cleanup of disposable lab nodes.
 
 After provisioning succeeds, you still need to:
@@ -510,7 +511,8 @@ their names/folders. If starting fails, some new VMs may already be running.
   `Natswitch` **does not create or configure NAT**. The script does not change
   host networking, VLANs, IP addresses, DNS, or switch configuration.
 - Install the Hyper-V role **inside** each new guest when ready; the script
-  exposes virtualization extensions but does not install that guest role.
+  exposes virtualization extensions and verifies explicit guest hypervisor
+  startup (`hypervisorlaunchtype Auto`), but does not install that guest role.
   The configured workflow handles guest naming, networking, DNS, and domain
   join. Data disks start blank. Leave disks intended for S2D pooling
   unpartitioned and unformatted; only initialize standalone disks that are not
@@ -575,31 +577,44 @@ The default post-provisioning workflow:
    Direct, reporting progress and identifying OOBE as a likely blocker. No
    interactive console login or guest network connectivity is needed when the
    parent was prepared with the supplied unattend helper.
-4. Disables and verifies the Domain, Private, and Public Windows Firewall
-   profiles immediately after PowerShell Direct becomes available. It verifies
+4. Verifies that the host exposes CPU virtualization extensions for each node,
+   including nodes selected with `-ConfigureExistingVMName`. Missing exposure
+   stops configuration with instructions to shut down the VM and enable it on
+   the host; the script does not forcibly power off existing guests.
+   Reads the current guest Windows boot entry through the locale-independent
+   BCD WMI provider. If `hypervisorlaunchtype` is missing or `Off`, sets it to
+   `Auto`, verifies the write, restarts only that guest, and waits for its boot
+   time to change and PowerShell Direct to return before verifying `Auto` again.
+   An existing explicit `Auto` setting does not cause an additional restart.
+   BCD access, update, restart, or verification failures stop configuration.
+   If a run stops after writing `Auto` but before a verified restart, complete
+   that guest restart before resuming; an already persisted `Auto` setting
+   alone does not establish that the guest has rebooted since the change.
+5. Disables and verifies the Domain, Private, and Public Windows Firewall
+   profiles after guest hypervisor startup validation. It verifies
    them again every 15 seconds for two minutes after the domain-join restart,
    re-disabling any profile that turns itself back on. It also sets and verifies
    the guest time zone as `India Standard Time` before configuration and after
    the domain-join restart.
-5. Selects addresses from `10.151.33.2` through `10.151.33.254`, excluding the
+6. Selects addresses from `10.151.33.2` through `10.151.33.254`, excluding the
    `10.151.33.1` gateway, `10.151.33.84` DNS/DC address, Hyper-V-reported guest
    addresses, existing `mylab.local` DNS A records, and addresses detected by
    ping or neighbor discovery from the DC.
-6. Maps host adapters to guest adapters by MAC address. Adapters on `Natswitch`
+7. Maps host adapters to guest adapters by MAC address. Adapters on `Natswitch`
    become `mgmt1`, `mgmt2`, and so on; adapters on `SMB-Network` become `smb1`,
    `smb2`, and so on.
-7. Disables IPv6 binding on every guest adapter. Only `mgmt1` receives an IPv4
+8. Disables IPv6 binding on every guest adapter. Only `mgmt1` receives an IPv4
    configuration: `/24`, gateway `10.151.33.1`, and primary DNS
    `10.151.33.84`. DHCP and existing IPv4 addresses are removed from the other
    guest adapters.
-8. Creates the derived OU at the domain root (`MSLABVM` -> `MSLABOU`,
+9. Creates the derived OU at the domain root (`MSLABVM` -> `MSLABOU`,
    or default `HypNode` -> `HypNodeOU`). If it exists, the first unused
    serialized name is used (`MSLABOU01`, `MSLABOU02`, and so on).
-9. Renames each workgroup guest to its Hyper-V VM name and waits for a verified
+10. Renames each workgroup guest to its Hyper-V VM name and waits for a verified
    reboot before joining it to `mylab.local` in the new OU. It then waits for a
    second verified reboot and checks its name, domain, and AD OU placement.
    Guests already using the target name need only the domain-join reboot.
-10. Detects the guest Windows Server version/edition and uses Automatic Virtual
+11. Detects the guest Windows Server version/edition and uses Automatic Virtual
     Machine Activation (AVMA) when the detected Hyper-V host is eligible.
     Activation runs after the guest's domain-join restart has completed.
 
@@ -757,11 +772,13 @@ enabled by the resume operation.
 
 ### Successful completion output
 
-Each node finishes with messages confirming PowerShell Direct, firewall
-stabilization, IST, its assigned address, and domain membership:
+Each node finishes with messages confirming PowerShell Direct, nested
+virtualization settings, firewall stabilization, IST, its assigned address,
+and domain membership:
 
 ```text
 PowerShell Direct is ready in 'HypNode11'.
+Nested virtualization settings verified in 'HypNode11': host CPU exposure enabled and guest hypervisorlaunchtype Auto.
 Windows Firewall is disabled for Domain, Private, and Public profiles in 'HypNode11' after 9 verification attempt(s).
 Time zone 'India Standard Time' is configured in 'HypNode11'.
 Configured HypNode11 as 10.151.33.4 and joined it to mylab.local.
@@ -841,6 +858,88 @@ only the unfinished VMs and reuse the OU printed by the failed run:
     -ConfigureExistingVMName 'HypNode10','HypNode11','HypNode12' `
     -ExistingOUName 'HypNodeOU'
 ```
+
+### Hyper-V installation says virtualization is not enabled in the BIOS
+
+The guest's `Install-WindowsFeature -Name Hyper-V` can fail with:
+
+```text
+Hyper-V cannot be installed because virtualization support is not enabled in the BIOS.
+```
+
+Do not assume that this means the physical BIOS or host exposure setting is
+disabled. In the observed Windows Server 2025 lab, `MSLABH02` and `MSLABH04`
+installed Hyper-V, while `MSLABH01` and `MSLABH03` failed. All four were on the
+same host with `ExposeVirtualizationExtensions = True`. The working node had
+an explicit `hypervisorlaunchtype Auto` boot entry; the tested failing node did
+not. Explicitly setting `Auto`, rebooting, and retrying installation resolved
+the failure on `MSLABH01`.
+
+The current provisioner checks both settings before networking/domain
+configuration for new deployments and explicit resume mode. Copy the updated
+[New-HyperVLab-Configured.ps1](./New-HyperVLab-Configured.ps1) to the host;
+updating only the menu script does not update its provisioning behavior.
+Hyper-V role installation remains a separate, manual step. This validation
+does not certify every Hyper-V, cluster, or S2D prerequisite.
+
+For already deployed nodes, use this targeted recovery:
+
+1. In elevated PowerShell **on the Hyper-V host**, inspect the affected VMs:
+
+   ```powershell
+   Get-VMProcessor -VMName 'MSLABH01', 'MSLABH03' |
+       Select-Object VMName, ExposeVirtualizationExtensions
+   ```
+
+   If exposure is `False`, shut down that guest normally, set it to `True`
+   with `Set-VMProcessor -VMName '<affected VM>' -ExposeVirtualizationExtensions $true`,
+   then start it. Do not change working nodes unnecessarily.
+
+2. In elevated PowerShell **inside each failing guest**, inspect its current
+   Windows boot entry:
+
+   ```powershell
+   bcdedit /enum '{current}'
+   ```
+
+   An absent line is not universally proof that virtualization is disabled,
+   and a successful Hyper-V installation can itself add the `Auto` entry.
+   However, explicitly setting this option and rebooting before installation
+   is a documented workaround for this error in nested environments.
+
+3. If the setting is missing or `Off`, enable it and restart that guest.
+   Save work first; this disconnects guest sessions:
+
+   ```powershell
+   bcdedit /set '{current}' hypervisorlaunchtype Auto
+   if ($LASTEXITCODE -ne 0) {
+       throw "BCDEdit failed with exit code $LASTEXITCODE."
+   }
+   Restart-Computer
+   ```
+
+4. After reconnecting, verify the boot entry reports `hypervisorlaunchtype Auto`
+   and retry the role installation:
+
+   ```powershell
+   bcdedit /enum '{current}'
+   Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -ErrorAction Stop |
+       Format-List Success, RestartNeeded, ExitCode, FeatureResult
+   ```
+
+   `Success = True` with `ExitCode = SuccessRestartRequired` means installation
+   succeeded but is **not finished until another restart**. Restart the guest,
+   then verify that `Get-WindowsFeature -Name Hyper-V` reports `Installed`.
+
+Inside a VM, `HypervisorPresent = True` can reflect the outer hypervisor;
+it does not prove that the guest's own Hyper-V hypervisor is running. CPU
+capability fields such as `VirtualizationFirmwareEnabled`, `VMMonitorModeExtensions`,
+and `SecondLevelAddressTranslationExtensions` can also be masked when a
+hypervisor is active. Do not interpret one `False` field as conclusive evidence
+of a physical BIOS problem or disable security features based on it alone.
+
+References: [Microsoft's nested-virtualization recovery procedure and guest boot option](https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/windows/troubleshoot-vm-by-use-nested-virtualization#step-1-create-a-rescue-vm-and-install-hyper-v-role),
+[nested virtualization prerequisites](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/enable-nested-virtualization).
 
 ### When PowerShell Direct reports "The credential is invalid"
 
@@ -970,6 +1069,16 @@ Before a real deployment:
    allocations. Also verify the documented domain/network defaults against
    your actual lab before removing `-WhatIf`.
 4. Deploy a small disposable batch before a larger run.
+
+Focused, mocked regression tests for guest hypervisor startup validation
+can run without Hyper-V or guest access:
+
+```powershell
+Invoke-Pester -Script .\New-HyperVLab-Configured.Tests.ps1
+```
+
+These tests do not replace a disposable-VM test of the BCD provider, guest
+restart, and later manual Hyper-V role installation.
 
 Cleanup `-WhatIf` is also non-mutating, but guest-aware preview requires
 credentials and performs read-only guest/DC discovery. Review its identity

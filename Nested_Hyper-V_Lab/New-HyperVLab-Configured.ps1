@@ -4,7 +4,9 @@
 Provisions Hyper-V lab VMs, configures their guests, and activates eligible Windows Server guests with AVMA.
 .DESCRIPTION
 Uses PowerShell Direct from the Hyper-V host. Credentials are requested securely and
-are never stored in this script.
+are never stored in this script. Verifies host virtualization exposure and enables
+guest hypervisor startup, restarting changed guests before continuing configuration.
+Does not install the Hyper-V role inside guests.
 .EXAMPLE
 .\New-HyperVLab-Configured.ps1
 .EXAMPLE
@@ -636,6 +638,84 @@ function Restart-LabGuest {
     } -ErrorAction Stop
     Wait-LabPowerShellDirect -VMName $VMName -Credential $RestartCredential `
         -TimeoutSeconds $TimeoutSeconds -PreviousBootTime $previousBootTime
+}
+
+$script:LabGuestHypervisorBootConfiguration = {
+    param([bool]$Configure = $false)
+
+    $ErrorActionPreference = 'Stop'
+    # BCD identifiers avoid parsing localized BCDEdit output.
+    $currentLoaderId = '{fa926493-6f1c-4193-a414-58f0b2456d1e}'
+    $launchTypeElement = [uint32]0x250000F0
+    $store = Invoke-CimMethod -Namespace 'root\WMI' -ClassName BcdStore `
+        -MethodName OpenStore -Arguments @{ File = '' } -ErrorAction Stop
+    if ($store.ReturnValue -ne $true -or $null -eq $store.Store) {
+        throw 'Could not open the guest system BCD store. Verify guest administrator access.'
+    }
+    $loader = Invoke-CimMethod -InputObject $store.Store -MethodName OpenObject `
+        -Arguments @{ Id = $currentLoaderId } -ErrorAction Stop
+    if ($loader.ReturnValue -ne $true -or $null -eq $loader.Object) {
+        throw 'Could not open the current guest Windows boot loader.'
+    }
+
+    function Get-LabHypervisorLaunchType {
+        $result = Invoke-CimMethod -InputObject $loader.Object -MethodName EnumerateElements -ErrorAction Stop
+        if ($result.ReturnValue -ne $true -or $null -eq $result.Elements) {
+            throw 'Could not enumerate the current guest Windows boot settings.'
+        }
+        $elements = @($result.Elements | Where-Object Type -EQ $launchTypeElement)
+        if ($elements.Count -eq 0) { return 'NotConfigured' }
+        if ($elements.Count -ne 1 -or $null -eq $elements[0].Integer -or
+            $elements[0].Integer -notin @(0, 1)) {
+            throw 'The guest hypervisorlaunchtype BCD element has an unexpected value.'
+        }
+        if ($elements[0].Integer -eq 1) { return 'Auto' }
+        return 'Off'
+    }
+
+    $launchType = Get-LabHypervisorLaunchType
+    $changed = $Configure -and $launchType -ne 'Auto'
+    if ($changed) {
+        $updated = Invoke-CimMethod -InputObject $loader.Object -MethodName SetIntegerElement `
+            -Arguments @{ Type = $launchTypeElement; Integer = [uint64]1 } -ErrorAction Stop
+        if ($updated.ReturnValue -ne $true) {
+            throw 'Could not set guest hypervisorlaunchtype to Auto in the current Windows boot entry.'
+        }
+        $launchType = Get-LabHypervisorLaunchType
+    }
+    if ($launchType -ne 'Auto') {
+        throw "Guest hypervisorlaunchtype is '$launchType', not Auto."
+    }
+    [pscustomobject]@{ HypervisorLaunchType = $launchType; Changed = $changed }
+}
+
+function Enable-LabGuestHypervisor {
+    param(
+        [string]$VMName,
+        [PSCredential]$Credential,
+        [int]$TimeoutSeconds = 900
+    )
+
+    $processors = @(Get-VMProcessor -VMName $VMName -ErrorAction Stop)
+    if ($processors.Count -ne 1 -or $processors[0].ExposeVirtualizationExtensions -ne $true) {
+        throw "Virtualization extensions are not verified as exposed for '$VMName'. Shut down the VM, run Set-VMProcessor -VMName '$VMName' -ExposeVirtualizationExtensions `$true on the Hyper-V host, then start the VM and resume configuration."
+    }
+    $state = Invoke-Command -VMName $VMName -Credential $Credential -ArgumentList $true `
+        -ScriptBlock $script:LabGuestHypervisorBootConfiguration -ErrorAction Stop
+    if ($state.HypervisorLaunchType -ne 'Auto' -or $null -eq $state.Changed) {
+        throw "Could not verify guest hypervisor startup configuration in '$VMName'."
+    }
+    if ($state.Changed) {
+        Write-Host "Set guest hypervisorlaunchtype to Auto in '$VMName'; restarting the guest before continuing."
+        Restart-LabGuest -VMName $VMName -Credential $Credential `
+            -RestartCredential $Credential -TimeoutSeconds $TimeoutSeconds
+        $verified = Invoke-Command -VMName $VMName -Credential $Credential -ArgumentList $false `
+            -ScriptBlock $script:LabGuestHypervisorBootConfiguration -ErrorAction Stop
+        if ($verified.HypervisorLaunchType -ne 'Auto') {
+            throw "Guest hypervisorlaunchtype did not remain Auto after restarting '$VMName'."
+        }
+    }
+    Write-Host "Nested virtualization settings verified in '$VMName': host CPU exposure enabled and guest hypervisorlaunchtype Auto."
 }
 
 function Disable-LabGuestFirewall {
@@ -1534,7 +1614,7 @@ function Invoke-HyperVLabConfiguredProvisioning {
 
     [void](Test-LabDomainController -VMName $DomainControllerVMName -DomainName $DomainName `
         -DnsServer $DnsServer -Credential $DomainCredential)
-    $createdVMs = if ($hasExistingVMs) {
+    $createdVMs = @(if ($hasExistingVMs) {
         $uniqueNames = @($ConfigureExistingVMName | Sort-Object -Unique)
         foreach ($requestedName in $uniqueNames) {
             if ($requestedName -ieq $DomainControllerVMName) {
@@ -1556,7 +1636,7 @@ function Invoke-HyperVLabConfiguredProvisioning {
     }
     else {
         @(Invoke-HyperVLabProvisioning -VMRoot $VMRoot -NamePrefix $NamePrefix -StartVMs $true)
-    }
+    })
     if ($createdVMs.Count -eq 0) {
         Write-Host 'No VMs were created; guest configuration was skipped.'
         return
@@ -1568,6 +1648,8 @@ function Invoke-HyperVLabConfiguredProvisioning {
             $currentName = $vm.Name
             Wait-LabPowerShellDirect -VMName $vm.Name -Credential $LocalAdministratorCredential `
                 -TimeoutSeconds $PowerShellDirectTimeoutSeconds -FailOnInvalidCredential:$hasExistingVMs
+            Enable-LabGuestHypervisor -VMName $vm.Name -Credential $LocalAdministratorCredential `
+                -TimeoutSeconds $PowerShellDirectTimeoutSeconds
             Disable-LabGuestFirewall -VMName $vm.Name -Credential $LocalAdministratorCredential
             Set-LabGuestTimeZone -VMName $vm.Name -Credential $LocalAdministratorCredential `
                 -TimeZoneId $GuestTimeZone
