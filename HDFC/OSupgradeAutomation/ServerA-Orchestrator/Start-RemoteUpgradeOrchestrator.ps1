@@ -80,8 +80,21 @@
 
 .PARAMETER RemoteStagingPath
     Temporary staging folder on Server B the files are copied into before
-    Start-TargetUpgrade.ps1 relocates what it needs to its permanent
-    C:\ProgramData\OSUpgradeAutomation location. Default: C:\Temp\OSUpgradeStaging
+    Start-TargetUpgrade.ps1 relocates runtime scripts into persistent storage.
+    Default: C:\Temp\OSUpgradeStaging. May be any separate, absolute local
+    directory on an available target drive, including paths containing spaces.
+
+.PARAMETER TargetDataRoot
+    Optional target storage root such as E:\OSUpgrade. Persistent scripts,
+    logs and markers use Artifacts beneath it, backups default to Backup,
+    and status defaults to upgrade_status.json. Explicit BackupRoot and
+    StatusJsonPath override those defaults. Does not move the staging folder,
+    ISO media, Windows-owned Panther logs, or Server A's own logs/mirror.
+    The backup location must remain on a non-system drive.
+
+.PARAMETER SkipDirtyBitCheck
+    Pass through to the target: explicitly skip disk dirty-bit validation,
+    recording WARN/Skipped. No dirty bits are queried, cleared or repaired.
 
 .PARAMETER IsoFolder, MinFreeSpaceGB, BackupRoot, StatusJsonPath, RetentionDays,
 .PARAMETER DisableAutoCleanup, SkipPatchCheckLab, SkipSystemStateBackup, SkipOrphanedProfileCheck,
@@ -175,8 +188,9 @@ param(
     # --- Pass-through parameters for Start-TargetUpgrade.ps1 -----------------
     [string]$IsoFolder             = "D:\ISO",
     [int]   $MinFreeSpaceGB        = 32,
-    [string]$BackupRoot            = "D:\UpgradeBackup",
-    [string]$StatusJsonPath        = "D:\upgrade_status.json",
+    [string]$BackupRoot            = "",
+    [string]$StatusJsonPath        = "",
+    [string]$TargetDataRoot        = "",
     [int]   $RetentionDays         = 14,
     [switch]$DisableAutoCleanup,
     [switch]$SkipPatchCheckLab,
@@ -184,6 +198,7 @@ param(
     [switch]$SkipOrphanedProfileCheck,
     [switch]$SkipUserProfileCountCheck,
     [switch]$SkipPendingFileRenameCheck,
+    [switch]$SkipDirtyBitCheck,
     [string]$MinVMwareToolsVersion = "12.0.0",
     [switch]$UseControlledReboot,
     [int]   $MaxPatchAgeDays       = 60,
@@ -377,7 +392,7 @@ function Write-LocalStatusMirror {
         $script:MirrorWriteWarningLogged = $false
     } catch {
         if (-not $script:MirrorWriteWarningLogged) {
-            Write-Log "Non-blocking: could not update local status mirror '$script:LocalStatusMirrorPath': $_" "WARN"
+            Write-Log "Non-blocking: could not update local status mirror '$script:LocalStatusMirrorPath': $_. Check elevation, file attributes and permissions, or set -LocalStatusMirrorPath to an approved writable Server A location. Console monitoring continues, but the local mirror is not confirmed current." "WARN"
             $script:MirrorWriteWarningLogged = $true
         }
     }
@@ -572,7 +587,7 @@ foreach ($f in $requiredFiles) {
 }
 Write-Log "All 6 target-side files found in $SourceFilesPath."
 . (Join-Path $SourceFilesPath "OSUpgradeStatus.ps1")
-foreach ($helperName in @("Write-UpgradeJsonFile", "ConvertFrom-UpgradePhaseHistory")) {
+foreach ($helperName in @("Write-UpgradeJsonFile", "ConvertFrom-UpgradePhaseHistory", "Resolve-UpgradeTargetPaths", "Get-UpgradeExecutionIdentity")) {
     if (-not (Get-Command -Name $helperName -CommandType Function -ErrorAction SilentlyContinue)) {
         throw "Companion helper is missing '$helperName'. Deploy the complete matching script set, not only the orchestrator."
     }
@@ -605,7 +620,7 @@ if (-not $script:WinRMTransport) {
     $hint += "Ensure PS Remoting is enabled on the target (Enable-PSRemoting) and that the relevant listener port is open through the firewall: 5985 for HTTP, 5986 for HTTPS (Get-ChildItem WSMan:\localhost\Listener on the target shows which listeners exist)."
     if (-not $UseSSL)               { $hint += "Both HTTP/5985 and HTTPS/5986 were tried automatically and neither answered." }
     if (-not $SkipCertificateCheck) { $hint += "The HTTPS/5986 probe validated the listener certificate - if that listener uses a self-signed or name-mismatched certificate this probe fails by design; re-run with -SkipCertificateCheck to accept it, or install a certificate whose CN/SAN matches '$TargetComputer' exactly." }
-    $hint += "For workgroup targets, TrustedHosts must also be configured on Server A."
+    $hint += "For workgroup/local-account or IP connections, prefer trusted HTTPS, or use only a customer-approved, narrowly scoped TrustedHosts configuration. Supply target-qualified credentials such as SERVERB\Admin; a filtered local-account token may lack administrative rights. No TrustedHosts, UAC, or authentication policy is changed by this script."
     throw "WinRM is not reachable on $TargetComputer over any supported transport. $($hint -join ' ')"
 }
 
@@ -636,8 +651,11 @@ $sessionParams = Get-WinRMSessionParams
 $resumeExisting = $false
 try {
     $existing = Invoke-Command @sessionParams -ScriptBlock {
-        $reg = Get-ItemProperty -Path "HKLM:\SOFTWARE\OSUpgradeAutomation" -ErrorAction SilentlyContinue |
-            Select-Object RunId, Phase, PhaseName, Status, PostUpgradeOSCaption, TargetOSCaption, TargetBuild, LastUpdated
+        $key = "HKLM:\SOFTWARE\OSUpgradeAutomation"
+        $reg = if (Test-Path -LiteralPath $key -ErrorAction Stop) {
+            Get-ItemProperty -LiteralPath $key -ErrorAction Stop |
+                Select-Object RunId, Phase, PhaseName, Status, PostUpgradeOSCaption, TargetOSCaption, TargetBuild, LastUpdated, StatusJsonPath, TargetDataRoot, ArtifactRoot, BackupRoot
+        } else { $null }
         if ($reg) {
             # Status "InProgress" ALONE is not trustworthy - setup.exe can
             # self-cancel (e.g. a OneSettings network-timeout) and leave
@@ -713,7 +731,40 @@ try {
         Write-Log "$TargetComputer reports Status=InProgress (Phase=$($existing.Phase) '$($existing.PhaseName)') but shows NO real activity (no setup process, setupact.log age=$([math]::Round($existing.PantherAgeMin,1)) min) - treating as a STALE prior attempt, not a genuine resume. Proceeding with a normal stage+kickoff; Start-TargetUpgrade.ps1's own stale-attempt cleanup (Section 1b) will reset and restart fresh." "WARN"
     }
 } catch {
-    Write-Log "Could not pre-check existing upgrade state on $TargetComputer (non-blocking, assuming none): $_" "WARN"
+    Write-Log "Could not inspect existing upgrade state on $TargetComputer. No staging or Setup launch will be attempted: $_" "ERROR"
+    throw
+}
+
+if ($resumeExisting) {
+    if ($StatusJsonPath -and $existing.StatusJsonPath -and $StatusJsonPath -ne $existing.StatusJsonPath) {
+        throw "Cannot change StatusJsonPath during resume. The existing run publishes to '$($existing.StatusJsonPath)'."
+    }
+    if ($TargetDataRoot -and $TargetDataRoot.TrimEnd('\') -ne ([string]$existing.TargetDataRoot).TrimEnd('\')) {
+        throw "Cannot relocate an existing run. Resume without -TargetDataRoot or use its recorded root '$($existing.TargetDataRoot)'."
+    }
+    if ($BackupRoot -and $existing.BackupRoot -and $BackupRoot.TrimEnd('\') -ne $existing.BackupRoot.TrimEnd('\')) {
+        throw "Cannot change BackupRoot during resume. The existing run uses '$($existing.BackupRoot)'."
+    }
+    $StatusJsonPath = if ($existing.StatusJsonPath) { $existing.StatusJsonPath } elseif ($StatusJsonPath) { $StatusJsonPath } else { "D:\upgrade_status.json" }
+    if ($existing.BackupRoot) { $BackupRoot = $existing.BackupRoot }
+    $targetArtifactRoot = $existing.ArtifactRoot
+    Write-Log "Resuming recorded paths: artifacts=$targetArtifactRoot; backup=$BackupRoot; status=$StatusJsonPath. Existing runs are not relocated or restaged."
+} else {
+    $targetPaths = Invoke-Command @sessionParams -ScriptBlock {
+        param($PathsDefinition, $IdentityDefinition, $DataRoot, $Backup, $JsonPath, $Staging)
+        $ErrorActionPreference = "Stop"
+        $identity = & ([scriptblock]::Create($IdentityDefinition))
+        $paths = & ([scriptblock]::Create($PathsDefinition)) -TargetDataRoot $DataRoot -BackupRoot $Backup `
+            -StatusJsonPath $JsonPath -RemoteStagingPath $Staging -CheckDrives
+        $paths | Add-Member -NotePropertyName ExecutionIdentity -NotePropertyValue $identity
+        $paths
+    } -ArgumentList ${function:Resolve-UpgradeTargetPaths}.ToString(), ${function:Get-UpgradeExecutionIdentity}.ToString(), `
+        $TargetDataRoot, $BackupRoot, $StatusJsonPath, $RemoteStagingPath
+    $BackupRoot = $targetPaths.BackupRoot
+    $StatusJsonPath = $targetPaths.StatusJsonPath
+    $RemoteStagingPath = $targetPaths.RemoteStagingPath
+    $targetArtifactRoot = $targetPaths.ArtifactRoot
+    Write-Log "Target identity: $($targetPaths.ExecutionIdentity). Paths: staging=$RemoteStagingPath; artifacts=$targetArtifactRoot; backup=$BackupRoot; status=$StatusJsonPath"
 }
 
 # Moved here from its original "Section 4 - Monitoring Loop Functions" spot
@@ -848,6 +899,7 @@ try {
         MinFreeSpaceGB        = $MinFreeSpaceGB
         BackupRoot            = $BackupRoot
         StatusJsonPath        = $StatusJsonPath
+        TargetDataRoot        = $TargetDataRoot
         RetentionDays         = $RetentionDays
         DisableAutoCleanup    = [bool]$DisableAutoCleanup
         SkipPatchCheckLab     = [bool]$SkipPatchCheckLab
@@ -855,6 +907,7 @@ try {
         SkipOrphanedProfileCheck = [bool]$SkipOrphanedProfileCheck
         SkipUserProfileCountCheck = [bool]$SkipUserProfileCountCheck
         SkipPendingFileRenameCheck = [bool]$SkipPendingFileRenameCheck
+        SkipDirtyBitCheck     = [bool]$SkipDirtyBitCheck
         MinVMwareToolsVersion = $MinVMwareToolsVersion
         UseControlledReboot   = [bool]$UseControlledReboot
         MaxPatchAgeDays       = $MaxPatchAgeDays
@@ -988,7 +1041,7 @@ try {
             Write-Log "Kickoff connection ended after the target entered Setup. Switching to bounded monitoring to distinguish reboot, interruption, and completion; Setup will not be relaunched." "WARN"
             $remoteResult = [pscustomobject]@{ Success = $true; Error = $null }
         } else {
-            $remoteResult = [pscustomobject]@{ Success = $false; Error = "Job '$($remoteJob.Name)' ended in state '$($remoteJob.State)' without returning a result - check Server B's own logs (C:\ProgramData\OSUpgradeAutomation\Logs) for what happened." }
+            $remoteResult = [pscustomobject]@{ Success = $false; Error = "Job '$($remoteJob.Name)' ended in state '$($remoteJob.State)' without returning a result - check '$targetArtifactRoot\Logs' on the target for what happened." }
         }
     }
 
@@ -1075,15 +1128,14 @@ try {
             if ($reRunCredHint) { Write-Log "        $reRunCredHint" "WARN" }
             Write-Log "        $reRunCommand" "WARN"
             Write-Log "      Alternatively, after accepting the migration risk, re-run with -SkipOrphanedProfileCheck. This bypasses only orphan SID resolution; profile inventory and other safety gates still run." "WARN"
-            Write-Log "      Nothing was changed on $TargetComputer this run (no backup, no ISO" "WARN"
-            Write-Log "      mount, no setup.exe) - it is safe to simply retry." "WARN"
+            Write-Log "      Setup was not launched after the failed precheck gate. Media may already be mounted and reports retained; resolve the findings before retrying." "WARN"
         } else {
-            Write-Log "ACTION REQUIRED: Resolve the reason(s) listed above on $TargetComputer, then re-run this same command. Nothing was changed on $TargetComputer (no backup, no ISO mount, no setup.exe) - it is safe to simply retry once fixed." "WARN"
+            Write-Log "ACTION REQUIRED: Resolve the reason(s) listed above on $TargetComputer before retrying. Reports, mounted media or backup artifacts may already exist; do not assume no changes occurred if kickoff was interrupted." "WARN"
             if ($reRunCredHint) { Write-Log "   $reRunCredHint" "WARN" }
             Write-Log "   Re-run command: $reRunCommand" "WARN"
         }
         Write-Log "====================================================================" "ERROR"
-        Write-Log "Full pre-check report: $BackupRoot\PreCheckReport_*.log (or C:\ProgramData\OSUpgradeAutomation\Logs if the backup drive was unreachable) on $TargetComputer." "ERROR"
+        Write-Log "Full pre-check report: $BackupRoot\PreCheckReport_*.log; target logs: $targetArtifactRoot\Logs on $TargetComputer." "ERROR"
 
         # Deliberately just falls through here (no throw/exit) - $upgradeKickoffOk
         # stays $false, the outer try's "finally" still cleans up the PSSession
@@ -1098,7 +1150,7 @@ try {
 }
 }
 
-if (-not $upgradeKickoffOk) { return }
+if (-not $upgradeKickoffOk) { exit 1 }
 
 # =============================================================================
 # SECTION 4 - MONITORING LOOP FUNCTIONS
@@ -1132,8 +1184,10 @@ function Get-RemoteUpgradeObservation {
         Invoke-Command @p -ScriptBlock {
             param($statusPath, [bool]$allowMonitorRefresh)
             $ErrorActionPreference = "Stop"
-            $basePath = "C:\ProgramData\OSUpgradeAutomation"
             $registry = Get-ItemProperty "HKLM:\SOFTWARE\OSUpgradeAutomation" -ErrorAction Stop
+            $basePath = if ($registry.ArtifactRoot) { $registry.ArtifactRoot } else {
+                Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) "OSUpgradeAutomation"
+            }
             if (-not $statusPath) { $statusPath = $registry.StatusJsonPath }
             $record = $null
             $readWarning = $null
@@ -1419,6 +1473,10 @@ function Get-RemoteStatusViaCimDcom {
                 RunId                        = Get-RegSZ "RunId"
                 Sequence                     = Get-RegDWord "Sequence"
                 ComputerName                 = $ComputerName
+                TargetDataRoot               = Get-RegSZ "TargetDataRoot"
+                ArtifactRoot                 = Get-RegSZ "ArtifactRoot"
+                BackupRoot                   = Get-RegSZ "BackupRoot"
+                StatusJsonPath               = Get-RegSZ "StatusJsonPath"
                 Status                       = Get-RegSZ "Status"
                 Phase                        = Get-RegDWord "Phase"
                 PhaseName                    = Get-RegSZ "PhaseName"
@@ -1467,6 +1525,8 @@ function Get-RemoteStatusViaCimDcom {
                 BackupFolder                 = Get-RegSZ "BackupFolder"
                 SystemStateBackupPath         = Get-RegSZ "SystemStateBackupPath"
                 DirtyBitCheckStatus          = Get-RegSZ "DirtyBitCheckStatus"
+                VMwareToolsVersion           = Get-RegSZ "VMwareToolsVersion"
+                VMwareToolsCheckStatus       = Get-RegSZ "VMwareToolsCheckStatus"
                 UserProfileInventoryStatus   = Get-RegSZ "UserProfileInventoryStatus"
                 UserProfileCount             = Get-RegDWord "UserProfileCount"
                 SpecialProfileCount          = Get-RegDWord "SpecialProfileCount"
@@ -1949,11 +2009,11 @@ while ($true) {
             }
             Write-Log "NOTE: $($skippedNames -join ' and ') had no live sample between these readings. $outageClause See the confirmed Setup history above when available; missing evidence is not a gap-free timeline or proof of failure." "INFO"
         }
-        # Reset unconditionally on every real reading (not just when a skip
-        # fires) - otherwise a stale "outage happened" flag from an earlier,
-        # already-explained gap could get wrongly attributed to a LATER,
-        # unrelated phase transition.
-        $outageObservedSinceLastPhase = $false
+        # A cached same-phase reading must not erase the outage before a
+        # later phase jump explains it.
+        if ($null -eq $lastObservedPhaseNum -or $curPhaseNum -ne $lastObservedPhaseNum) {
+            $outageObservedSinceLastPhase = $false
+        }
         $lastObservedPhaseNum = $curPhaseNum
     }
 
@@ -2078,6 +2138,9 @@ function Write-FinalSummary {
     Write-Log " User profiles (precheck)  : $summaryProfileLine"
     Write-Log " Orphan-profile check      : $(if ($status.OrphanedProfileCheckStatus) { $status.OrphanedProfileCheckStatus } else { 'Not reported' })"
     Write-Log " Disk dirty-bit check      : $(if ($status.DirtyBitCheckStatus) { $status.DirtyBitCheckStatus } else { 'Not reported' })"
+    Write-Log " VMware Tools              : $(if ($status.VMwareToolsVersion) { "$($status.VMwareToolsVersion) ($($status.VMwareToolsCheckStatus))" } else { 'Not reported' })"
+    Write-Log " Target artifact directory : $(if ($status.ArtifactRoot) { $status.ArtifactRoot } else { $targetArtifactRoot })"
+    Write-Log " Target status JSON        : $(if ($status.StatusJsonPath) { $status.StatusJsonPath } else { $StatusJsonPath })"
     Write-Log " Pending-file-rename gate  : $(if ($status.PendingFileRenameCheckStatus) { $status.PendingFileRenameCheckStatus } else { 'Not reported' })"
     Write-Log " Monitoring duration       : $totalMinutes minute(s)."
     Write-Log "===================================================================="
@@ -2112,7 +2175,7 @@ switch ($finalOutcome) {
     "Failed" {
         Write-FinalSummary -UpgradeStatus "Failed"
         Write-Log " Failed at phase           : $($status.PhaseName) (Notes: $($status.Notes))" "ERROR"
-        Write-Log " Review D:\UpgradeBackup\<run>\OSUpgradeProgress.log and Logs\ (incl. SetupDiagResults.xml if present), plus C:\ProgramData\OSUpgradeAutomation\Logs, on $TargetComputer." "ERROR"
+        Write-Log " Review the run's OSUpgradeProgress.log under '$BackupRoot' and target logs under '$targetArtifactRoot\Logs' (including SetupDiagResults.xml if present) on $TargetComputer." "ERROR"
         exit 1
     }
     "ValidationFailed" {
